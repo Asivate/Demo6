@@ -166,10 +166,11 @@ PREDICTION_THRES = 0.5  # Changed from 0.15 to 0.5 to match original server
 FINGER_SNAP_THRES = 0.4  # Increased from 0.03 to make it harder to detect false finger snaps
 DBLEVEL_THRES = -30  # Changed from -60 to -30 to match original server
 SILENCE_THRES = -75  # Unchanged (Threshold for silence detection)
-SPEECH_SENTIMENT_THRES = 0.6  # Increased from 0.35 to 0.6 to reduce false speech detection
+SPEECH_SENTIMENT_THRES = 0.8  # Increased from 0.6 to 0.8 to reduce false speech detection
 CHOPPING_THRES = 0.7  # Unchanged - higher threshold for chopping sounds
-SPEECH_PREDICTION_THRES = 0.7  # Unchanged - higher threshold for speech
-SPEECH_DETECTION_THRES = 0.5  # Increased from 0.30 to 0.5 to reduce false speech detection
+SPEECH_PREDICTION_THRES = 0.85  # Increased from 0.7 to 0.85 to reduce false speech detections
+SPEECH_DETECTION_THRES = 0.7  # Increased from 0.5 to 0.7 to reduce false speech detection
+SPEECH_BIAS_CORRECTION = 0.3  # New parameter to correct for speech bias in the model
 
 # Add flag to disable Google Speech by default - use Whisper instead
 # USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
@@ -554,7 +555,19 @@ def tensorflow_predict(x_input):
     with tf_lock:
         with tf_graph.as_default():
             with tf_session.as_default():
-                return models["tensorflow"].predict(x_input)
+                predictions = models["tensorflow"].predict(x_input)
+                
+                # Apply speech bias correction to reduce false speech detections
+                # Only apply correction if speech has very high confidence
+                for i in range(len(predictions)):
+                    speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
+                    if speech_idx < len(predictions[i]) and predictions[i][speech_idx] > 0.7:
+                        # Apply correction factor to reduce speech confidence
+                        predictions[i][speech_idx] -= SPEECH_BIAS_CORRECTION
+                        # Ensure it doesn't go below 0
+                        predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+                
+                return predictions
 
 # Modify the audio_data handler to use our custom prediction function
 @socketio.on('audio_data')
@@ -641,17 +654,17 @@ def handle_source(json_data):
             })
             return
         
-        # Take predictions from the valid indices - using original logic, no speech bias correction
+        # Take predictions from the valid indices
         context_prediction = np.take(predictions[0], valid_indices)
         m = np.argmax(context_prediction)
         
-        # Check if prediction confidence is high enough - original server logic
+        # Get the corresponding label from the valid indices
+        predicted_label = active_context[valid_indices.index(valid_indices[m])]
+        human_label = homesounds.to_human_labels[predicted_label]
+        
+        # Check if prediction confidence is high enough
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            # Get the corresponding label from the valid indices
-            human_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
             print(f"Top prediction: {human_label} ({context_prediction[m]:.4f})")
-            
-            # Process sound-specific logic
             
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
@@ -662,27 +675,77 @@ def handle_source(json_data):
                     'db': str(db)
                 })
                 return
-                
-            # Check for speech with sentiment analysis
-            if human_label == "Speech" and context_prediction[m] > SPEECH_SENTIMENT_THRES:
-                # Process speech with sentiment analysis
-                if sentiment_pipeline is not None:
-                    print("Speech detected. Processing sentiment...")
-                    sentiment_result = process_speech_with_sentiment(np_wav)
+            
+            # Special case for "Speech" - use higher threshold and verify with Google Speech API
+            if human_label == "Speech":
+                # Apply stricter threshold for speech detection
+                if context_prediction[m] < SPEECH_PREDICTION_THRES:
+                    print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
                     
-                    if sentiment_result and 'sentiment' in sentiment_result:
-                        label = f"Speech {sentiment_result['sentiment']['category']}"
+                    # Check if there's another sound with reasonable confidence
+                    # Find second highest prediction
+                    temp_context = context_prediction.copy()
+                    speech_idx = valid_indices.index(valid_indices[m])
+                    temp_context[speech_idx] = 0  # Zero out speech confidence
+                    
+                    second_best_idx = np.argmax(temp_context)
+                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
+                        # Use the second-best prediction instead
+                        second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
+                        second_best_human_label = homesounds.to_human_labels[second_best_label]
+                        print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
+                        
                         socketio.emit('audio_label', {
-                            'label': label,
-                            'accuracy': str(sentiment_result['sentiment']['confidence']),
+                            'label': second_best_human_label,
+                            'accuracy': str(temp_context[second_best_idx]),
                             'db': str(db),
-                            'emoji': sentiment_result['sentiment']['emoji'],
-                            'transcription': sentiment_result['text'],
-                            'emotion': sentiment_result['sentiment']['original_emotion'],
-                            'sentiment_score': str(sentiment_result['sentiment']['confidence'])
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
                         })
-                        print(f"EMITTING: {label}")
                         return
+                
+                # Process speech with sentiment analysis if confidence is high enough
+                if context_prediction[m] > SPEECH_SENTIMENT_THRES:
+                    # Process speech with sentiment analysis
+                    if sentiment_pipeline is not None:
+                        print("Speech detected. Processing sentiment...")
+                        sentiment_result = process_speech_with_sentiment(np_wav)
+                        
+                        # Only emit speech if Google API found actual speech content
+                        if sentiment_result and 'sentiment' in sentiment_result and sentiment_result['text']:
+                            label = f"Speech {sentiment_result['sentiment']['category']}"
+                            socketio.emit('audio_label', {
+                                'label': label,
+                                'accuracy': str(sentiment_result['sentiment']['confidence']),
+                                'db': str(db),
+                                'emoji': sentiment_result['sentiment']['emoji'],
+                                'transcription': sentiment_result['text'],
+                                'emotion': sentiment_result['sentiment']['original_emotion'],
+                                'sentiment_score': str(sentiment_result['sentiment']['confidence'])
+                            })
+                            print(f"EMITTING: {label}")
+                            return
+                        else:
+                            # No transcription found, check for second-best prediction
+                            temp_context = context_prediction.copy()
+                            speech_idx = valid_indices.index(valid_indices[m])
+                            temp_context[speech_idx] = 0  # Zero out speech confidence
+                            
+                            second_best_idx = np.argmax(temp_context)
+                            if temp_context[second_best_idx] > PREDICTION_THRES * 0.7:  # 70% of normal threshold
+                                # Use the second-best prediction instead
+                                second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
+                                second_best_human_label = homesounds.to_human_labels[second_best_label]
+                                print(f"No speech transcription found. Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
+                                
+                                socketio.emit('audio_label', {
+                                    'label': second_best_human_label,
+                                    'accuracy': str(temp_context[second_best_idx]),
+                                    'db': str(db),
+                                    'time': str(time_data),
+                                    'record_time': str(record_time) if record_time else ''
+                                })
+                                return
             
             # Regular sound detection
             socketio.emit('audio_label', {
@@ -729,7 +792,7 @@ def process_speech_with_sentiment(audio_data):
     """
     # Settings for improved speech processing
     SPEECH_MAX_BUFFER_SIZE = 8  # Number of audio chunks to keep in buffer for speech only
-    MIN_WORD_COUNT = 3   # Minimum number of meaningful words for valid transcription
+    MIN_WORD_COUNT = 2   # Reduced from 3 to 2 for better sensitivity
     MIN_CONFIDENCE = 0.7  # Minimum confidence level for speech detection
     
     # Initialize or update audio buffer (stored in function attributes)
@@ -802,6 +865,16 @@ def process_speech_with_sentiment(audio_data):
         logger.info(f"Audio boosted from RMS {rms:.4f} to {new_rms:.4f}")
         concatenated_audio = enhanced_audio
     
+    # Apply high-pass filter to reduce background noise
+    try:
+        # Create a high-pass filter to reduce background noise
+        b, a = signal.butter(4, 80/(RATE/2), 'highpass')  # 80Hz high-pass filter
+        filtered_audio = signal.filtfilt(b, a, concatenated_audio)
+        logger.info("Applied high-pass filter for noise reduction")
+        concatenated_audio = filtered_audio
+    except Exception as e:
+        logger.warning(f"Error applying high-pass filter: {str(e)}")
+    
     logger.info("Transcribing speech to text...")
     
     # Transcribe audio using the selected speech-to-text processor
@@ -809,15 +882,15 @@ def process_speech_with_sentiment(audio_data):
         # Use Google Cloud Speech-to-Text if available
         try:
             transcription = transcribe_with_google(concatenated_audio, RATE)
-            logger.info(f"Used Google Cloud Speech-to-Text for transcription")
+            logger.info(f"Google transcription result: '{transcription}'")
         except Exception as e:
             logger.error(f"Error with Google Speech API: {str(e)}. Falling back to Whisper.")
             transcription = speech_processor.transcribe(concatenated_audio, RATE)
-            logger.info(f"Used Whisper for transcription (fallback)")
+            logger.info(f"Whisper transcription result: '{transcription}'")
     else:
         # Use Whisper (default)
         transcription = speech_processor.transcribe(concatenated_audio, RATE)
-        logger.info(f"Used Whisper for transcription")
+        logger.info(f"Whisper transcription result: '{transcription}'")
     
     # Check for valid transcription with sufficient content
     if not transcription:
@@ -832,7 +905,7 @@ def process_speech_with_sentiment(audio_data):
         logger.info(f"Transcription has too few meaningful words: '{transcription}'")
         return None
     
-    logger.info(f"Transcription: {transcription}")
+    logger.info(f"Valid transcription found: '{transcription}'")
     
     # Analyze sentiment
     sentiment = analyze_sentiment(transcription)
