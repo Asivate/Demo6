@@ -745,11 +745,11 @@ def handle_source(json_data):
                         
                         # Special case for Knock detection with lower threshold
                         knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15:  # Use lower threshold for knock
-                            print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
+                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.15:  # Use lower threshold for knock
+                            print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence!")
                             socketio.emit('audio_label', {
                                 'label': 'Knocking',
-                                'accuracy': str(pred[0][knock_idx]),
+                                'accuracy': str(predictions[0][knock_idx]),
                                 'db': str(db),
                                 'time': str(time_data),
                                 'record_time': str(record_time) if record_time else ''
@@ -1208,6 +1208,7 @@ def handle_source(json_data):
         data = json_data.get('data', [])
         db = json_data.get('db', 0)
         time_data = json_data.get('time', 0)
+        record_time = json_data.get('record_time', None)
         
         # ENHANCED SILENCE DETECTION: Check if audio is silent
         if db < SILENCE_THRES:
