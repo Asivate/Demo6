@@ -171,7 +171,7 @@ CHOPPING_THRES = 0.85  # Increased from 0.7 to 0.85 to reduce false positives
 SPEECH_PREDICTION_THRES = 0.85  # Threshold for speech detection
 SPEECH_DETECTION_THRES = 0.7  # Secondary threshold for speech detection
 SPEECH_BIAS_CORRECTION = 0.5  # Increased correction factor for speech bias (from 0.3 to 0.5)
-KNOCK_DETECTION_THRES = 0.04  # Lowered threshold specifically for knock detection (very sensitive)
+KNOCK_DETECTION_THRES = 0.12  # Increased from 0.04 to 0.12 to reduce false positives
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -511,7 +511,7 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
                     print("Custom prediction function initialized successfully")
-            print("Third fallback method succeeded")
+                print("Third fallback method succeeded")
         except Exception as e3:
             print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
@@ -660,30 +660,34 @@ def handle_source(json_data):
         knock_detection_audio = enhance_knock_detection(np_wav, RATE)
         
         # Pad audio if needed to match expected size for models
-        if original_size < RATE:
-            # Pad with zeros to reach 1 second (16000 samples)
-            # If the sample is very short (less than 0.5 seconds), duplicate it to strengthen signal
-            if original_size < RATE // 2:
-                # Repeat the audio to make the signal stronger instead of just padding with zeros
-                repeat_count = 3  # Repeat short samples 3 times to amplify the signal
-                np_wav = np.tile(np_wav, repeat_count)
-                if np_wav.size > RATE:
-                    np_wav = np_wav[:RATE]  # Trim if it exceeds 1 second
-                else:
-                    # If still not enough, add zero padding
-                    padding = np.zeros(RATE - np_wav.size)
-                    np_wav = np.concatenate([np_wav, padding])
-                
-                # Also pad the knock detection audio
-                if knock_detection_audio.size < RATE:
-                    # Specialized padding for knock detection
-                    # For knocks, we want to preserve the transient nature, so use a gentler approach
-                    knock_detection_audio = np.tile(knock_detection_audio, 2)[:RATE]
-                    if knock_detection_audio.size < RATE:
-                        padding = np.zeros(RATE - knock_detection_audio.size)
-                        knock_detection_audio = np.concatenate([knock_detection_audio, padding])
+        if original_size < RATE // 2:
+            # Use a more conservative approach to repeating short samples
+            repeat_count = 2  # Reduced from 3 to 2 to prevent over-amplification
+            np_wav = np.tile(np_wav, repeat_count)
+            if np_wav.size > RATE:
+                np_wav = np_wav[:RATE]  # Trim if it exceeds 1 second
             else:
-                # For longer samples, just pad with zeros
+                # If still not enough, add more zero padding
+                # Use a larger portion of zeros to reduce the impact of the short sample
+                padding = np.zeros(RATE - np_wav.size)
+                np_wav = np.concatenate([np_wav, padding])
+            
+            # Also pad the knock detection audio more conservatively
+            if knock_detection_audio.size < RATE:
+                # More conservative approach for knock detection
+                # Don't repeat more than once to avoid false transients
+                if knock_detection_audio.size > RATE // 4:  # Only if we have a reasonable amount of audio
+                    knock_detection_audio = np.tile(knock_detection_audio, 1.5)[:RATE]
+                
+                # Always ensure we have the right size with zero padding
+                if knock_detection_audio.size < RATE:
+                    padding = np.zeros(RATE - knock_detection_audio.size)
+                    knock_detection_audio = np.concatenate([knock_detection_audio, padding])
+            
+            print("Applied conservative padding for short audio sample")
+        else:
+            # For longer samples, just pad with zeros if needed
+            if original_size < RATE:
                 padding = np.zeros(RATE - original_size)
                 np_wav = np.concatenate([np_wav, padding])
                 
@@ -691,8 +695,8 @@ def handle_source(json_data):
                 if knock_detection_audio.size < RATE:
                     padding = np.zeros(RATE - knock_detection_audio.size)
                     knock_detection_audio = np.concatenate([knock_detection_audio, padding])
-            
-            print(f"Padded audio data to size: {RATE} samples (1 second)")
+                
+                print(f"Padded longer audio from {original_size} to {RATE} samples")
         
         # Process both versions of the audio
         regular_features = waveform_to_examples(np_wav, RATE)
@@ -738,7 +742,7 @@ def handle_source(json_data):
             print(f"Knock confidence: Regular={regular_knock_conf:.4f}, Enhanced={enhanced_knock_conf:.4f}")
             
             # If the enhanced processing significantly improved knock detection, use it
-            if enhanced_knock_conf > 0.08 and enhanced_knock_conf > regular_knock_conf * 1.2:
+            if enhanced_knock_conf > KNOCK_DETECTION_THRES and enhanced_knock_conf > regular_knock_conf * 2.0:
                 print(f"Using knock-enhanced prediction (improved by {enhanced_knock_conf/max(regular_knock_conf, 0.001):.2f}x)")
                 predictions = knock_predictions
             else:
@@ -1317,18 +1321,18 @@ def handle_source(json_data):
         knock_enhanced_x = x.copy()
         
         # For spectrograms, knocks typically have strong onset characteristics
-        # Enhance the contrast in the spectrogram
+        # Enhance the contrast in the spectrogram, but more conservatively
         if knock_enhanced_x.size > 0:
-            # Apply non-linear transformation to enhance differences
-            # Square the values to emphasize large values (typical of knocks)
-            knock_enhanced_x = np.power(knock_enhanced_x, 1.5)  # More aggressive than squaring
+            # Apply gentler non-linear transformation to enhance differences
+            # Lower power to be less aggressive
+            knock_enhanced_x = np.power(knock_enhanced_x, 1.2)  # Reduced from 1.5 to 1.2
             
             # Normalize to maintain overall energy
             if np.max(knock_enhanced_x) > 0:
                 scale_factor = np.max(x) / np.max(knock_enhanced_x)
-                knock_enhanced_x *= scale_factor
+                knock_enhanced_x *= scale_factor * 0.9  # Slightly reduce scaling
             
-            print("Applied knock enhancement to feature data")
+            print("Applied conservative knock enhancement to feature data")
         
         # Reshape both feature sets for model input
         regular_input = x.reshape(1, 96, 64, 1)
@@ -1349,7 +1353,7 @@ def handle_source(json_data):
             print(f"Knock confidence: Regular={regular_knock_conf:.4f}, Enhanced={enhanced_knock_conf:.4f}")
             
             # If the enhanced processing significantly improved knock detection, use it
-            if enhanced_knock_conf > 0.08 and enhanced_knock_conf > regular_knock_conf * 1.2:
+            if enhanced_knock_conf > KNOCK_DETECTION_THRES and enhanced_knock_conf > regular_knock_conf * 2.0:
                 print(f"Using knock-enhanced prediction (improved by {enhanced_knock_conf/max(regular_knock_conf, 0.001):.2f}x)")
                 pred = knock_pred
             else:
@@ -1531,24 +1535,24 @@ def enhance_knock_detection(audio_data, sample_rate=16000):
     onset_signal = np.copy(diff_signal)
     onset_signal[onset_signal < 0] = 0
     
-    # 4. Apply non-linear enhancement to emphasize strong knocks
-    # Square the signal to emphasize large values
-    enhanced_signal = onset_signal ** 2
+    # 4. Apply non-linear enhancement to emphasize strong knocks, but more conservatively
+    # Linear scaling instead of squaring to avoid over-amplification
+    enhanced_signal = onset_signal * 1.5  # Reduced from squaring to linear scaling
     
     # 5. Combine the original filtered signal with the enhanced onset detection
     # Scale the enhanced signal to match the original
     if np.max(enhanced_signal) > 0:
-        enhanced_signal = enhanced_signal / np.max(enhanced_signal) * np.max(np.abs(filtered_audio))
+        enhanced_signal = enhanced_signal / np.max(enhanced_signal) * np.max(np.abs(filtered_audio)) * 0.8  # Reduced scaling factor
     
-    # Blend original and enhanced signal with more weight on the enhanced component
-    alpha = 0.7  # Weight for enhanced component
+    # Blend original and enhanced signal with LESS weight on the enhanced component
+    alpha = 0.4  # Reduced from 0.7 to 0.4 - less emphasis on enhancements
     processed_audio = (1 - alpha) * filtered_audio + alpha * enhanced_signal
     
     # 6. Normalize the final signal
     if np.max(np.abs(processed_audio)) > 0:
         processed_audio = processed_audio / np.max(np.abs(processed_audio)) * np.max(np.abs(audio_data))
     
-    print(f"Applied specialized knock detection processing")
+    print("Applied more conservative knock detection processing")
     return processed_audio
 
 if __name__ == '__main__':
