@@ -28,8 +28,16 @@ import queue
 from transformers import pipeline
 import logging
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # Import our AST model implementation
 import ast_model
+
+# Global flags for speech recognition - defined BEFORE they're referenced
+USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API if available
+USE_GOOGLE_SPEECH = False  # Set to True to use Google Cloud Speech-to-Text instead of Whisper
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
@@ -42,10 +50,6 @@ if USE_GOOGLE_SPEECH_API:
     except ImportError:
         print("Google Cloud Speech module not available. Using Whisper instead.")
         USE_GOOGLE_SPEECH_API = False
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # Memory optimization settings
 MEMORY_OPTIMIZATION_LEVEL = os.environ.get('MEMORY_OPTIMIZATION', '1')  # 0=None, 1=Moderate, 2=Aggressive
@@ -168,7 +172,7 @@ SPEECH_PREDICTION_THRES = 0.7  # Unchanged - higher threshold for speech
 SPEECH_DETECTION_THRES = 0.5  # Increased from 0.30 to 0.5 to reduce false speech detection
 
 # Add flag to disable Google Speech by default - use Whisper instead
-USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
+# USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
 
 # Define model-specific contexts - only use the first 30 sound classes (0-29) that the model was trained on
 core_sounds = [
@@ -509,7 +513,7 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
             if not USE_AST_MODEL:
                 raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
-    print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
+print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
 # ##############################
 # # Setup Audio Callback
@@ -636,7 +640,7 @@ def handle_source(json_data):
                 'db': str(db)
             })
             return
-            
+        
         # Take predictions from the valid indices - using original logic, no speech bias correction
         context_prediction = np.take(predictions[0], valid_indices)
         m = np.argmax(context_prediction)
