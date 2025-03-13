@@ -1,6 +1,6 @@
 from threading import Lock
 from flask import Flask, render_template, session, request, \
-    copy_current_request_context, Response, jsonify
+    copy_current_request_context, Response, jsonify, send_from_directory
 from flask_socketio import SocketIO, emit, join_room, leave_room, \
     close_room, rooms, disconnect
 import tensorflow as tf
@@ -155,7 +155,7 @@ recent_predictions = []  # Store recent prediction probabilities for each sound 
 speech_predictions = []  # Separate storage for speech predictions
 prediction_lock = Lock()  # Lock for thread-safe access to prediction history
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
 app.config['SECRET_KEY'] = 'soundwatch_secret!'
 socketio = SocketIO(app, async_mode=async_mode)
 thread = None
@@ -171,6 +171,9 @@ CHOPPING_THRES = 0.7  # Unchanged - higher threshold for chopping sounds
 SPEECH_PREDICTION_THRES = 0.85  # Increased from 0.7 to 0.85 to reduce false speech detections
 SPEECH_DETECTION_THRES = 0.7  # Increased from 0.5 to 0.7 to reduce false speech detection
 SPEECH_BIAS_CORRECTION = 0.3  # New parameter to correct for speech bias in the model
+
+# Apply stronger speech bias correction since the model is heavily biased towards speech
+APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
 
 # Add flag to disable Google Speech by default - use Whisper instead
 # USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
@@ -507,7 +510,7 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
                     print("Custom prediction function initialized successfully")
-            print("Third fallback method succeeded")
+                print("Third fallback method succeeded")
         except Exception as e3:
             print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
@@ -559,13 +562,17 @@ def tensorflow_predict(x_input):
                 
                 # Apply speech bias correction to reduce false speech detections
                 # Only apply correction if speech has very high confidence
-                for i in range(len(predictions)):
-                    speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
-                    if speech_idx < len(predictions[i]) and predictions[i][speech_idx] > 0.7:
-                        # Apply correction factor to reduce speech confidence
-                        predictions[i][speech_idx] -= SPEECH_BIAS_CORRECTION
-                        # Ensure it doesn't go below 0
-                        predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+                if APPLY_SPEECH_BIAS_CORRECTION:
+                    for i in range(len(predictions)):
+                        speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
+                        if speech_idx < len(predictions[i]):
+                            # Apply correction factor to reduce speech confidence - stronger correction
+                            predictions[i][speech_idx] -= SPEECH_BIAS_CORRECTION
+                            # Ensure it doesn't go below 0
+                            predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+                            
+                            # Debug print to show the effect of bias correction
+                            print(f"Applied speech bias correction: {predictions[i][speech_idx] + SPEECH_BIAS_CORRECTION:.4f} -> {predictions[i][speech_idx]:.4f}")
                 
                 return predictions
 
@@ -703,6 +710,17 @@ def handle_source(json_data):
                             'record_time': str(record_time) if record_time else ''
                         })
                         return
+                    else:
+                        # No good alternative, emit unrecognized sound
+                        print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
+                        socketio.emit('audio_label', {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '0.3',
+                            'db': str(db),
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
+                        })
+                        return
                 
                 # Process speech with sentiment analysis if confidence is high enough
                 if context_prediction[m] > SPEECH_SENTIMENT_THRES:
@@ -746,8 +764,19 @@ def handle_source(json_data):
                                     'record_time': str(record_time) if record_time else ''
                                 })
                                 return
+                            else:
+                                # No good alternative, emit unrecognized
+                                print("No speech transcription and no alternative sound, emitting Unrecognized Sound")
+                                socketio.emit('audio_label', {
+                                    'label': 'Unrecognized Sound',
+                                    'accuracy': '0.4',
+                                    'db': str(db),
+                                    'time': str(time_data),
+                                    'record_time': str(record_time) if record_time else ''
+                                })
+                                return
             
-            # Regular sound detection
+            # Regular sound detection for non-speech sounds
             socketio.emit('audio_label', {
                 'label': human_label,
                 'accuracy': str(context_prediction[m]),
@@ -933,8 +962,11 @@ def background_thread():
 
 @app.route('/')
 def index():
-    """Render the main page"""
-    return render_template('index.html')
+    return send_from_directory(app.static_folder, 'index.html')
+
+@app.route('/<path:path>')
+def static_files(path):
+    return send_from_directory(app.static_folder, path)
 
 @app.route('/api/health')
 def health_check():
@@ -1159,18 +1191,21 @@ def handle_source(json_data):
             })
             return
         
-        # Take predictions from the valid indices - using original logic, no speech bias correction  
+        # Take predictions from the valid indices
         context_prediction = np.take(pred[0], valid_indices)
         m = np.argmax(context_prediction)
-        print('Max prediction', homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]], context_prediction[m])
         
-        # Check if prediction confidence is high enough using original server logic
+        # Get the corresponding label
+        predicted_label = active_context[valid_indices.index(valid_indices[m])]
+        human_label = homesounds.to_human_labels[predicted_label]
+        print('Max prediction', human_label, context_prediction[m])
+        
+        # Check if prediction confidence is high enough
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
-            print(f"Prediction: {label} ({context_prediction[m]:.4f})")
+            print(f"Prediction: {human_label} ({context_prediction[m]:.4f})")
             
             # Special case for "Chopping" - use higher threshold
-            if label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
+            if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
                 socketio.emit('audio_label', {
                     'label': 'Unrecognized Sound',
@@ -1180,15 +1215,53 @@ def handle_source(json_data):
                     'record_time': str(record_time) if record_time else ''
                 })
                 return
+            
+            # Special case for "Speech" - use higher threshold
+            if human_label == "Speech":
+                if context_prediction[m] < SPEECH_PREDICTION_THRES:
+                    print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
+                    
+                    # Check if there's another sound with reasonable confidence
+                    temp_context = context_prediction.copy()
+                    speech_idx = valid_indices.index(valid_indices[m])
+                    temp_context[speech_idx] = 0  # Zero out speech confidence
+                    
+                    second_best_idx = np.argmax(temp_context)
+                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
+                        # Use the second-best prediction instead
+                        second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
+                        second_best_human_label = homesounds.to_human_labels[second_best_label]
+                        print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
+                        
+                        socketio.emit('audio_label', {
+                            'label': second_best_human_label,
+                            'accuracy': str(temp_context[second_best_idx]),
+                            'db': str(db),
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
+                        })
+                        return
+                    else:
+                        # No good alternative, emit unrecognized sound
+                        print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
+                        socketio.emit('audio_label', {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '0.3',
+                            'db': str(db),
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
+                        })
+                        return
                 
-            # Emit the sound label
+            # Emit the sound label for non-speech sounds or speech above threshold
             socketio.emit('audio_label', {
-                'label': label,
+                'label': human_label,
                 'accuracy': str(context_prediction[m]),
                 'db': str(db),
                 'time': str(time_data),
                 'record_time': str(record_time) if record_time else ''
             })
+            print(f"EMITTING: {human_label} ({context_prediction[m]:.4f})")
         else:
             # Sound didn't meet confidence threshold
             socketio.emit('audio_label', {
@@ -1198,6 +1271,7 @@ def handle_source(json_data):
                 'time': str(time_data),
                 'record_time': str(record_time) if record_time else ''
             })
+            print(f"EMITTING: Unrecognized Sound (below threshold)")
     except Exception as e:
         print(f"Error in handle_source: {str(e)}")
         traceback.print_exc()
