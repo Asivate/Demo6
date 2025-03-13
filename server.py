@@ -34,7 +34,14 @@ import ast_model
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
 from speech_to_text import transcribe_audio, SpeechToText
-from google_speech import transcribe_with_google, GoogleSpeechToText
+
+# Conditionally import Google speech module
+if USE_GOOGLE_SPEECH_API:
+    try:
+        from google_speech import transcribe_with_google, GoogleSpeechToText
+    except ImportError:
+        print("Google Cloud Speech module not available. Using Whisper instead.")
+        USE_GOOGLE_SPEECH_API = False
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -160,8 +167,8 @@ CHOPPING_THRES = 0.7  # Unchanged - higher threshold for chopping sounds
 SPEECH_PREDICTION_THRES = 0.7  # Unchanged - higher threshold for speech
 SPEECH_DETECTION_THRES = 0.5  # Increased from 0.30 to 0.5 to reduce false speech detection
 
-# Add a speech bias correction factor - the model is heavily biased toward speech
-SPEECH_BIAS_CORRECTION = 0.4  # Reduce speech confidence by 40% to counteract model bias
+# Add flag to disable Google Speech by default - use Whisper instead
+USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
 
 # Define model-specific contexts - only use the first 30 sound classes (0-29) that the model was trained on
 core_sounds = [
@@ -629,30 +636,12 @@ def handle_source(json_data):
                 'db': str(db)
             })
             return
-        
-        # Apply speech bias correction - the model is heavily biased toward speech
-        speech_index = -1
-        modified_predictions = predictions[0].copy()
-        
-        # Find the speech index
-        for i, x in enumerate(active_context):
-            if x == 'speech' and homesounds.labels[x] < len(modified_predictions):
-                speech_index = homesounds.labels[x]
-                break
-        
-        # Apply correction to speech confidence if it's too high
-        if speech_index >= 0:
-            original_speech_confidence = modified_predictions[speech_index]
-            # Only apply correction if speech confidence is very high
-            if original_speech_confidence > 0.8:
-                modified_predictions[speech_index] = original_speech_confidence * (1.0 - SPEECH_BIAS_CORRECTION)
-                print(f"Applied speech bias correction: {original_speech_confidence:.4f} -> {modified_predictions[speech_index]:.4f}")
-        
-        # Take predictions from the valid indices
-        context_prediction = np.take(modified_predictions, valid_indices)
+            
+        # Take predictions from the valid indices - using original logic, no speech bias correction
+        context_prediction = np.take(predictions[0], valid_indices)
         m = np.argmax(context_prediction)
         
-        # Check if prediction confidence is high enough
+        # Check if prediction confidence is high enough - original server logic
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             # Get the corresponding label from the valid indices
             human_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
@@ -667,47 +656,6 @@ def handle_source(json_data):
                     'label': 'Unrecognized Sound',
                     'accuracy': '0.2',
                     'db': str(db)
-                })
-                return
-                
-            # Special case for "Speech" - use higher threshold to prevent false positives
-            if human_label == "Speech" and context_prediction[m] < SPEECH_PREDICTION_THRES:
-                print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
-                
-                # Find the second highest prediction instead
-                second_best_index = -1
-                second_best_confidence = 0
-                
-                # Create a copy of context_prediction and set the max value to 0
-                second_best_prediction = context_prediction.copy()
-                second_best_prediction[m] = 0
-                
-                # Find the new max
-                second_best_m = np.argmax(second_best_prediction)
-                second_best_confidence = second_best_prediction[second_best_m]
-                
-                # If the second best prediction is good enough, use it instead
-                if second_best_confidence > PREDICTION_THRES * 0.7:  # Lower threshold for second best
-                    second_best_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[second_best_m])]]
-                    print(f"Using second best prediction: {second_best_label} ({second_best_confidence:.4f})")
-                    
-                    socketio.emit('audio_label', {
-                        'label': second_best_label,
-                        'accuracy': str(second_best_confidence),
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
-                    })
-                    print(f"EMITTING: {second_best_label} ({second_best_confidence:.2f})")
-                    return
-                
-                # Otherwise, mark as unrecognized
-                socketio.emit('audio_label', {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '0.3',
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
                 })
                 return
                 
@@ -853,10 +801,15 @@ def process_speech_with_sentiment(audio_data):
     logger.info("Transcribing speech to text...")
     
     # Transcribe audio using the selected speech-to-text processor
-    if USE_GOOGLE_SPEECH:
-        # Use Google Cloud Speech-to-Text
-        transcription = transcribe_with_google(concatenated_audio, RATE)
-        logger.info(f"Used Google Cloud Speech-to-Text for transcription")
+    if USE_GOOGLE_SPEECH and USE_GOOGLE_SPEECH_API:
+        # Use Google Cloud Speech-to-Text if available
+        try:
+            transcription = transcribe_with_google(concatenated_audio, RATE)
+            logger.info(f"Used Google Cloud Speech-to-Text for transcription")
+        except Exception as e:
+            logger.error(f"Error with Google Speech API: {str(e)}. Falling back to Whisper.")
+            transcription = speech_processor.transcribe(concatenated_audio, RATE)
+            logger.info(f"Used Whisper for transcription (fallback)")
     else:
         # Use Whisper (default)
         transcription = speech_processor.transcribe(concatenated_audio, RATE)
@@ -1060,19 +1013,6 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
                 for i, pred in enumerate(valid_predictions):
                     aggregated += pred * weights[i]
                 
-                # Apply a slight boost to non-speech sounds to counteract speech bias
-                if not is_speech and len(label_list) > 0:
-                    speech_idx = -1
-                    for i, label in enumerate(label_list):
-                        if label == 'speech':
-                            speech_idx = i
-                            break
-                    
-                    if speech_idx >= 0 and speech_idx < len(aggregated):
-                        # Slightly reduce speech probability to give other sounds a better chance
-                        speech_prob = aggregated[speech_idx]
-                        aggregated[speech_idx] = speech_prob * 0.8
-                
                 # Debug the aggregation
                 logger.info(f"Aggregating {len(valid_predictions)} predictions {'(speech)' if is_speech else ''}")
             else:
@@ -1142,30 +1082,12 @@ def handle_source(json_data):
             })
             return
         
-        # Apply speech bias correction - the model is heavily biased toward speech
-        speech_index = -1
-        modified_predictions = pred[0].copy()
-        
-        # Find the speech index
-        for i, x in enumerate(active_context):
-            if x == 'speech' and homesounds.labels[x] < len(modified_predictions):
-                speech_index = homesounds.labels[x]
-                break
-        
-        # Apply correction to speech confidence if it's too high
-        if speech_index >= 0:
-            original_speech_confidence = modified_predictions[speech_index]
-            # Only apply correction if speech confidence is very high
-            if original_speech_confidence > 0.8:
-                modified_predictions[speech_index] = original_speech_confidence * (1.0 - SPEECH_BIAS_CORRECTION)
-                print(f"Applied speech bias correction: {original_speech_confidence:.4f} -> {modified_predictions[speech_index]:.4f}")
-            
-        # Take predictions from the valid indices
-        context_prediction = np.take(modified_predictions, valid_indices)
+        # Take predictions from the valid indices - using original logic, no speech bias correction  
+        context_prediction = np.take(pred[0], valid_indices)
         m = np.argmax(context_prediction)
         print('Max prediction', homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]], context_prediction[m])
         
-        # Check if prediction confidence is high enough
+        # Check if prediction confidence is high enough using original server logic
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
             print(f"Prediction: {label} ({context_prediction[m]:.4f})")
@@ -1176,47 +1098,6 @@ def handle_source(json_data):
                 socketio.emit('audio_label', {
                     'label': 'Unrecognized Sound',
                     'accuracy': '1.0',
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
-                return
-            
-            # Special case for "Speech" - use higher threshold to prevent false positives
-            if label == "Speech" and context_prediction[m] < SPEECH_PREDICTION_THRES:
-                print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
-                
-                # Find the second highest prediction instead
-                second_best_index = -1
-                second_best_confidence = 0
-                
-                # Create a copy of context_prediction and set the max value to 0
-                second_best_prediction = context_prediction.copy()
-                second_best_prediction[m] = 0
-                
-                # Find the new max
-                second_best_m = np.argmax(second_best_prediction)
-                second_best_confidence = second_best_prediction[second_best_m]
-                
-                # If the second best prediction is good enough, use it instead
-                if second_best_confidence > PREDICTION_THRES * 0.7:  # Lower threshold for second best
-                    second_best_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[second_best_m])]]
-                    print(f"Using second best prediction: {second_best_label} ({second_best_confidence:.4f})")
-                    
-                    socketio.emit('audio_label', {
-                        'label': second_best_label,
-                        'accuracy': str(second_best_confidence),
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
-                    })
-                    print(f"EMITTING: {second_best_label} ({second_best_confidence:.2f})")
-                    return
-                
-                # Otherwise, mark as unrecognized
-                socketio.emit('audio_label', {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '0.3',
                     'db': str(db),
                     'time': str(time_data),
                     'record_time': str(record_time) if record_time else ''
