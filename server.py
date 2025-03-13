@@ -150,11 +150,6 @@ socketio = SocketIO(app, async_mode=async_mode)
 thread = None
 thread_lock = Lock()
 
-# contexts
-context = homesounds.everything
-# use this to change context -- see homesounds.py
-active_context = homesounds.everything
-
 # thresholds
 PREDICTION_THRES = 0.5  # Changed from 0.15 to 0.5 to match original server
 FINGER_SNAP_THRES = 0.4  # Increased from 0.03 to make it harder to detect false finger snaps
@@ -164,6 +159,21 @@ SPEECH_SENTIMENT_THRES = 0.6  # Increased from 0.35 to 0.6 to reduce false speec
 CHOPPING_THRES = 0.7  # Unchanged - higher threshold for chopping sounds
 SPEECH_PREDICTION_THRES = 0.7  # Unchanged - higher threshold for speech
 SPEECH_DETECTION_THRES = 0.5  # Increased from 0.30 to 0.5 to reduce false speech detection
+
+# Define model-specific contexts - only use the first 30 sound classes (0-29) that the model was trained on
+core_sounds = [
+    'dog-bark', 'drill', 'hazard-alarm', 'phone-ring', 'speech', 
+    'vacuum', 'baby-cry', 'chopping', 'cough', 'door', 
+    'water-running', 'knock', 'microwave', 'shaver', 'toothbrush', 
+    'blender', 'dishwasher', 'doorbell', 'flush', 'hair-dryer', 
+    'laugh', 'snore', 'typing', 'hammer', 'car-horn', 
+    'engine', 'saw', 'cat-meow', 'alarm-clock', 'cooking'
+]
+
+# contexts - use only the valid sound labels the model can recognize
+context = core_sounds
+# use this context for active detection - IMPORTANT: This line fixes the invalid label warnings
+active_context = core_sounds
 
 CHANNELS = 1
 RATE = 16000
