@@ -659,16 +659,33 @@ def handle_source(json_data):
         debug_predictions(predictions[0], homesounds.everything)
         
         # Find maximum prediction for active context
-        context_prediction = np.take(
-            predictions[0], [homesounds.labels[x] for x in active_context])
+        # Fix for index out of bounds error - ensure indices are valid
+        valid_indices = []
+        for x in active_context:
+            if x in homesounds.labels and homesounds.labels[x] < len(predictions[0]):
+                valid_indices.append(homesounds.labels[x])
+            else:
+                print(f"Warning: Label '{x}' maps to an invalid index or is not found in homesounds.labels")
+        
+        if not valid_indices:
+            print("Error: No valid sound labels found in current context")
+            socketio.emit('audio_label', {
+                'label': 'Error: Invalid Sound Context',
+                'accuracy': '0.0',
+                'db': str(db)
+            })
+            return
+            
+        context_prediction = np.take(predictions[0], valid_indices)
         m = np.argmax(context_prediction)
         
         # Check if prediction confidence is high enough
         if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
-            print(f"Top prediction: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})")
+            # Get the corresponding label from the valid indices
+            human_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
+            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f})")
             
             # Process sound-specific logic
-            human_label = homesounds.to_human_labels[active_context[m]]
             
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
@@ -1094,13 +1111,30 @@ def handle_source(json_data):
         pred = tensorflow_predict(x)
         
         # Find maximum prediction for active context
-        context_prediction = np.take(pred[0], [homesounds.labels[x] for x in active_context])
+        # Fix for index out of bounds error - ensure indices are valid
+        valid_indices = []
+        for x in active_context:
+            if x in homesounds.labels and homesounds.labels[x] < len(pred[0]):
+                valid_indices.append(homesounds.labels[x])
+            else:
+                print(f"Warning: Label '{x}' maps to an invalid index or is not found in homesounds.labels")
+        
+        if not valid_indices:
+            print("Error: No valid sound labels found in current context")
+            socketio.emit('audio_label', {
+                'label': 'Error: Invalid Sound Context',
+                'accuracy': '0.0',
+                'db': str(db)
+            })
+            return
+            
+        context_prediction = np.take(pred[0], valid_indices)
         m = np.argmax(context_prediction)
-        print('Max prediction', homesounds.to_human_labels[active_context[m]], context_prediction[m])
+        print('Max prediction', homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]], context_prediction[m])
         
         # Check if prediction confidence is high enough
         if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
-            label = homesounds.to_human_labels[active_context[m]]
+            label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
             print(f"Prediction: {label} ({context_prediction[m]:.4f})")
             
             # Special case for "Chopping" - use higher threshold
