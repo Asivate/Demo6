@@ -126,10 +126,16 @@ tf.compat.v1.disable_eager_execution()
 
 # Create a TensorFlow lock for thread safety, and another lock for the AST model
 tf_lock = Lock()
-tf_graph = tf.Graph()
+tf_graph = tf.compat.v1.Graph()
 tf_session = tf.compat.v1.Session(graph=tf_graph)
 ast_lock = Lock()
 speech_lock = Lock() # Lock for speech processing
+
+# Dictionary to store model-specific info
+model_info = {
+    "input_name": None,
+    "output_name": None
+}
 
 # Prediction aggregation system - store recent predictions to improve accuracy
 MAX_PREDICTIONS_HISTORY = 3  # Increased from 2 to 3 for more stable non-speech sound detection
@@ -280,7 +286,19 @@ def load_models():
             # Try to load the model with the new API
             with tf_graph.as_default():
                 with tf_session.as_default():
-                    models["tensorflow"] = keras.models.load_model(model_filename)
+                    # Load the model in a way that preserves input names
+                    models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                    
+                    # Find the input tensor name
+                    input_layers = models["tensorflow"].inputs
+                    if input_layers and len(input_layers) > 0:
+                        model_info["input_name"] = input_layers[0].name
+                        print(f"Determined model input tensor name: {model_info['input_name']}")
+                    else:
+                        # Default fallback name
+                        model_info["input_name"] = "input_1:0"
+                        print(f"Could not determine input tensor name, using default: {model_info['input_name']}")
+                    
                     # Make a dummy prediction to ensure the predict function is initialized
                     # This is critical for TensorFlow 1.x compatibility
                     print("Initializing TensorFlow model with a dummy prediction...")
@@ -293,22 +311,67 @@ def load_models():
                 models["tensorflow"].summary()
         except Exception as e:
             print(f"Error loading TensorFlow model with standard method: {e}")
+            traceback.print_exc()
             # Fallback for older model formats
             try:
                 with tf_graph.as_default():
                     with tf_session.as_default():
+                        # Load model using a more explicit approach
                         models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                        # Make a dummy prediction to ensure the predict function is initialized
-                        # This is critical for TensorFlow 1.x compatibility
-                        print("Initializing TensorFlow model with a dummy prediction...")
+                        
+                        # Create function that uses the session directly
+                        model = models["tensorflow"]
+                        
+                        # Create a custom predict function that uses the session directly
+                        def custom_predict(x):
+                            # Get input and output tensors
+                            input_tensor = model.inputs[0]
+                            output_tensor = model.outputs[0]
+                            # Run prediction in the session
+                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                        
+                        # Replace the model's predict function with our custom one
+                        models["tensorflow"].predict = custom_predict
+                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                        
+                        # Test it
                         dummy_input = np.zeros((1, 96, 64, 1))
                         _ = models["tensorflow"].predict(dummy_input)
-                        print("Model prediction function initialized successfully")
-                print("TensorFlow model loaded with compile=False option")
+                        print("Custom prediction function initialized successfully")
             except Exception as e2:
                 print(f"Error with fallback method: {e2}")
-                if not USE_AST_MODEL:
-                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+                traceback.print_exc()
+                try:
+                    print("Trying third fallback method with explicit tensor names...")
+                    with tf_graph.as_default():
+                        with tf_session.as_default():
+                            # Load model using a more explicit approach
+                            models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                            
+                            # Create function that uses the session directly
+                            model = models["tensorflow"]
+                            
+                            # Create a custom predict function that uses the session directly
+                            def custom_predict(x):
+                                # Get input and output tensors
+                                input_tensor = model.inputs[0]
+                                output_tensor = model.outputs[0]
+                                # Run prediction in the session
+                                return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                            
+                            # Replace the model's predict function with our custom one
+                            models["tensorflow"].predict = custom_predict
+                            model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                            
+                            # Test it
+                            dummy_input = np.zeros((1, 96, 64, 1))
+                            _ = models["tensorflow"].predict(dummy_input)
+                            print("Custom prediction function initialized successfully")
+                except Exception as e3:
+                    print(f"Error with third fallback method: {e3}")
+                    traceback.print_exc()
+                    if not USE_AST_MODEL:
+                        raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
     print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
@@ -397,7 +460,19 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
         # Try to load the model with the new API
         with tf_graph.as_default():
             with tf_session.as_default():
-                models["tensorflow"] = keras.models.load_model(model_filename)
+                # Load the model in a way that preserves input names
+                models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                
+                # Find the input tensor name
+                input_layers = models["tensorflow"].inputs
+                if input_layers and len(input_layers) > 0:
+                    model_info["input_name"] = input_layers[0].name
+                    print(f"Determined model input tensor name: {model_info['input_name']}")
+                else:
+                    # Default fallback name
+                    model_info["input_name"] = "input_1:0"
+                    print(f"Could not determine input tensor name, using default: {model_info['input_name']}")
+                
                 # Make a dummy prediction to ensure the predict function is initialized
                 # This is critical for TensorFlow 1.x compatibility
                 print("Initializing TensorFlow model with a dummy prediction...")
@@ -410,24 +485,70 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
             models["tensorflow"].summary()
     except Exception as e:
         print(f"Error loading TensorFlow model with standard method: {e}")
+        traceback.print_exc()
         # Fallback for older model formats
         try:
             with tf_graph.as_default():
                 with tf_session.as_default():
+                    # Load model using a more explicit approach
                     models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                    # Make a dummy prediction to ensure the predict function is initialized
-                    # This is critical for TensorFlow 1.x compatibility
-                    print("Initializing TensorFlow model with a dummy prediction...")
+                    
+                    # Create function that uses the session directly
+                    model = models["tensorflow"]
+                    
+                    # Create a custom predict function that uses the session directly
+                    def custom_predict(x):
+                        # Get input and output tensors
+                        input_tensor = model.inputs[0]
+                        output_tensor = model.outputs[0]
+                        # Run prediction in the session
+                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                    
+                    # Replace the model's predict function with our custom one
+                    models["tensorflow"].predict = custom_predict
+                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                    
+                    # Test it
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
-                    print("Model prediction function initialized successfully")
+                    print("Custom prediction function initialized successfully")
             print("TensorFlow model loaded with compile=False option")
         except Exception as e2:
             print(f"Error with fallback method: {e2}")
-            if not USE_AST_MODEL:
-                raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+            traceback.print_exc()
+            try:
+                print("Trying third fallback method with explicit tensor names...")
+                with tf_graph.as_default():
+                    with tf_session.as_default():
+                        # Load model using a more explicit approach
+                        models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                        
+                        # Create function that uses the session directly
+                        model = models["tensorflow"]
+                        
+                        # Create a custom predict function that uses the session directly
+                        def custom_predict(x):
+                            # Get input and output tensors
+                            input_tensor = model.inputs[0]
+                            output_tensor = model.outputs[0]
+                            # Run prediction in the session
+                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                        
+                        # Replace the model's predict function with our custom one
+                        models["tensorflow"].predict = custom_predict
+                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                        
+                        # Test it
+                        dummy_input = np.zeros((1, 96, 64, 1))
+                        _ = models["tensorflow"].predict(dummy_input)
+                        print("Custom prediction function initialized successfully")
+            except Exception as e3:
+                print(f"Error with third fallback method: {e3}")
+                traceback.print_exc()
+                if not USE_AST_MODEL:
+                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
-print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
+    print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
 # ##############################
 # # Setup Audio Callback
@@ -462,82 +583,15 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
 
     return (in_data, 0)  # pyaudio.paContinue equivalent
 
+# Custom TensorFlow prediction function
+def tensorflow_predict(x_input):
+    """Make predictions with TensorFlow model in the correct session context."""
+    with tf_lock:
+        with tf_graph.as_default():
+            with tf_session.as_default():
+                return models["tensorflow"].predict(x_input)
 
-@socketio.on('audio_feature_data')
-def handle_source(json_data):
-    """Handle audio features sent from client.
-    
-    Args:
-        json_data: JSON object containing audio data
-    """
-    try:
-        data = str(json_data.get('data', ''))
-        db = json_data.get('db', 0)
-        time_data = json_data.get('time', 0)
-        record_time = json_data.get('record_time', None)
-        
-        # Convert feature data to numpy array
-        data = data.strip('[]')  # Remove square brackets if present
-        x = np.fromstring(data, dtype=np.float16, sep=',')
-        print('Data after to numpy', x)
-        
-        # Reshape for TensorFlow model
-        x = x.reshape(1, 96, 64, 1)
-        print('Successfully reshape audio features', x.shape)
-        
-        # Make prediction with TensorFlow model
-        with tf_lock:
-            pred = models["tensorflow"].predict(x)
-        
-        # Find maximum prediction for active context
-        context_prediction = np.take(pred[0], [homesounds.labels[x] for x in active_context])
-        m = np.argmax(context_prediction)
-        print('Max prediction', homesounds.to_human_labels[active_context[m]], context_prediction[m])
-        
-        # Check if prediction confidence is high enough
-        if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
-            label = homesounds.to_human_labels[active_context[m]]
-            print(f"Prediction: {label} ({context_prediction[m]:.4f})")
-            
-            # Special case for "Chopping" - use higher threshold
-            if label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
-                print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                socketio.emit('audio_label', {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '1.0',
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
-                return
-                
-            # Emit the sound label
-            socketio.emit('audio_label', {
-                'label': label,
-                'accuracy': str(context_prediction[m]),
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
-        else:
-            # Sound didn't meet confidence threshold
-            socketio.emit('audio_label', {
-                'label': 'Unrecognized Sound',
-                'accuracy': '1.0',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
-    except Exception as e:
-        print(f"Error in handle_source: {str(e)}")
-        traceback.print_exc()
-        socketio.emit('audio_label', {
-            'label': 'Error Processing Audio Features',
-            'accuracy': '0.0',
-            'db': str(db) if 'db' in locals() else '-100'
-        })
-
-
+# Modify the audio_data handler to use our custom prediction function
 @socketio.on('audio_data')
 def handle_source(json_data):
     """Handle audio data sent from client.
@@ -597,10 +651,9 @@ def handle_source(json_data):
             
         print(f"Processed audio data shape: {x_input.shape}")
         
-        # Make prediction with TensorFlow model
+        # Make prediction with TensorFlow model using our custom function
         print("Making prediction with TensorFlow model...")
-        with tf_lock:
-            predictions = models["tensorflow"].predict(x_input)
+        predictions = tensorflow_predict(x_input)
         
         # Debug all raw predictions (before thresholding)
         debug_predictions(predictions[0], homesounds.everything)
@@ -1014,6 +1067,79 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
             logger.info(f"Aggregation kept same top prediction: {label}, confidence: {new_prediction[orig_top_idx]:.4f} -> {aggregated[orig_top_idx]:.4f}")
         
         return aggregated
+
+@socketio.on('audio_feature_data')
+def handle_source(json_data):
+    """Handle audio features sent from client.
+    
+    Args:
+        json_data: JSON object containing audio data
+    """
+    try:
+        data = str(json_data.get('data', ''))
+        db = json_data.get('db', 0)
+        time_data = json_data.get('time', 0)
+        record_time = json_data.get('record_time', None)
+        
+        # Convert feature data to numpy array
+        data = data.strip('[]')  # Remove square brackets if present
+        x = np.fromstring(data, dtype=np.float16, sep=',')
+        print('Data after to numpy', x)
+        
+        # Reshape for TensorFlow model
+        x = x.reshape(1, 96, 64, 1)
+        print('Successfully reshape audio features', x.shape)
+        
+        # Make prediction with TensorFlow model using our custom function
+        pred = tensorflow_predict(x)
+        
+        # Find maximum prediction for active context
+        context_prediction = np.take(pred[0], [homesounds.labels[x] for x in active_context])
+        m = np.argmax(context_prediction)
+        print('Max prediction', homesounds.to_human_labels[active_context[m]], context_prediction[m])
+        
+        # Check if prediction confidence is high enough
+        if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
+            label = homesounds.to_human_labels[active_context[m]]
+            print(f"Prediction: {label} ({context_prediction[m]:.4f})")
+            
+            # Special case for "Chopping" - use higher threshold
+            if label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
+                print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
+                socketio.emit('audio_label', {
+                    'label': 'Unrecognized Sound',
+                    'accuracy': '1.0',
+                    'db': str(db),
+                    'time': str(time_data),
+                    'record_time': str(record_time) if record_time else ''
+                })
+                return
+                
+            # Emit the sound label
+            socketio.emit('audio_label', {
+                'label': label,
+                'accuracy': str(context_prediction[m]),
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
+            })
+        else:
+            # Sound didn't meet confidence threshold
+            socketio.emit('audio_label', {
+                'label': 'Unrecognized Sound',
+                'accuracy': '1.0',
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
+            })
+    except Exception as e:
+        print(f"Error in handle_source: {str(e)}")
+        traceback.print_exc()
+        socketio.emit('audio_label', {
+            'label': 'Error Processing Audio Features',
+            'accuracy': '0.0',
+            'db': str(db) if 'db' in locals() else '-100'
+        })
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
