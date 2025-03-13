@@ -293,37 +293,36 @@ def load_models():
         print("Using TensorFlow model: %s" % (model_filename))
         
         try:
-            # Try to load the model with the new API
             with tf_graph.as_default():
                 with tf_session.as_default():
-                    # Load the model in a way that preserves input names
+                    # Load model using a more explicit approach
                     models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
                     
-                    # Find the input tensor name
-                    input_layers = models["tensorflow"].inputs
-                    if input_layers and len(input_layers) > 0:
-                        model_info["input_name"] = input_layers[0].name
-                        print(f"Determined model input tensor name: {model_info['input_name']}")
-                    else:
-                        # Default fallback name
-                        model_info["input_name"] = "input_1:0"
-                        print(f"Could not determine input tensor name, using default: {model_info['input_name']}")
+                    # Create function that uses the session directly
+                    model = models["tensorflow"]
                     
-                    # Make a dummy prediction to ensure the predict function is initialized
-                    # This is critical for TensorFlow 1.x compatibility
-                    print("Initializing TensorFlow model with a dummy prediction...")
+                    # Create a custom predict function that uses the session directly
+                    def custom_predict(x):
+                        # Get input and output tensors
+                        input_tensor = model.inputs[0]
+                        output_tensor = model.outputs[0]
+                        # Run prediction in the session
+                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                    
+                    # Replace the model's predict function with our custom one
+                    models["tensorflow"].predict = custom_predict
+                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                    
+                    # Test it
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
-                    print("Model prediction function initialized successfully")
-            print("TensorFlow model loaded successfully")
-            if not USE_AST_MODEL:
-                print("TensorFlow model will be used as primary model")
-                models["tensorflow"].summary()
-        except Exception as e:
-            print(f"Error loading TensorFlow model with standard method: {e}")
+                    print("Custom prediction function initialized successfully")
+            print("TensorFlow model loaded with compile=False option")
+        except Exception as e2:
+            print(f"Error with fallback method: {e2}")
             traceback.print_exc()
-            # Fallback for older model formats
             try:
+                print("Trying third fallback method with explicit tensor names...")
                 with tf_graph.as_default():
                     with tf_session.as_default():
                         # Load model using a more explicit approach
@@ -348,40 +347,12 @@ def load_models():
                         dummy_input = np.zeros((1, 96, 64, 1))
                         _ = models["tensorflow"].predict(dummy_input)
                         print("Custom prediction function initialized successfully")
-            except Exception as e2:
-                print(f"Error with fallback method: {e2}")
+                print("Third fallback method succeeded")
+            except Exception as e3:
+                print(f"Error with third fallback method: {e3}")
                 traceback.print_exc()
-                try:
-                    print("Trying third fallback method with explicit tensor names...")
-                    with tf_graph.as_default():
-                        with tf_session.as_default():
-                            # Load model using a more explicit approach
-                            models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                            
-                            # Create function that uses the session directly
-                            model = models["tensorflow"]
-                            
-                            # Create a custom predict function that uses the session directly
-                            def custom_predict(x):
-                                # Get input and output tensors
-                                input_tensor = model.inputs[0]
-                                output_tensor = model.outputs[0]
-                                # Run prediction in the session
-                                return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                            
-                            # Replace the model's predict function with our custom one
-                            models["tensorflow"].predict = custom_predict
-                            model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                            
-                            # Test it
-                            dummy_input = np.zeros((1, 96, 64, 1))
-                            _ = models["tensorflow"].predict(dummy_input)
-                            print("Custom prediction function initialized successfully")
-                except Exception as e3:
-                    print(f"Error with third fallback method: {e3}")
-                    traceback.print_exc()
-                    if not USE_AST_MODEL:
-                        raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+                if not USE_AST_MODEL:
+                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
     print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
@@ -467,37 +438,36 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
     print("Using TensorFlow model: %s" % (model_filename))
     
     try:
-        # Try to load the model with the new API
         with tf_graph.as_default():
             with tf_session.as_default():
-                # Load the model in a way that preserves input names
+                # Load model using a more explicit approach
                 models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
                 
-                # Find the input tensor name
-                input_layers = models["tensorflow"].inputs
-                if input_layers and len(input_layers) > 0:
-                    model_info["input_name"] = input_layers[0].name
-                    print(f"Determined model input tensor name: {model_info['input_name']}")
-                else:
-                    # Default fallback name
-                    model_info["input_name"] = "input_1:0"
-                    print(f"Could not determine input tensor name, using default: {model_info['input_name']}")
+                # Create function that uses the session directly
+                model = models["tensorflow"]
                 
-                # Make a dummy prediction to ensure the predict function is initialized
-                # This is critical for TensorFlow 1.x compatibility
-                print("Initializing TensorFlow model with a dummy prediction...")
+                # Create a custom predict function that uses the session directly
+                def custom_predict(x):
+                    # Get input and output tensors
+                    input_tensor = model.inputs[0]
+                    output_tensor = model.outputs[0]
+                    # Run prediction in the session
+                    return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                
+                # Replace the model's predict function with our custom one
+                models["tensorflow"].predict = custom_predict
+                model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                
+                # Test it
                 dummy_input = np.zeros((1, 96, 64, 1))
                 _ = models["tensorflow"].predict(dummy_input)
-                print("Model prediction function initialized successfully")
-        print("TensorFlow model loaded successfully")
-        if not USE_AST_MODEL:
-            print("TensorFlow model will be used as primary model")
-            models["tensorflow"].summary()
-    except Exception as e:
-        print(f"Error loading TensorFlow model with standard method: {e}")
+                print("Custom prediction function initialized successfully")
+        print("TensorFlow model loaded with compile=False option")
+    except Exception as e2:
+        print(f"Error with fallback method: {e2}")
         traceback.print_exc()
-        # Fallback for older model formats
         try:
+            print("Trying third fallback method with explicit tensor names...")
             with tf_graph.as_default():
                 with tf_session.as_default():
                     # Load model using a more explicit approach
@@ -522,41 +492,12 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
                     print("Custom prediction function initialized successfully")
-            print("TensorFlow model loaded with compile=False option")
-        except Exception as e2:
-            print(f"Error with fallback method: {e2}")
+            print("Third fallback method succeeded")
+        except Exception as e3:
+            print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
-            try:
-                print("Trying third fallback method with explicit tensor names...")
-                with tf_graph.as_default():
-                    with tf_session.as_default():
-                        # Load model using a more explicit approach
-                        models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                        
-                        # Create function that uses the session directly
-                        model = models["tensorflow"]
-                        
-                        # Create a custom predict function that uses the session directly
-                        def custom_predict(x):
-                            # Get input and output tensors
-                            input_tensor = model.inputs[0]
-                            output_tensor = model.outputs[0]
-                            # Run prediction in the session
-                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                        
-                        # Replace the model's predict function with our custom one
-                        models["tensorflow"].predict = custom_predict
-                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                        
-                        # Test it
-                        dummy_input = np.zeros((1, 96, 64, 1))
-                        _ = models["tensorflow"].predict(dummy_input)
-                        print("Custom prediction function initialized successfully")
-                except Exception as e3:
-                    print(f"Error with third fallback method: {e3}")
-                    traceback.print_exc()
-                    if not USE_AST_MODEL:
-                        raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+            if not USE_AST_MODEL:
+                raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
     print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
