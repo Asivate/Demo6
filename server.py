@@ -167,10 +167,11 @@ FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
 DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
 SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
 SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
-CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
+CHOPPING_THRES = 0.85  # Increased from 0.7 to 0.85 to reduce false positives
 SPEECH_PREDICTION_THRES = 0.85  # Threshold for speech detection
 SPEECH_DETECTION_THRES = 0.7  # Secondary threshold for speech detection
 SPEECH_BIAS_CORRECTION = 0.5  # Increased correction factor for speech bias (from 0.3 to 0.5)
+KNOCK_DETECTION_THRES = 0.04  # Lowered threshold specifically for knock detection (very sensitive)
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -510,7 +511,7 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
                     print("Custom prediction function initialized successfully")
-                print("Third fallback method succeeded")
+            print("Third fallback method succeeded")
         except Exception as e3:
             print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
@@ -634,6 +635,9 @@ def handle_source(json_data):
             db = dbFS(rms)
         print(f"Db... {db}")
         
+        # Store original audio for potential use in speech processing
+        original_audio = np_wav.copy()
+        
         # ENHANCED SILENCE DETECTION: Check if audio is silent - emit silence and return early
         if db < SILENCE_THRES:
             print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
@@ -649,7 +653,12 @@ def handle_source(json_data):
         # Check original audio size
         original_size = np_wav.size
         print(f"Original np_wav shape: {np_wav.shape}, size: {original_size}")
-
+        
+        # Create two separate processed versions of the audio:
+        # 1. Regular processing for general sound detection
+        # 2. Specialized processing for knock detection
+        knock_detection_audio = enhance_knock_detection(np_wav, RATE)
+        
         # Pad audio if needed to match expected size for models
         if original_size < RATE:
             # Pad with zeros to reach 1 second (16000 samples)
@@ -664,18 +673,33 @@ def handle_source(json_data):
                     # If still not enough, add zero padding
                     padding = np.zeros(RATE - np_wav.size)
                     np_wav = np.concatenate([np_wav, padding])
+                
+                # Also pad the knock detection audio
+                if knock_detection_audio.size < RATE:
+                    # Specialized padding for knock detection
+                    # For knocks, we want to preserve the transient nature, so use a gentler approach
+                    knock_detection_audio = np.tile(knock_detection_audio, 2)[:RATE]
+                    if knock_detection_audio.size < RATE:
+                        padding = np.zeros(RATE - knock_detection_audio.size)
+                        knock_detection_audio = np.concatenate([knock_detection_audio, padding])
             else:
                 # For longer samples, just pad with zeros
                 padding = np.zeros(RATE - original_size)
                 np_wav = np.concatenate([np_wav, padding])
+                
+                # Also pad the knock detection audio
+                if knock_detection_audio.size < RATE:
+                    padding = np.zeros(RATE - knock_detection_audio.size)
+                    knock_detection_audio = np.concatenate([knock_detection_audio, padding])
             
             print(f"Padded audio data to size: {RATE} samples (1 second)")
         
-        # Convert waveform to examples (spectrogram features)
-        x = waveform_to_examples(np_wav, RATE)
+        # Process both versions of the audio
+        regular_features = waveform_to_examples(np_wav, RATE)
+        knock_features = waveform_to_examples(knock_detection_audio, RATE)
         
-        # Basic sanity check for x
-        if x.shape[0] == 0:
+        # Check if we got valid features
+        if regular_features.shape[0] == 0 or knock_features.shape[0] == 0:
             print("Error: Empty audio features")
             socketio.emit('audio_label', {
                 'label': 'Error: Empty Audio Features',
@@ -684,21 +708,45 @@ def handle_source(json_data):
             })
             return
         
-        # Use the first frame (or whichever is appropriate)
-        if x.shape[0] > 1:
-            print(f"Using first frame from multiple frames: {x.shape[1:3]}")
-            x_input = x[0].reshape(1, 96, 64, 1)  # Reshape for model input
+        # Reshape for model input
+        if regular_features.shape[0] > 1:
+            regular_input = regular_features[0].reshape(1, 96, 64, 1)
         else:
-            x_input = x.reshape(1, 96, 64, 1)
+            regular_input = regular_features.reshape(1, 96, 64, 1)
             
-        print(f"Processed audio data shape: {x_input.shape}")
+        if knock_features.shape[0] > 1:
+            knock_input = knock_features[0].reshape(1, 96, 64, 1)
+        else:
+            knock_input = knock_features.reshape(1, 96, 64, 1)
         
-        # Make prediction with TensorFlow model using our custom function
-        print("Making prediction with TensorFlow model...")
-        predictions = tensorflow_predict(x_input, db)
+        print(f"Processed regular audio data shape: {regular_input.shape}")
+        print(f"Processed knock-enhanced audio data shape: {knock_input.shape}")
         
-        # Debug all raw predictions (before thresholding)
-        debug_predictions(predictions[0], homesounds.everything)
+        # Make predictions with both versions
+        print("Making predictions with TensorFlow model...")
+        regular_predictions = tensorflow_predict(regular_input, db)
+        knock_predictions = tensorflow_predict(knock_input, db)
+        
+        # Debug the predictions
+        debug_predictions(regular_predictions[0], homesounds.everything)
+        
+        # Specifically look at knock confidence in both predictions
+        knock_idx = homesounds.labels.get('knock', 11)
+        if knock_idx < len(regular_predictions[0]) and knock_idx < len(knock_predictions[0]):
+            regular_knock_conf = regular_predictions[0][knock_idx]
+            enhanced_knock_conf = knock_predictions[0][knock_idx]
+            print(f"Knock confidence: Regular={regular_knock_conf:.4f}, Enhanced={enhanced_knock_conf:.4f}")
+            
+            # If the enhanced processing significantly improved knock detection, use it
+            if enhanced_knock_conf > 0.08 and enhanced_knock_conf > regular_knock_conf * 1.2:
+                print(f"Using knock-enhanced prediction (improved by {enhanced_knock_conf/max(regular_knock_conf, 0.001):.2f}x)")
+                predictions = knock_predictions
+            else:
+                # Otherwise use regular predictions
+                predictions = regular_predictions
+        else:
+            # If we can't find the knock index, use regular predictions
+            predictions = regular_predictions
         
         # Find maximum prediction for active context
         # Fix for index out of bounds error - ensure indices are valid
@@ -775,7 +823,7 @@ def handle_source(json_data):
                         
                         # Special case for Knock detection with lower threshold
                         knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.05:  # Lowered threshold for knock from 0.15 to 0.05
+                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_DETECTION_THRES and db > DBLEVEL_THRES:  # Using constant instead of 0.05
                             print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence!")
                             socketio.emit('audio_label', {
                                 'label': 'Knocking',
@@ -1262,13 +1310,54 @@ def handle_source(json_data):
                 x = np.fromstring(data, dtype=np.float32, sep=',')
             else:
                 raise ValueError("Could not convert feature data to numpy array")
-                
-        # Reshape for model input
-        x = x.reshape(1, 96, 64, 1)
-        print(f"Successfully reshaped audio features: {x.shape}")
         
-        # Make prediction with TensorFlow model using our custom function
-        pred = tensorflow_predict(x, db)
+        # Enhanced knock detection - directly in feature space
+        # Since we're working with pre-processed features rather than raw audio,
+        # we'll enhance the features in a way that favors transient sounds
+        knock_enhanced_x = x.copy()
+        
+        # For spectrograms, knocks typically have strong onset characteristics
+        # Enhance the contrast in the spectrogram
+        if knock_enhanced_x.size > 0:
+            # Apply non-linear transformation to enhance differences
+            # Square the values to emphasize large values (typical of knocks)
+            knock_enhanced_x = np.power(knock_enhanced_x, 1.5)  # More aggressive than squaring
+            
+            # Normalize to maintain overall energy
+            if np.max(knock_enhanced_x) > 0:
+                scale_factor = np.max(x) / np.max(knock_enhanced_x)
+                knock_enhanced_x *= scale_factor
+            
+            print("Applied knock enhancement to feature data")
+        
+        # Reshape both feature sets for model input
+        regular_input = x.reshape(1, 96, 64, 1)
+        knock_input = knock_enhanced_x.reshape(1, 96, 64, 1)
+        
+        print(f"Successfully reshaped audio features: {regular_input.shape}")
+        print(f"Successfully reshaped knock-enhanced features: {knock_input.shape}")
+        
+        # Make predictions with both feature sets
+        regular_pred = tensorflow_predict(regular_input, db)
+        knock_pred = tensorflow_predict(knock_input, db)
+        
+        # Compare knock confidence in both predictions
+        knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
+        if knock_idx < len(regular_pred[0]) and knock_idx < len(knock_pred[0]):
+            regular_knock_conf = regular_pred[0][knock_idx]
+            enhanced_knock_conf = knock_pred[0][knock_idx]
+            print(f"Knock confidence: Regular={regular_knock_conf:.4f}, Enhanced={enhanced_knock_conf:.4f}")
+            
+            # If the enhanced processing significantly improved knock detection, use it
+            if enhanced_knock_conf > 0.08 and enhanced_knock_conf > regular_knock_conf * 1.2:
+                print(f"Using knock-enhanced prediction (improved by {enhanced_knock_conf/max(regular_knock_conf, 0.001):.2f}x)")
+                pred = knock_pred
+            else:
+                # Otherwise use regular predictions
+                pred = regular_pred
+        else:
+            # If knock index is invalid, use regular predictions
+            pred = regular_pred
         
         # Find maximum prediction for active context
         valid_indices = []
@@ -1341,7 +1430,7 @@ def handle_source(json_data):
                         
                         # Special case for Knock detection with lower threshold
                         knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.05:  # Lowered threshold for knock from 0.15 to 0.05
+                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_DETECTION_THRES and db > DBLEVEL_THRES:  # Using constant instead of 0.05
                             print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
                             socketio.emit('audio_label', {
                                 'label': 'Knocking',
@@ -1376,7 +1465,7 @@ def handle_source(json_data):
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.05 and db > DBLEVEL_THRES:  # Check knock and ensure sound is loud enough
+            if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_DETECTION_THRES and db > DBLEVEL_THRES:  # Using constant instead of 0.05
                 print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
                 socketio.emit('audio_label', {
                     'label': 'Knocking',
@@ -1398,6 +1487,69 @@ def handle_source(json_data):
     except Exception as e:
         print(f"Error in audio_feature_data handler: {str(e)}")
         traceback.print_exc()
+
+def enhance_knock_detection(audio_data, sample_rate=16000):
+    """
+    Specialized preprocessing to enhance knock detection in audio.
+    
+    Args:
+        audio_data: Raw audio numpy array
+        sample_rate: Sample rate of the audio (default: 16000 Hz)
+        
+    Returns:
+        Processed audio optimized for knock detection
+    """
+    from scipy import signal
+    import numpy as np
+    
+    # Check if we have enough audio
+    if len(audio_data) < 1000:  # Too short to process
+        return audio_data
+    
+    # 1. Apply bandpass filter to focus on knock frequency range (100-800 Hz)
+    # Knocks typically have most energy in this frequency range
+    nyquist = 0.5 * sample_rate
+    low = 100 / nyquist
+    high = 800 / nyquist
+    b, a = signal.butter(3, [low, high], btype='band')
+    try:
+        filtered_audio = signal.filtfilt(b, a, audio_data)
+    except Exception as e:
+        print(f"Filtering error: {e}")
+        filtered_audio = audio_data  # Fallback to original if filtering fails
+    
+    # 2. Detect transient onsets (sharp changes in amplitude typical of knocks)
+    # Calculate the envelope of the signal
+    analytic_signal = np.abs(signal.hilbert(filtered_audio))
+    
+    # 3. Enhance the onset of transient sounds (where knocks have most energy)
+    # First derivative to emphasize rapid changes
+    diff_signal = np.diff(analytic_signal)
+    diff_signal = np.append(diff_signal, 0)  # Append 0 to maintain length
+    
+    # Only keep positive changes (onsets) and zero out the rest
+    onset_signal = np.copy(diff_signal)
+    onset_signal[onset_signal < 0] = 0
+    
+    # 4. Apply non-linear enhancement to emphasize strong knocks
+    # Square the signal to emphasize large values
+    enhanced_signal = onset_signal ** 2
+    
+    # 5. Combine the original filtered signal with the enhanced onset detection
+    # Scale the enhanced signal to match the original
+    if np.max(enhanced_signal) > 0:
+        enhanced_signal = enhanced_signal / np.max(enhanced_signal) * np.max(np.abs(filtered_audio))
+    
+    # Blend original and enhanced signal with more weight on the enhanced component
+    alpha = 0.7  # Weight for enhanced component
+    processed_audio = (1 - alpha) * filtered_audio + alpha * enhanced_signal
+    
+    # 6. Normalize the final signal
+    if np.max(np.abs(processed_audio)) > 0:
+        processed_audio = processed_audio / np.max(np.abs(processed_audio)) * np.max(np.abs(audio_data))
+    
+    print(f"Applied specialized knock detection processing")
+    return processed_audio
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
