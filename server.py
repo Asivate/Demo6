@@ -178,19 +178,39 @@ APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
 # Add flag to disable Google Speech by default - use Whisper instead
 # USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
 
-# Define model-specific contexts - only use the first 30 sound classes (0-29) that the model was trained on
+# Define model-specific contexts based on SoundWatch research (20 high-priority sound classes)
+# High-priority sounds (like alarms, knocks) are listed first as they are most important for DHH users
 core_sounds = [
-    'dog-bark', 'drill', 'hazard-alarm', 'phone-ring', 'speech', 
-    'vacuum', 'baby-cry', 'chopping', 'cough', 'door', 
-    'water-running', 'knock', 'microwave', 'shaver', 'toothbrush', 
-    'blender', 'dishwasher', 'doorbell', 'flush', 'hair-dryer', 
-    'laugh', 'snore', 'typing', 'hammer', 'car-horn', 
-    'engine', 'saw', 'cat-meow', 'alarm-clock', 'cooking'
+    # High-priority sounds (critical for safety/awareness)
+    'hazard-alarm',    # Fire/smoke alarm - highest priority
+    'alarm-clock',     # Alarm clock
+    'knock',           # Door knock  
+    'doorbell',        # Doorbell
+    'phone-ring',      # Phone ringing
+    'baby-cry',        # Baby crying
+    
+    # Medium-priority household sounds
+    'door',            # Door opening/closing
+    'water-running',   # Running water
+    'microwave',       # Microwave beeping
+    'speech',          # Human speech
+    'dog-bark',        # Dog barking
+    'cat-meow',        # Cat meowing
+    'cough',           # Coughing
+    
+    # Common household appliances/activities
+    'vacuum',          # Vacuum cleaner
+    'blender',         # Blender
+    'chopping',        # Chopping (cooking)
+    'dishwasher',      # Dishwasher
+    'flush',           # Toilet flushing
+    'typing',          # Keyboard typing
+    'cooking'          # Cooking sounds
 ]
 
 # contexts - use only the valid sound labels the model can recognize
 context = core_sounds
-# use this context for active detection - IMPORTANT: This line fixes the invalid label warnings
+# use this context for active detection
 active_context = core_sounds
 
 CHANNELS = 1
@@ -510,7 +530,7 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                     dummy_input = np.zeros((1, 96, 64, 1))
                     _ = models["tensorflow"].predict(dummy_input)
                     print("Custom prediction function initialized successfully")
-                print("Third fallback method succeeded")
+            print("Third fallback method succeeded")
         except Exception as e3:
             print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
@@ -557,16 +577,20 @@ def tensorflow_predict(x_input, db_level=None):
     """Make predictions with TensorFlow model in the correct session context.
     
     Args:
-        x_input: Input data in the correct shape for the model
+        x_input: Input data in the correct shape for the model (1, 96, 64, 1)
         db_level: Optional decibel level of the audio, used for intelligent bias correction
+    
+    Returns:
+        List of predictions with speech bias correction applied if enabled
     """
     with tf_lock:
         with tf_graph.as_default():
             with tf_session.as_default():
+                # Make predictions - expect input shape (1, 96, 64, 1) as per SoundWatch specs
                 predictions = models["tensorflow"].predict(x_input)
                 
                 # Apply speech bias correction to reduce false speech detections
-                # Only apply correction if speech has very high confidence AND audio is not silent
+                # According to research, speech is often over-predicted by the model
                 if APPLY_SPEECH_BIAS_CORRECTION:
                     # Skip bias correction entirely if the audio is near-silent
                     if db_level is not None and db_level < SILENCE_THRES + 10:
@@ -574,20 +598,40 @@ def tensorflow_predict(x_input, db_level=None):
                     else:
                         for i in range(len(predictions)):
                             speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
+                            
+                            # Ensure the index is valid
                             if speech_idx < len(predictions[i]):
                                 # Check if speech confidence is unusually high for potentially silent audio
                                 is_silent = db_level is not None and db_level < DBLEVEL_THRES
+                                
                                 # Apply stronger correction for silent/near-silent audio
                                 correction = SPEECH_BIAS_CORRECTION * 1.5 if is_silent else SPEECH_BIAS_CORRECTION
                                 
-                                # Apply correction factor to reduce speech confidence
+                                # Get original speech confidence
                                 original_confidence = predictions[i][speech_idx]
-                                predictions[i][speech_idx] -= correction
-                                # Ensure it doesn't go below 0
-                                predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
                                 
-                                # Debug print to show the effect of bias correction
-                                print(f"Applied speech bias correction: {original_confidence:.4f} -> {predictions[i][speech_idx]:.4f} (correction: {correction:.2f})")
+                                # Only apply correction if speech is very high confidence
+                                # This prevents over-correction for genuine speech
+                                if original_confidence > 0.6:
+                                    # Apply correction factor to reduce speech confidence
+                                    predictions[i][speech_idx] -= correction
+                                    
+                                    # Ensure it doesn't go below 0
+                                    predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+                                    
+                                    # Slightly boost high-priority sounds to counter speech bias
+                                    # This helps ensure important sounds like alarms are detected properly
+                                    for priority_sound in ['hazard-alarm', 'alarm-clock', 'knock', 'doorbell']:
+                                        if priority_sound in homesounds.labels:
+                                            priority_idx = homesounds.labels[priority_sound]
+                                            if priority_idx < len(predictions[i]) and predictions[i][priority_idx] > 0.2:
+                                                # Boost high-priority sounds slightly if they already have some confidence
+                                                predictions[i][priority_idx] += 0.1
+                                                predictions[i][priority_idx] = min(1.0, predictions[i][priority_idx])  # Cap at 1.0
+                                                print(f"Boosted {priority_sound} from {predictions[i][priority_idx]-0.1:.4f} to {predictions[i][priority_idx]:.4f}")
+                                    
+                                    # Debug print to show the effect of bias correction
+                                    print(f"Applied speech bias correction: {original_confidence:.4f} -> {predictions[i][speech_idx]:.4f} (correction: {correction:.2f})")
                 
                 return predictions
 
@@ -606,17 +650,17 @@ def handle_source(json_data):
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
-        # Convert audio data to numpy array
+        # Convert audio data to numpy array - ensure float32 for consistent processing
         np_wav = np.array(data, dtype=np.float32)
         
         # Debug information
-        print(f"Successfully convert to NP rep {np_wav}")
+        print(f"Successfully converted to numpy array, shape: {np_wav.shape}")
         
         # Calculate decibel level if not provided
         if not db:
             rms = np.sqrt(np.mean(np_wav**2))
             db = dbFS(rms)
-        print(f"Db... {db}")
+        print(f"Audio decibel level: {db} dB")
         
         # ENHANCED SILENCE DETECTION: Check if audio is silent - emit silence and return early
         if db < SILENCE_THRES:
@@ -630,18 +674,25 @@ def handle_source(json_data):
             })
             return
         
-        # Check original audio size
+        # Check original audio size - SoundWatch requires exactly 1 second (16000 samples) of audio
         original_size = np_wav.size
-        print(f"Original np_wav shape: {np_wav.shape}, size: {original_size}")
+        print(f"Original audio: shape={np_wav.shape}, size={original_size} samples")
         
-        # Pad audio if needed to match expected size for models
+        # Ensure we have exactly 1 second of audio (16000 samples at 16KHz)
         if original_size < RATE:
-            # Pad with zeros to reach 1 second (16000 samples)
-            padding = np.zeros(RATE - original_size)
+            # Pad with zeros if shorter than 1 second (16000 samples)
+            padding = np.zeros(RATE - original_size, dtype=np.float32)
             np_wav = np.concatenate([np_wav, padding])
-            print(f"Padded audio data to size: {RATE} samples (1 second)")
+            print(f"Audio padded to {RATE} samples (1 second)")
+        elif original_size > RATE:
+            # Trim if longer than 1 second - use the most recent samples
+            np_wav = np_wav[-RATE:]
+            print(f"Audio trimmed to {RATE} samples (1 second)")
         
-        # Convert waveform to examples (spectrogram features)
+        # At this point, we have exactly 1 second of 16KHz audio as required by the model
+        
+        # Convert waveform to log mel-spectrogram features with 64 mel bins
+        # This matches the SoundWatch research specifications
         x = waveform_to_examples(np_wav, RATE)
         
         # Basic sanity check for x
@@ -654,24 +705,24 @@ def handle_source(json_data):
             })
             return
         
-        # Use the first frame (or whichever is appropriate)
+        # Reshape for model input - model expects shape (1, 96, 64, 1)
+        # 96 time frames, 64 mel bins, 1 channel
         if x.shape[0] > 1:
-            print(f"Using first frame from multiple frames: {x.shape[1:3]}")
-            x_input = x[0].reshape(1, 96, 64, 1)  # Reshape for model input
+            print(f"Using first frame from multiple frames: {x.shape}")
+            x_input = x[0].reshape(1, 96, 64, 1)
         else:
             x_input = x.reshape(1, 96, 64, 1)
             
-        print(f"Processed audio data shape: {x_input.shape}")
+        print(f"Processed audio features shape: {x_input.shape}")
         
-        # Make prediction with TensorFlow model using our custom function
+        # Make prediction with TensorFlow model
         print("Making prediction with TensorFlow model...")
         predictions = tensorflow_predict(x_input, db)
         
         # Debug all raw predictions (before thresholding)
         debug_predictions(predictions[0], homesounds.everything)
         
-        # Find maximum prediction for active context
-        # Fix for index out of bounds error - ensure indices are valid
+        # Use only valid indices for the active context
         valid_indices = []
         for x in active_context:
             if x in homesounds.labels and homesounds.labels[x] < len(predictions[0]):
@@ -697,7 +748,7 @@ def handle_source(json_data):
         human_label = homesounds.to_human_labels[predicted_label]
         
         # Print prediction information
-        print(f"Prediction: {human_label} ({context_prediction[m]:.2f}, db: {db})")
+        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}, db: {db})")
 
         # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
@@ -1217,11 +1268,12 @@ def handle_source(json_data):
                 'label': 'Silent',
                 'accuracy': '1.0',
                 'db': str(db),
-                'time': str(time_data)
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
             })
             return
             
-        # Convert feature data to numpy array
+        # Convert feature data to numpy array - handle both new and old formats
         try:
             # Try to convert directly (if data is a list of floats)
             x = np.array(data, dtype=np.float32)
@@ -1233,14 +1285,15 @@ def handle_source(json_data):
             else:
                 raise ValueError("Could not convert feature data to numpy array")
                 
-        # Reshape for model input
+        # Reshape to expected model input: (1, 96, 64, 1) - 96 time frames with 64 mel bins
+        # This matches the SoundWatch research specifications
         x = x.reshape(1, 96, 64, 1)
         print(f"Successfully reshaped audio features: {x.shape}")
         
-        # Make prediction with TensorFlow model using our custom function
+        # Make prediction with TensorFlow model
         pred = tensorflow_predict(x, db)
         
-        # Find maximum prediction for active context
+        # Find maximum prediction for active context - ensure valid indices
         valid_indices = []
         for label in active_context:
             if label in homesounds.labels and homesounds.labels[label] < len(pred[0]):
@@ -1253,7 +1306,9 @@ def handle_source(json_data):
             socketio.emit('audio_label', {
                 'label': 'Error: Invalid Sound Context',
                 'accuracy': '0.0',
-                'db': str(db)
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
             })
             return
             

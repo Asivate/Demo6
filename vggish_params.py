@@ -5,12 +5,13 @@ NUM_FRAMES = 96  # Frames in input mel-spectrogram patch.
 NUM_BANDS = 64  # Frequency bands in input mel-spectrogram patch.
 EMBEDDING_SIZE = 128  # Size of embedding layer.
 
-SAMPLE_RATE = 16000
-STFT_WINDOW_LENGTH_SECONDS = 0.025
-STFT_HOP_LENGTH_SECONDS = 0.010
-NUM_MEL_BINS = NUM_BANDS
-MEL_MIN_HZ = 125
-MEL_MAX_HZ = 7500
+# Audio settings - SoundWatch uses 16KHz, 1-second mono audio
+SAMPLE_RATE = 16000  # 16KHz sampling rate
+STFT_WINDOW_LENGTH_SECONDS = 0.025  # 25ms window
+STFT_HOP_LENGTH_SECONDS = 0.010  # 10ms hop (stride)
+NUM_MEL_BINS = NUM_BANDS  # 64 mel bins as specified in research
+MEL_MIN_HZ = 125  # Minimum frequency
+MEL_MAX_HZ = 7500  # Maximum frequency
 LOG_OFFSET = 0.01  # Offset used for stabilized log of input mel-spectrogram.
 EXAMPLE_WINDOW_SECONDS = 0.96  # Each example contains 96 10ms frames
 EXAMPLE_HOP_SECONDS = 0.96     # with zero overlap.
