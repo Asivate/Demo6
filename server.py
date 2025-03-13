@@ -162,9 +162,9 @@ thread = None
 thread_lock = Lock()
 
 # thresholds
-PREDICTION_THRES = 0.5  # General confidence threshold
+PREDICTION_THRES = 0.15  # Lower from 0.25/0.30 to 0.15
 FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
-DBLEVEL_THRES = -30  # Minimum decibel level for sound detection
+DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
 SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
 SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
@@ -696,10 +696,13 @@ def handle_source(json_data):
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
         
+        # Print prediction information
+        print(f"Prediction: {human_label} ({context_prediction[m]:.2f}, db: {db})")
+
         # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
-            
+
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
@@ -739,6 +742,20 @@ def handle_source(json_data):
                     else:
                         # No good alternative, emit unrecognized sound
                         print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
+                        
+                        # Special case for Knock detection with lower threshold
+                        knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
+                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15:  # Use lower threshold for knock
+                            print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
+                            socketio.emit('audio_label', {
+                                'label': 'Knocking',
+                                'accuracy': str(pred[0][knock_idx]),
+                                'db': str(db),
+                                'time': str(time_data),
+                                'record_time': str(record_time) if record_time else ''
+                            })
+                            return
+                        
                         socketio.emit('audio_label', {
                             'label': 'Unrecognized Sound',
                             'accuracy': '0.3',
@@ -813,31 +830,27 @@ def handle_source(json_data):
                                     'record_time': str(record_time) if record_time else ''
                                 })
                                 return
-            
-            # Regular sound detection for non-speech sounds
-            socketio.emit('audio_label', {
-                'label': human_label,
-                'accuracy': str(context_prediction[m]),
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
-            print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
-        else:
-            # Sound didn't meet thresholds
-            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
-            socketio.emit('audio_label', {
-                'label': 'Unrecognized Sound',
-                'accuracy': '0.5',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
-            print(f"EMITTING: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
+        
+        # Default case: Emit the detected sound
+        socketio.emit('audio_label', {
+            'label': human_label,
+            'accuracy': str(context_prediction[m]),
+            'db': str(db),
+            'time': str(time_data),
+            'record_time': str(record_time) if record_time else ''
+        })
+        print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
         traceback.print_exc()
+        # Send error message to client
+        socketio.emit('audio_label', {
+            'label': 'Error',
+            'accuracy': '0.0',
+            'db': str(db) if 'db' in locals() else '-100',
+            'time': str(time_data) if 'time_data' in locals() else '0',
+            'record_time': str(record_time) if 'record_time' in locals() and record_time else ''
+        })
 
 # Keep track of recent audio buffers for better speech transcription
 recent_audio_buffer = []
@@ -1265,20 +1278,20 @@ def handle_source(json_data):
                 })
                 return
                 
-            # Special case for "Speech" - use higher threshold
+            # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
                 # Apply stricter threshold for speech detection
                 if context_prediction[m] < SPEECH_PREDICTION_THRES:
                     print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
                     
-                    # Check for alternative predictions
+                    # Check if there's another sound with reasonable confidence
                     temp_context = context_prediction.copy()
                     speech_idx = valid_indices.index(valid_indices[m])
                     temp_context[speech_idx] = 0  # Zero out speech confidence
                     
                     second_best_idx = np.argmax(temp_context)
-                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:
-                        # Use the second-best prediction
+                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
+                        # Use the second-best prediction instead
                         second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
                         second_best_human_label = homesounds.to_human_labels[second_best_label]
                         print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
@@ -1287,17 +1300,33 @@ def handle_source(json_data):
                             'label': second_best_human_label,
                             'accuracy': str(temp_context[second_best_idx]),
                             'db': str(db),
-                            'time': str(time_data)
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
                         })
                         return
                     else:
-                        # No good alternative
+                        # No good alternative, emit unrecognized sound
                         print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
+                        
+                        # Special case for Knock detection with lower threshold
+                        knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
+                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15:  # Use lower threshold for knock
+                            print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
+                            socketio.emit('audio_label', {
+                                'label': 'Knocking',
+                                'accuracy': str(pred[0][knock_idx]),
+                                'db': str(db),
+                                'time': str(time_data),
+                                'record_time': str(record_time) if record_time else ''
+                            })
+                            return
+                        
                         socketio.emit('audio_label', {
                             'label': 'Unrecognized Sound',
                             'accuracy': '0.3',
                             'db': str(db),
-                            'time': str(time_data)
+                            'time': str(time_data),
+                            'record_time': str(record_time) if record_time else ''
                         })
                         return
             
@@ -1314,11 +1343,25 @@ def handle_source(json_data):
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
             print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
             
+            # Check for knock with lower threshold as a fallback
+            knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
+            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:  # Check knock and ensure sound is loud enough
+                print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
+                socketio.emit('audio_label', {
+                    'label': 'Knocking',
+                    'accuracy': str(pred[0][knock_idx]),
+                    'db': str(db),
+                    'time': str(time_data),
+                    'record_time': str(record_time) if record_time else ''
+                })
+                return
+            
             socketio.emit('audio_label', {
                 'label': 'Unrecognized Sound',
                 'accuracy': '0.5',
                 'db': str(db),
-                'time': str(time_data)
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
             })
             print(f"EMITTING: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
