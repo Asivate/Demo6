@@ -552,11 +552,11 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                         dummy_input = np.zeros((1, 96, 64, 1))
                         _ = models["tensorflow"].predict(dummy_input)
                         print("Custom prediction function initialized successfully")
-            except Exception as e3:
-                print(f"Error with third fallback method: {e3}")
-                traceback.print_exc()
-                if not USE_AST_MODEL:
-                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+                except Exception as e3:
+                    print(f"Error with third fallback method: {e3}")
+                    traceback.print_exc()
+                    if not USE_AST_MODEL:
+                        raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
     print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
@@ -690,7 +690,7 @@ def handle_source(json_data):
         m = np.argmax(context_prediction)
         
         # Check if prediction confidence is high enough
-        if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
+        if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             # Get the corresponding label from the valid indices
             human_label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
             print(f"Top prediction: {human_label} ({context_prediction[m]:.4f})")
@@ -1143,7 +1143,7 @@ def handle_source(json_data):
         print('Max prediction', homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]], context_prediction[m])
         
         # Check if prediction confidence is high enough
-        if context_prediction[m] > PREDICTION_THRES and -db > DBLEVEL_THRES:
+        if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             label = homesounds.to_human_labels[active_context[valid_indices.index(valid_indices[m])]]
             print(f"Prediction: {label} ({context_prediction[m]:.4f})")
             
