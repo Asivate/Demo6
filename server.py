@@ -170,7 +170,7 @@ SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
 SPEECH_PREDICTION_THRES = 0.85  # Threshold for speech detection
 SPEECH_DETECTION_THRES = 0.7  # Secondary threshold for speech detection
-SPEECH_BIAS_CORRECTION = 0.3  # Correction factor for speech bias
+SPEECH_BIAS_CORRECTION = 0.5  # Increased correction factor for speech bias (from 0.3 to 0.5)
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -589,6 +589,22 @@ def tensorflow_predict(x_input, db_level=None):
                                 # Debug print to show the effect of bias correction
                                 print(f"Applied speech bias correction: {original_confidence:.4f} -> {predictions[i][speech_idx]:.4f} (correction: {correction:.2f})")
                 
+                # Special pre-processing for knock detection
+                knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
+                
+                # Step 2: Special pre-processing for knock detection - amplify knock signal
+                if knock_idx is not None and knock_idx < len(predictions[0]):
+                    # Check for transient sound characteristics typical of knocks 
+                    # (represented by high decibel level and short duration)
+                    if db_level is not None and db_level > -50:  # Knocks tend to be louder
+                        # Enhance the knock confidence if it's at least minimally present
+                        if predictions[0][knock_idx] > 0.01:
+                            # Amplify knock signal but keep it reasonable
+                            original_knock = predictions[0][knock_idx]
+                            knock_amplification = min(0.15, original_knock * 2.0)  # Double it but max at 0.15
+                            predictions[0][knock_idx] = knock_amplification
+                            print(f"Enhanced knock confidence from {original_knock:.4f} to {predictions[0][knock_idx]:.4f}")
+                
                 return predictions
 
 # Modify the audio_data handler to use our custom prediction function
@@ -633,12 +649,26 @@ def handle_source(json_data):
         # Check original audio size
         original_size = np_wav.size
         print(f"Original np_wav shape: {np_wav.shape}, size: {original_size}")
-        
+
         # Pad audio if needed to match expected size for models
         if original_size < RATE:
             # Pad with zeros to reach 1 second (16000 samples)
-            padding = np.zeros(RATE - original_size)
-            np_wav = np.concatenate([np_wav, padding])
+            # If the sample is very short (less than 0.5 seconds), duplicate it to strengthen signal
+            if original_size < RATE // 2:
+                # Repeat the audio to make the signal stronger instead of just padding with zeros
+                repeat_count = 3  # Repeat short samples 3 times to amplify the signal
+                np_wav = np.tile(np_wav, repeat_count)
+                if np_wav.size > RATE:
+                    np_wav = np_wav[:RATE]  # Trim if it exceeds 1 second
+                else:
+                    # If still not enough, add zero padding
+                    padding = np.zeros(RATE - np_wav.size)
+                    np_wav = np.concatenate([np_wav, padding])
+            else:
+                # For longer samples, just pad with zeros
+                padding = np.zeros(RATE - original_size)
+                np_wav = np.concatenate([np_wav, padding])
+            
             print(f"Padded audio data to size: {RATE} samples (1 second)")
         
         # Convert waveform to examples (spectrogram features)
@@ -745,7 +775,7 @@ def handle_source(json_data):
                         
                         # Special case for Knock detection with lower threshold
                         knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.15:  # Use lower threshold for knock
+                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.05:  # Lowered threshold for knock from 0.15 to 0.05
                             print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence!")
                             socketio.emit('audio_label', {
                                 'label': 'Knocking',
@@ -1311,7 +1341,7 @@ def handle_source(json_data):
                         
                         # Special case for Knock detection with lower threshold
                         knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15:  # Use lower threshold for knock
+                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.05:  # Lowered threshold for knock from 0.15 to 0.05
                             print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
                             socketio.emit('audio_label', {
                                 'label': 'Knocking',
@@ -1346,7 +1376,7 @@ def handle_source(json_data):
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:  # Check knock and ensure sound is loud enough
+            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.05 and db > DBLEVEL_THRES:  # Check knock and ensure sound is loud enough
                 print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
                 socketio.emit('audio_label', {
                     'label': 'Knocking',
