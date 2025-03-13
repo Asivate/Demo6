@@ -677,14 +677,18 @@ def handle_source(json_data):
                 # More conservative approach for knock detection
                 # Don't repeat more than once to avoid false transients
                 if knock_detection_audio.size > RATE // 4:  # Only if we have a reasonable amount of audio
-                    knock_detection_audio = np.tile(knock_detection_audio, 1.5)[:RATE]
+                    # Create a version that's 1.5x the length by concatenating the original plus half of it
+                    half_size = knock_detection_audio.size // 2
+                    knock_detection_audio = np.concatenate([knock_detection_audio, knock_detection_audio[:half_size]])
+                    # Ensure we don't exceed the rate
+                    knock_detection_audio = knock_detection_audio[:RATE]
                 
                 # Always ensure we have the right size with zero padding
                 if knock_detection_audio.size < RATE:
                     padding = np.zeros(RATE - knock_detection_audio.size)
                     knock_detection_audio = np.concatenate([knock_detection_audio, padding])
-            
-            print("Applied conservative padding for short audio sample")
+                
+                print("Applied conservative padding for short audio sample")
         else:
             # For longer samples, just pad with zeros if needed
             if original_size < RATE:
