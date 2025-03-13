@@ -162,15 +162,15 @@ thread = None
 thread_lock = Lock()
 
 # thresholds
-PREDICTION_THRES = 0.5  # Changed from 0.15 to 0.5 to match original server
-FINGER_SNAP_THRES = 0.4  # Increased from 0.03 to make it harder to detect false finger snaps
-DBLEVEL_THRES = -30  # Changed from -60 to -30 to match original server
-SILENCE_THRES = -75  # Unchanged (Threshold for silence detection)
-SPEECH_SENTIMENT_THRES = 0.8  # Increased from 0.6 to 0.8 to reduce false speech detection
-CHOPPING_THRES = 0.7  # Unchanged - higher threshold for chopping sounds
-SPEECH_PREDICTION_THRES = 0.85  # Increased from 0.7 to 0.85 to reduce false speech detections
-SPEECH_DETECTION_THRES = 0.7  # Increased from 0.5 to 0.7 to reduce false speech detection
-SPEECH_BIAS_CORRECTION = 0.3  # New parameter to correct for speech bias in the model
+PREDICTION_THRES = 0.5  # General confidence threshold
+FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
+DBLEVEL_THRES = -30  # Minimum decibel level for sound detection
+SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
+SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
+CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
+SPEECH_PREDICTION_THRES = 0.85  # Threshold for speech detection
+SPEECH_DETECTION_THRES = 0.7  # Secondary threshold for speech detection
+SPEECH_BIAS_CORRECTION = 0.3  # Correction factor for speech bias
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -553,26 +553,41 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
     return (in_data, 0)  # pyaudio.paContinue equivalent
 
 # Custom TensorFlow prediction function
-def tensorflow_predict(x_input):
-    """Make predictions with TensorFlow model in the correct session context."""
+def tensorflow_predict(x_input, db_level=None):
+    """Make predictions with TensorFlow model in the correct session context.
+    
+    Args:
+        x_input: Input data in the correct shape for the model
+        db_level: Optional decibel level of the audio, used for intelligent bias correction
+    """
     with tf_lock:
         with tf_graph.as_default():
             with tf_session.as_default():
                 predictions = models["tensorflow"].predict(x_input)
                 
                 # Apply speech bias correction to reduce false speech detections
-                # Only apply correction if speech has very high confidence
+                # Only apply correction if speech has very high confidence AND audio is not silent
                 if APPLY_SPEECH_BIAS_CORRECTION:
-                    for i in range(len(predictions)):
-                        speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
-                        if speech_idx < len(predictions[i]):
-                            # Apply correction factor to reduce speech confidence - stronger correction
-                            predictions[i][speech_idx] -= SPEECH_BIAS_CORRECTION
-                            # Ensure it doesn't go below 0
-                            predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
-                            
-                            # Debug print to show the effect of bias correction
-                            print(f"Applied speech bias correction: {predictions[i][speech_idx] + SPEECH_BIAS_CORRECTION:.4f} -> {predictions[i][speech_idx]:.4f}")
+                    # Skip bias correction entirely if the audio is near-silent
+                    if db_level is not None and db_level < SILENCE_THRES + 10:
+                        print(f"Skipping speech bias correction for silent audio ({db_level} dB)")
+                    else:
+                        for i in range(len(predictions)):
+                            speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
+                            if speech_idx < len(predictions[i]):
+                                # Check if speech confidence is unusually high for potentially silent audio
+                                is_silent = db_level is not None and db_level < DBLEVEL_THRES
+                                # Apply stronger correction for silent/near-silent audio
+                                correction = SPEECH_BIAS_CORRECTION * 1.5 if is_silent else SPEECH_BIAS_CORRECTION
+                                
+                                # Apply correction factor to reduce speech confidence
+                                original_confidence = predictions[i][speech_idx]
+                                predictions[i][speech_idx] -= correction
+                                # Ensure it doesn't go below 0
+                                predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+                                
+                                # Debug print to show the effect of bias correction
+                                print(f"Applied speech bias correction: {original_confidence:.4f} -> {predictions[i][speech_idx]:.4f} (correction: {correction:.2f})")
                 
                 return predictions
 
@@ -602,6 +617,18 @@ def handle_source(json_data):
             rms = np.sqrt(np.mean(np_wav**2))
             db = dbFS(rms)
         print(f"Db... {db}")
+        
+        # ENHANCED SILENCE DETECTION: Check if audio is silent - emit silence and return early
+        if db < SILENCE_THRES:
+            print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
+            socketio.emit('audio_label', {
+                'label': 'Silent',
+                'accuracy': '1.0',
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
+            })
+            return
         
         # Check original audio size
         original_size = np_wav.size
@@ -638,7 +665,7 @@ def handle_source(json_data):
         
         # Make prediction with TensorFlow model using our custom function
         print("Making prediction with TensorFlow model...")
-        predictions = tensorflow_predict(x_input)
+        predictions = tensorflow_predict(x_input, db)
         
         # Debug all raw predictions (before thresholding)
         debug_predictions(predictions[0], homesounds.everything)
@@ -669,9 +696,9 @@ def handle_source(json_data):
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
         
-        # Check if prediction confidence is high enough
+        # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f})")
+            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
             
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
@@ -690,7 +717,6 @@ def handle_source(json_data):
                     print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
                     
                     # Check if there's another sound with reasonable confidence
-                    # Find second highest prediction
                     temp_context = context_prediction.copy()
                     speech_idx = valid_indices.index(valid_indices[m])
                     temp_context[speech_idx] = 0  # Zero out speech confidence
@@ -721,6 +747,18 @@ def handle_source(json_data):
                             'record_time': str(record_time) if record_time else ''
                         })
                         return
+                
+                # ADDITIONAL CHECK: Don't even attempt speech sentiment for low audio levels
+                if db < DBLEVEL_THRES + 5:  # 5dB above minimum threshold
+                    print(f"Audio level too low for speech: {db} dB < {DBLEVEL_THRES + 5} dB")
+                    socketio.emit('audio_label', {
+                        'label': 'Unrecognized Sound',
+                        'accuracy': '0.3',
+                        'db': str(db),
+                        'time': str(time_data),
+                        'record_time': str(record_time) if record_time else ''
+                    })
+                    return
                 
                 # Process speech with sentiment analysis if confidence is high enough
                 if context_prediction[m] > SPEECH_SENTIMENT_THRES:
@@ -787,6 +825,8 @@ def handle_source(json_data):
             print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
         else:
             # Sound didn't meet thresholds
+            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
+            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
             socketio.emit('audio_label', {
                 'label': 'Unrecognized Sound',
                 'accuracy': '0.5',
@@ -798,11 +838,6 @@ def handle_source(json_data):
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
         traceback.print_exc()
-        socketio.emit('audio_label', {
-            'label': 'Error Processing',
-            'accuracy': '0.0',
-            'db': str(db) if 'db' in locals() else '-100'
-        })
 
 # Keep track of recent audio buffers for better speech transcription
 recent_audio_buffer = []
@@ -1150,38 +1185,55 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
 
 @socketio.on('audio_feature_data')
 def handle_source(json_data):
-    """Handle audio features sent from client.
+    """Handle pre-processed audio feature data sent from client.
     
     Args:
-        json_data: JSON object containing audio data
+        json_data: JSON object containing audio feature data
     """
     try:
-        data = str(json_data.get('data', ''))
+        # Extract data from the request
+        data = json_data.get('data', [])
         db = json_data.get('db', 0)
         time_data = json_data.get('time', 0)
-        record_time = json_data.get('record_time', None)
         
+        # ENHANCED SILENCE DETECTION: Check if audio is silent
+        if db < SILENCE_THRES:
+            print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
+            socketio.emit('audio_label', {
+                'label': 'Silent',
+                'accuracy': '1.0',
+                'db': str(db),
+                'time': str(time_data)
+            })
+            return
+            
         # Convert feature data to numpy array
-        data = data.strip('[]')  # Remove square brackets if present
-        x = np.fromstring(data, dtype=np.float16, sep=',')
-        print('Data after to numpy', x)
-        
-        # Reshape for TensorFlow model
+        try:
+            # Try to convert directly (if data is a list of floats)
+            x = np.array(data, dtype=np.float32)
+        except (ValueError, TypeError):
+            # If direct conversion fails, try parsing from string (old format)
+            if isinstance(data, str):
+                data = data.strip("[]")
+                x = np.fromstring(data, dtype=np.float32, sep=',')
+            else:
+                raise ValueError("Could not convert feature data to numpy array")
+                
+        # Reshape for model input
         x = x.reshape(1, 96, 64, 1)
-        print('Successfully reshape audio features', x.shape)
+        print(f"Successfully reshaped audio features: {x.shape}")
         
         # Make prediction with TensorFlow model using our custom function
-        pred = tensorflow_predict(x)
+        pred = tensorflow_predict(x, db)
         
         # Find maximum prediction for active context
-        # Fix for index out of bounds error - ensure indices are valid
         valid_indices = []
-        for x in active_context:
-            if x in homesounds.labels and homesounds.labels[x] < len(pred[0]):
-                valid_indices.append(homesounds.labels[x])
+        for label in active_context:
+            if label in homesounds.labels and homesounds.labels[label] < len(pred[0]):
+                valid_indices.append(homesounds.labels[label])
             else:
-                print(f"Warning: Label '{x}' maps to an invalid index or is not found in homesounds.labels")
-        
+                print(f"Warning: Label '{label}' maps to an invalid index or is not found in homesounds.labels")
+                
         if not valid_indices:
             print("Error: No valid sound labels found in current context")
             socketio.emit('audio_label', {
@@ -1190,45 +1242,43 @@ def handle_source(json_data):
                 'db': str(db)
             })
             return
-        
+            
         # Take predictions from the valid indices
         context_prediction = np.take(pred[0], valid_indices)
         m = np.argmax(context_prediction)
         
-        # Get the corresponding label
+        # Convert index to label
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
-        print('Max prediction', human_label, context_prediction[m])
         
-        # Check if prediction confidence is high enough
+        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
+        
+        # Apply thresholding
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            print(f"Prediction: {human_label} ({context_prediction[m]:.4f})")
-            
             # Special case for "Chopping" - use higher threshold
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
                 socketio.emit('audio_label', {
                     'label': 'Unrecognized Sound',
-                    'accuracy': '1.0',
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
+                    'accuracy': '0.2',
+                    'db': str(db)
                 })
                 return
-            
+                
             # Special case for "Speech" - use higher threshold
             if human_label == "Speech":
+                # Apply stricter threshold for speech detection
                 if context_prediction[m] < SPEECH_PREDICTION_THRES:
                     print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
                     
-                    # Check if there's another sound with reasonable confidence
+                    # Check for alternative predictions
                     temp_context = context_prediction.copy()
                     speech_idx = valid_indices.index(valid_indices[m])
                     temp_context[speech_idx] = 0  # Zero out speech confidence
                     
                     second_best_idx = np.argmax(temp_context)
-                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
-                        # Use the second-best prediction instead
+                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:
+                        # Use the second-best prediction
                         second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
                         second_best_human_label = homesounds.to_human_labels[second_best_label]
                         print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
@@ -1237,49 +1287,43 @@ def handle_source(json_data):
                             'label': second_best_human_label,
                             'accuracy': str(temp_context[second_best_idx]),
                             'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
+                            'time': str(time_data)
                         })
                         return
                     else:
-                        # No good alternative, emit unrecognized sound
+                        # No good alternative
                         print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
                         socketio.emit('audio_label', {
                             'label': 'Unrecognized Sound',
                             'accuracy': '0.3',
                             'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
+                            'time': str(time_data)
                         })
                         return
-                
-            # Emit the sound label for non-speech sounds or speech above threshold
+            
+            # Emit the predicted label
             socketio.emit('audio_label', {
                 'label': human_label,
                 'accuracy': str(context_prediction[m]),
                 'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
+                'time': str(time_data)
             })
-            print(f"EMITTING: {human_label} ({context_prediction[m]:.4f})")
+            print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
         else:
-            # Sound didn't meet confidence threshold
+            # Sound didn't meet thresholds
+            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
+            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
+            
             socketio.emit('audio_label', {
                 'label': 'Unrecognized Sound',
-                'accuracy': '1.0',
+                'accuracy': '0.5',
                 'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
+                'time': str(time_data)
             })
-            print(f"EMITTING: Unrecognized Sound (below threshold)")
+            print(f"EMITTING: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
-        print(f"Error in handle_source: {str(e)}")
+        print(f"Error in audio_feature_data handler: {str(e)}")
         traceback.print_exc()
-        socketio.emit('audio_label', {
-            'label': 'Error Processing Audio Features',
-            'accuracy': '0.0',
-            'db': str(db) if 'db' in locals() else '-100'
-        })
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
