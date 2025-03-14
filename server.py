@@ -211,6 +211,17 @@ SPEECH_DETECTION_THRES = 0.55  # Lowered from 0.6 to 0.55 for secondary speech d
 SPEECH_BIAS_CORRECTION = 0.25  # Reduced from 0.3 to 0.25 to avoid excessive correction
 KNOCK_LOWER_THRESHOLD = 0.05  # Lower threshold for knock detection
 
+# Define critical sounds that get priority treatment
+CRITICAL_SOUNDS = {
+    'hazard-alarm': 0.05,   # Fire alarm - extremely critical with very low threshold
+    'knock': 0.05,          # Knock - already implemented
+    'doorbell': 0.07,       # Doorbell - important for awareness
+    'baby-cry': 0.1,        # Baby crying - important for caregivers
+    'water-running': 0.1,   # Water running - requested by user
+    'phone-ring': 0.1,      # Phone ringing - important communication
+    'alarm-clock': 0.1      # Alarm clock - important for time management
+}
+
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
 
@@ -550,14 +561,20 @@ def tensorflow_predict(x_input, db_level=None):
                                     
                                     # Slightly boost high-priority sounds to counter speech bias
                                     # This helps ensure important sounds like alarms are detected properly
-                                    for priority_sound in ['hazard-alarm', 'alarm-clock', 'knock', 'doorbell']:
+                                    for priority_sound in list(CRITICAL_SOUNDS.keys()):
                                         if priority_sound in homesounds.labels:
                                             priority_idx = homesounds.labels[priority_sound]
-                                            if priority_idx < len(predictions[i]) and predictions[i][priority_idx] > 0.2:
-                                                # Boost high-priority sounds slightly if they already have some confidence
-                                                predictions[i][priority_idx] += 0.1
+                                            if priority_idx < len(predictions[i]) and predictions[i][priority_idx] > 0.05:
+                                                # Boost critical sounds more aggressively when they have some signal
+                                                # Higher boost for safety-critical sounds
+                                                if priority_sound == 'hazard-alarm':
+                                                    boost = 0.15  # Strong boost for fire alarms
+                                                else:
+                                                    boost = 0.1   # Standard boost for other critical sounds
+                                                
+                                                predictions[i][priority_idx] += boost
                                                 predictions[i][priority_idx] = min(1.0, predictions[i][priority_idx])  # Cap at 1.0
-                                                print(f"Boosted {priority_sound} from {predictions[i][priority_idx]-0.1:.4f} to {predictions[i][priority_idx]:.4f}")
+                                                print(f"Boosted {priority_sound} from {predictions[i][priority_idx]-boost:.4f} to {predictions[i][priority_idx]:.4f}")
                                     
                                     # Debug print to show the effect of bias correction
                                     print(f"Applied speech bias correction: {original_confidence:.4f} -> {predictions[i][speech_idx]:.4f} (correction: {correction:.2f})")
@@ -661,6 +678,27 @@ def handle_source(json_data):
         # Get the corresponding label from the valid indices
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
+        
+        # Check for critical sounds with special thresholds before main processing
+        for sound, threshold in CRITICAL_SOUNDS.items():
+            if sound in homesounds.labels:
+                sound_idx = homesounds.labels[sound]
+                if sound_idx < len(predictions[0]) and predictions[0][sound_idx] > threshold:
+                    # For loud sounds or sounds with higher confidence, prioritize them
+                    confidence = predictions[0][sound_idx]
+                    human_sound_label = homesounds.to_human_labels[sound]
+                    
+                    # Use different thresholds based on sound type and dB level
+                    trigger_confidence = threshold
+                    if sound == 'hazard-alarm' and db > 60:  # Fire alarms are usually loud
+                        trigger_confidence = threshold * 0.8  # Lower threshold for loud fire alarms
+                    elif sound == 'water-running' and db > 50:  # Water is usually mid-level volume
+                        trigger_confidence = threshold * 0.9  # Lower threshold for audible water
+                    
+                    if confidence > trigger_confidence:
+                        print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {db} dB")
+                        emit_sound_notification(human_sound_label, str(confidence), db, time_data, record_time)
+                        return
         
         # Check for knock specifically (with lower threshold) before main processing
         knock_idx = homesounds.labels.get('knock', 11)
@@ -1120,6 +1158,27 @@ def handle_source(json_data):
         pred = tensorflow_predict(x, db)
         logger.debug(f"Raw prediction shape: {pred[0].shape}")
         
+        # Check for critical sounds with special thresholds before main processing
+        for sound, threshold in CRITICAL_SOUNDS.items():
+            if sound in homesounds.labels:
+                sound_idx = homesounds.labels[sound]
+                if sound_idx < len(pred[0]) and pred[0][sound_idx] > threshold:
+                    # For loud sounds or sounds with higher confidence, prioritize them
+                    confidence = pred[0][sound_idx]
+                    human_sound_label = homesounds.to_human_labels[sound]
+                    
+                    # Use different thresholds based on sound type and dB level
+                    trigger_confidence = threshold
+                    if sound == 'hazard-alarm' and db > 60:  # Fire alarms are usually loud
+                        trigger_confidence = threshold * 0.8  # Lower threshold for loud fire alarms
+                    elif sound == 'water-running' and db > 50:  # Water is usually mid-level volume
+                        trigger_confidence = threshold * 0.9  # Lower threshold for audible water
+                    
+                    if confidence > trigger_confidence:
+                        logger.debug(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {db} dB")
+                        emit_sound_notification(human_sound_label, str(confidence), db, time_data, record_time)
+                        return
+        
         # Check for knock specifically (with lower threshold) before main processing
         knock_idx = homesounds.labels.get('knock', 11)
         if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
@@ -1252,15 +1311,26 @@ def should_send_notification(sound_label):
         last_notification_sound = sound_label
         return True
     
+    # Critical sounds bypass cooldown - fire alarms must always be notified
+    if sound_label == "Fire/Smoke Alarm":
+        logger.debug(f"Critical sound '{sound_label}' bypassing cooldown")
+        last_notification_time = current_time
+        last_notification_sound = sound_label
+        return True
+    
+    # Important sounds (like water running, doorbell) use reduced cooldown
+    if sound_label in ["Knocking", "Water Running", "Doorbell In-Use", "Baby Crying", "Phone Ringing", "Alarm Clock"]:
+        # For important sounds, apply a shorter cooldown and interrupt other sounds
+        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.5
+        # Allow interruption of non-critical sounds
+        if last_notification_sound not in ["Fire/Smoke Alarm", "Knocking", "Water Running", "Doorbell In-Use", 
+                                          "Baby Crying", "Phone Ringing", "Alarm Clock"]:
+            required_cooldown = 0.2  # Very short cooldown to interrupt non-critical sounds
     # If we're sending the same sound again, require longer cooldown
-    if sound_label == last_notification_sound:
+    elif sound_label == last_notification_sound:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
     else:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS
-    
-    # Special case: knocking interrupts other sounds with shorter cooldown
-    if sound_label == "Knocking" and last_notification_sound != "Knocking":
-        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.5
     
     # If enough time has passed, allow the notification
     if time_since_last >= required_cooldown:
