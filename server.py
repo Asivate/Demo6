@@ -118,10 +118,12 @@ def cleanup_memory():
         logger.info(f"Memory cleanup performed (cycle {prediction_counter})")
 
 # Speech recognition settings
-USE_GOOGLE_SPEECH = False  # Set to True to use Google Cloud Speech-to-Text instead of Whisper
 
 # Add the current directory to the path so we can import our modules
 os.path.dirname(os.path.abspath(__file__))
+
+# Keep track of server start time
+start_time = time.time()
 
 # Helper function to get the computer's IP addresses
 def get_ip_addresses():
@@ -298,13 +300,16 @@ models = {
     "feature_extractor": None
 }
 
+# Keep track of active clients
+active_clients = set()
+
 # Initialize speech recognition systems
 google_speech_processor = None  # Will be lazy-loaded when needed
 
 # Load models
 def load_models():
     """Load all required models for sound recognition and speech processing."""
-    global models, USE_AST_MODEL
+    global models, USE_AST_MODEL, USE_GOOGLE_SPEECH_API
     
     # Initialize models dictionary
     models = {
@@ -1042,7 +1047,7 @@ def status():
         'tensorflow_model_loaded': models["tensorflow"] is not None,
         'ast_model_loaded': models["ast"] is not None,
         'using_ast_model': USE_AST_MODEL,
-        'speech_recognition': 'Google Cloud' if USE_GOOGLE_SPEECH else 'Whisper',
+        'speech_recognition': 'Google Cloud' if USE_GOOGLE_SPEECH_API else 'Disabled',
         'sentiment_analysis_enabled': True,
         'ip_addresses': ip_addresses,
         'uptime': time.time() - start_time,
@@ -1052,26 +1057,26 @@ def status():
 
 @app.route('/api/toggle-speech-recognition', methods=['POST'])
 def toggle_speech_recognition():
-    """Toggle between Whisper and Google Cloud Speech-to-Text"""
-    global USE_GOOGLE_SPEECH
+    """Toggle Google Cloud Speech-to-Text on or off"""
+    global USE_GOOGLE_SPEECH_API
     data = request.get_json()
     
     if data and 'use_google_speech' in data:
-        USE_GOOGLE_SPEECH = data['use_google_speech']
-        logger.info(f"Speech recognition system changed to: {'Google Cloud' if USE_GOOGLE_SPEECH else 'Whisper'}")
+        USE_GOOGLE_SPEECH_API = data['use_google_speech']
+        logger.info(f"Speech recognition {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}")
         return jsonify({
             "success": True,
-            "message": f"Speech recognition system set to {'Google Cloud' if USE_GOOGLE_SPEECH else 'Whisper'}",
-            "use_google_speech": USE_GOOGLE_SPEECH
+            "message": f"Speech recognition {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}",
+            "use_google_speech": USE_GOOGLE_SPEECH_API
         })
     else:
         # Toggle the current value if no specific value provided
-        USE_GOOGLE_SPEECH = not USE_GOOGLE_SPEECH
-        logger.info(f"Speech recognition system toggled to: {'Google Cloud' if USE_GOOGLE_SPEECH else 'Whisper'}")
+        USE_GOOGLE_SPEECH_API = not USE_GOOGLE_SPEECH_API
+        logger.info(f"Speech recognition toggled to {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}")
         return jsonify({
             "success": True,
-            "message": f"Speech recognition system toggled to {'Google Cloud' if USE_GOOGLE_SPEECH else 'Whisper'}",
-            "use_google_speech": USE_GOOGLE_SPEECH
+            "message": f"Speech recognition toggled to {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}",
+            "use_google_speech": USE_GOOGLE_SPEECH_API
         })
 
 @socketio.on('send_message')
@@ -1112,7 +1117,9 @@ def handle_connect():
     """
     Handle client connection events.
     """
-    print(f"Client connected: {request.sid}")
+    global active_clients
+    active_clients.add(request.sid)
+    print(f"Client connected: {request.sid} (Total: {len(active_clients)})")
     # Send confirmation to client
     emit('server_status', {'status': 'connected', 'message': 'Connected to SoundWatch server'})
 
@@ -1121,7 +1128,10 @@ def handle_disconnect():
     """
     Handle client disconnection events.
     """
-    print(f"Client disconnected: {request.sid}")
+    global active_clients
+    if request.sid in active_clients:
+        active_clients.remove(request.sid)
+    print(f"Client disconnected: {request.sid} (Total: {len(active_clients)})")
 
 # Helper function to aggregate predictions from multiple overlapping segments
 def aggregate_predictions(new_prediction, label_list, is_speech=False):
