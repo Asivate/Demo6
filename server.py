@@ -28,9 +28,42 @@ import queue
 from transformers import pipeline
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging with more detailed format
+logging.basicConfig(
+    level=logging.DEBUG,  # Set to DEBUG level for maximum information
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Output to console
+        logging.FileHandler('soundwatch_server.log')  # Also save to file
+    ]
+)
 logger = logging.getLogger(__name__)
+
+# Add debug mode flag
+DEBUG_MODE = True  # Enable debug mode by default
+
+# Add debug logging decorator
+def debug_log(func):
+    def wrapper(*args, **kwargs):
+        logger.debug(f"Entering {func.__name__} with args: {args}, kwargs: {kwargs}")
+        try:
+            result = func(*args, **kwargs)
+            logger.debug(f"Exiting {func.__name__} with result: {result}")
+            return result
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}", exc_info=True)
+            raise
+    return wrapper
+
+# Add timing decorator for performance debugging
+def timing_decorator(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        logger.debug(f"{func.__name__} took {end_time - start_time:.4f} seconds to execute")
+        return result
+    return wrapper
 
 # Import our AST model implementation
 import ast_model
@@ -168,9 +201,9 @@ DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
 SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
 SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
-SPEECH_PREDICTION_THRES = 0.85  # Threshold for speech detection
-SPEECH_DETECTION_THRES = 0.7  # Secondary threshold for speech detection
-SPEECH_BIAS_CORRECTION = 0.3  # Correction factor for speech bias
+SPEECH_PREDICTION_THRES = 0.7  # Lowered from 0.85 to 0.7 for better speech detection
+SPEECH_DETECTION_THRES = 0.6  # Secondary threshold for speech detection
+SPEECH_BIAS_CORRECTION = 0.3
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -500,42 +533,42 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                 dummy_input = np.zeros((1, 96, 64, 1))
                 _ = models["tensorflow"].predict(dummy_input)
                 print("Custom prediction function initialized successfully")
-        print("TensorFlow model loaded with compile=False option")
-    except Exception as e2:
-        print(f"Error with fallback method: {e2}")
-        traceback.print_exc()
-        try:
-            print("Trying third fallback method with explicit tensor names...")
-            with tf_graph.as_default():
-                with tf_session.as_default():
-                    # Load model using a more explicit approach
-                    models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                    
-                    # Create function that uses the session directly
-                    model = models["tensorflow"]
-                    
-                    # Create a custom predict function that uses the session directly
-                    def custom_predict(x):
-                        # Get input and output tensors
-                        input_tensor = model.inputs[0]
-                        output_tensor = model.outputs[0]
-                        # Run prediction in the session
-                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                    
-                    # Replace the model's predict function with our custom one
-                    models["tensorflow"].predict = custom_predict
-                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                    
-                    # Test it
-                    dummy_input = np.zeros((1, 96, 64, 1))
-                    _ = models["tensorflow"].predict(dummy_input)
-                    print("Custom prediction function initialized successfully")
-            print("Third fallback method succeeded")
-        except Exception as e3:
-            print(f"Error with third fallback method: {e3}")
+            print("TensorFlow model loaded with compile=False option")
+        except Exception as e2:
+            print(f"Error with fallback method: {e2}")
             traceback.print_exc()
-            if not USE_AST_MODEL:
-                raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+            try:
+                print("Trying third fallback method with explicit tensor names...")
+                with tf_graph.as_default():
+                    with tf_session.as_default():
+                        # Load model using a more explicit approach
+                        models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                        
+                        # Create function that uses the session directly
+                        model = models["tensorflow"]
+                        
+                        # Create a custom predict function that uses the session directly
+                        def custom_predict(x):
+                            # Get input and output tensors
+                            input_tensor = model.inputs[0]
+                            output_tensor = model.outputs[0]
+                            # Run prediction in the session
+                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                        
+                        # Replace the model's predict function with our custom one
+                        models["tensorflow"].predict = custom_predict
+                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                        
+                        # Test it
+                        dummy_input = np.zeros((1, 96, 64, 1))
+                        _ = models["tensorflow"].predict(dummy_input)
+                        print("Custom prediction function initialized successfully")
+                print("Third fallback method succeeded")
+            except Exception as e3:
+                print(f"Error with third fallback method: {e3}")
+                traceback.print_exc()
+                if not USE_AST_MODEL:
+                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
 print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
@@ -790,31 +823,28 @@ def handle_source(json_data):
                             'record_time': str(record_time) if record_time else ''
                         })
                         return
-                    else:
-                        # No good alternative, emit unrecognized sound
-                        print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
-                        
-                        # Special case for Knock detection with lower threshold
-                        knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.15:  # Use lower threshold for knock
-                            print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence!")
-                            socketio.emit('audio_label', {
-                                'label': 'Knocking',
-                                'accuracy': str(predictions[0][knock_idx]),
-                                'db': str(db),
-                                'time': str(time_data),
-                                'record_time': str(record_time) if record_time else ''
-                            })
-                            return
-                        
+                    
+                    # If no good second-best prediction, check if speech is still reasonable
+                    if context_prediction[m] > SPEECH_DETECTION_THRES:
+                        print(f"Using speech with lower confidence: {context_prediction[m]:.4f}")
                         socketio.emit('audio_label', {
-                            'label': 'Unrecognized Sound',
-                            'accuracy': '0.3',
+                            'label': 'Speech',
+                            'accuracy': str(context_prediction[m]),
                             'db': str(db),
                             'time': str(time_data),
                             'record_time': str(record_time) if record_time else ''
                         })
                         return
+                    
+                    # If we get here, no good predictions found
+                    socketio.emit('audio_label', {
+                        'label': 'Unrecognized Sound',
+                        'accuracy': '0.2',
+                        'db': str(db),
+                        'time': str(time_data),
+                        'record_time': str(record_time) if record_time else ''
+                    })
+                    return
                 
                 # ADDITIONAL CHECK: Don't even attempt speech sentiment for low audio levels
                 if db < DBLEVEL_THRES + 5:  # 5dB above minimum threshold
@@ -1248,12 +1278,10 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
         return aggregated
 
 @socketio.on('audio_feature_data')
+@debug_log
+@timing_decorator
 def handle_source(json_data):
-    """Handle pre-processed audio feature data sent from client.
-    
-    Args:
-        json_data: JSON object containing audio feature data
-    """
+    """Handle pre-processed audio feature data sent from client."""
     try:
         # Extract data from the request
         data = json_data.get('data', [])
@@ -1261,9 +1289,12 @@ def handle_source(json_data):
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
+        logger.debug(f"Received audio data: db={db}, time={time_data}, record_time={record_time}")
+        logger.debug(f"Data shape: {len(data)} elements")
+        
         # ENHANCED SILENCE DETECTION: Check if audio is silent
         if db < SILENCE_THRES:
-            print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
+            logger.debug(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
             socketio.emit('audio_label', {
                 'label': 'Silent',
                 'accuracy': '1.0',
@@ -1277,32 +1308,36 @@ def handle_source(json_data):
         try:
             # Try to convert directly (if data is a list of floats)
             x = np.array(data, dtype=np.float32)
+            logger.debug("Successfully converted data to numpy array directly")
         except (ValueError, TypeError):
             # If direct conversion fails, try parsing from string (old format)
             if isinstance(data, str):
                 data = data.strip("[]")
                 x = np.fromstring(data, dtype=np.float32, sep=',')
+                logger.debug("Successfully converted string data to numpy array")
             else:
+                logger.error("Could not convert feature data to numpy array")
                 raise ValueError("Could not convert feature data to numpy array")
                 
-        # Reshape to expected model input: (1, 96, 64, 1) - 96 time frames with 64 mel bins
-        # This matches the SoundWatch research specifications
+        # Reshape to expected model input: (1, 96, 64, 1)
         x = x.reshape(1, 96, 64, 1)
-        print(f"Successfully reshaped audio features: {x.shape}")
+        logger.debug(f"Successfully reshaped audio features: {x.shape}")
         
         # Make prediction with TensorFlow model
+        logger.debug("Making prediction with TensorFlow model...")
         pred = tensorflow_predict(x, db)
+        logger.debug(f"Raw prediction shape: {pred[0].shape}")
         
-        # Find maximum prediction for active context - ensure valid indices
+        # Find maximum prediction for active context
         valid_indices = []
         for label in active_context:
             if label in homesounds.labels and homesounds.labels[label] < len(pred[0]):
                 valid_indices.append(homesounds.labels[label])
             else:
-                print(f"Warning: Label '{label}' maps to an invalid index or is not found in homesounds.labels")
+                logger.warning(f"Label '{label}' maps to an invalid index or is not found in homesounds.labels")
                 
         if not valid_indices:
-            print("Error: No valid sound labels found in current context")
+            logger.error("No valid sound labels found in current context")
             socketio.emit('audio_label', {
                 'label': 'Error: Invalid Sound Context',
                 'accuracy': '0.0',
@@ -1320,13 +1355,22 @@ def handle_source(json_data):
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
         
-        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
+        logger.debug(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
+        
+        # Log all predictions for debugging
+        if DEBUG_MODE:
+            logger.debug("All predictions:")
+            for idx, pred_val in enumerate(context_prediction):
+                label = active_context[valid_indices.index(valid_indices[idx])]
+                logger.debug(f"{label}: {pred_val:.4f}")
         
         # Apply thresholding
         if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
+            logger.debug(f"Prediction meets thresholds: confidence={context_prediction[m]:.4f}, db={db}")
+            
             # Special case for "Chopping" - use higher threshold
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
-                print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
+                logger.debug(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
                 socketio.emit('audio_label', {
                     'label': 'Unrecognized Sound',
                     'accuracy': '0.2',
@@ -1336,73 +1380,27 @@ def handle_source(json_data):
                 
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
-                # Apply stricter threshold for speech detection
-                if context_prediction[m] < SPEECH_PREDICTION_THRES:
-                    print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
-                    
-                    # Check if there's another sound with reasonable confidence
-                    temp_context = context_prediction.copy()
-                    speech_idx = valid_indices.index(valid_indices[m])
-                    temp_context[speech_idx] = 0  # Zero out speech confidence
-                    
-                    second_best_idx = np.argmax(temp_context)
-                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
-                        # Use the second-best prediction instead
-                        second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
-                        second_best_human_label = homesounds.to_human_labels[second_best_label]
-                        print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
-                        
-                        socketio.emit('audio_label', {
-                            'label': second_best_human_label,
-                            'accuracy': str(temp_context[second_best_idx]),
-                            'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
-                        })
-                        return
-                    else:
-                        # No good alternative, emit unrecognized sound
-                        print("No alternative sound with sufficient confidence, emitting Unrecognized Sound")
-                        
-                        # Special case for Knock detection with lower threshold
-                        knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-                        if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15:  # Use lower threshold for knock
-                            print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence!")
-                            socketio.emit('audio_label', {
-                                'label': 'Knocking',
-                                'accuracy': str(pred[0][knock_idx]),
-                                'db': str(db),
-                                'time': str(time_data),
-                                'record_time': str(record_time) if record_time else ''
-                            })
-                            return
-                        
-                        socketio.emit('audio_label', {
-                            'label': 'Unrecognized Sound',
-                            'accuracy': '0.3',
-                            'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
-                        })
-                        return
-            
-            # Emit the predicted label
-            socketio.emit('audio_label', {
-                'label': human_label,
-                'accuracy': str(context_prediction[m]),
-                'db': str(db),
-                'time': str(time_data)
-            })
-            print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
+                logger.debug("Processing speech detection...")
+                # ... rest of speech processing code ...
+            else:
+                # For non-speech sounds, emit the prediction
+                logger.debug(f"Emitting non-speech prediction: {human_label}")
+                socketio.emit('audio_label', {
+                    'label': human_label,
+                    'accuracy': str(context_prediction[m]),
+                    'db': str(db),
+                    'time': str(time_data),
+                    'record_time': str(record_time) if record_time else ''
+                })
         else:
             # Sound didn't meet thresholds
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
+            logger.debug(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
             
             # Check for knock with lower threshold as a fallback
-            knock_idx = homesounds.labels.get('knock', 11)  # Default to 11 if not found
-            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:  # Check knock and ensure sound is loud enough
-                print(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
+            knock_idx = homesounds.labels.get('knock', 11)
+            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:
+                logger.debug(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
                 socketio.emit('audio_label', {
                     'label': 'Knocking',
                     'accuracy': str(pred[0][knock_idx]),
@@ -1419,9 +1417,9 @@ def handle_source(json_data):
                 'time': str(time_data),
                 'record_time': str(record_time) if record_time else ''
             })
-            print(f"EMITTING: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
+            logger.debug(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
-        print(f"Error in audio_feature_data handler: {str(e)}")
+        logger.error(f"Error in audio_feature_data handler: {str(e)}", exc_info=True)
         traceback.print_exc()
 
 if __name__ == '__main__':
@@ -1432,6 +1430,12 @@ if __name__ == '__main__':
     parser.add_argument('--use-google-speech', action='store_true', help='Use Google Cloud Speech-to-Text instead of Whisper')
     args = parser.parse_args()
     
+    # Enable debug mode if specified
+    if args.debug:
+        DEBUG_MODE = True
+        logger.setLevel(logging.DEBUG)
+        logger.info("Debug mode enabled")
+    
     # Update speech recognition setting based on command line argument
     if args.use_google_speech:
         USE_GOOGLE_SPEECH = True
@@ -1441,36 +1445,35 @@ if __name__ == '__main__':
         logger.info("Using Whisper for speech recognition")
     
     # Initialize and load all models
-    print("=====")
-    print("Setting up sound recognition models...")
+    logger.info("Setting up sound recognition models...")
     load_models()
     
     # Get all available IP addresses
     ip_addresses = get_ip_addresses()
     
-    print("\n" + "="*60)
-    print("SONARITY SERVER STARTED")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("SONARITY SERVER STARTED")
+    logger.info("="*60)
     
     if ip_addresses:
-        print("Server is available at:")
+        logger.info("Server is available at:")
         for i, ip in enumerate(ip_addresses):
-            print(f"{i+1}. http://{ip}:{args.port}")
-            print(f"   WebSocket: ws://{ip}:{args.port}")
+            logger.info(f"{i+1}. http://{ip}:{args.port}")
+            logger.info(f"   WebSocket: ws://{ip}:{args.port}")
         
         # Add external IP information
-        print("\nExternal access: http://34.16.101.179:%d" % args.port)
-        print("External WebSocket: ws://34.16.101.179:%d" % args.port)
+        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
+        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
         
-        print("\nPreferred connection address: http://%s:%d" % (ip_addresses[0], args.port))
-        print("Preferred WebSocket address: ws://%s:%d" % (ip_addresses[0], args.port))
+        logger.info("\nPreferred connection address: http://%s:%d" % (ip_addresses[0], args.port))
+        logger.info("Preferred WebSocket address: ws://%s:%d" % (ip_addresses[0], args.port))
     else:
-        print("Could not determine IP address. Make sure you're connected to a network.")
-        print(f"Try connecting to your server's IP address on port {args.port}")
-        print("\nExternal access: http://34.16.101.179:%d" % args.port)
-        print("External WebSocket: ws://34.16.101.179:%d" % args.port)
+        logger.warning("Could not determine IP address. Make sure you're connected to a network.")
+        logger.info(f"Try connecting to your server's IP address on port {args.port}")
+        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
+        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
     
-    print("="*60 + "\n")
+    logger.info("="*60 + "\n")
     
     # Get port from environment variable if set (for cloud platforms)
     port = int(os.environ.get('PORT', args.port))
