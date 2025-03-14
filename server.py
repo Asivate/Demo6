@@ -886,7 +886,137 @@ def handle_source(json_data):
 recent_audio_buffer = []
 MAX_BUFFER_SIZE = 5  # Keep last 5 chunks
 
-# Helper function to process speech detection with sentiment analysis
+# Add this new function after the recent_audio_buffer initialization but before process_speech_with_sentiment
+def is_likely_real_speech(audio_data, sample_rate=16000):
+    """
+    Analyze audio to determine if it contains actual human speech using
+    voice activity detection (VAD) techniques based on acoustic properties.
+    
+    Args:
+        audio_data: numpy array of audio samples
+        sample_rate: sample rate of the audio
+        
+    Returns:
+        tuple: (is_speech, confidence, features_dict) 
+    """
+    # Basic validation
+    if len(audio_data) < sample_rate * 0.5:  # Need at least 0.5s of audio
+        logger.debug("Audio too short for speech analysis")
+        return False, 0.0, {"reason": "too_short"}
+    
+    # Calculate basic audio metrics
+    rms = np.sqrt(np.mean(np.square(audio_data)))
+    if rms < 0.005:  # Very quiet audio is unlikely to be speech
+        logger.debug(f"Audio too quiet for speech (RMS: {rms:.6f})")
+        return False, 0.0, {"reason": "too_quiet", "rms": float(rms)}
+    
+    # Zero-crossing rate (ZCR) - speech has specific ZCR patterns
+    zero_crossings = np.sum(np.abs(np.diff(np.signbit(audio_data))))
+    zcr = zero_crossings / len(audio_data)
+    
+    # Calculate spectral features that distinguish speech
+    try:
+        # Apply short-time Fourier transform (STFT)
+        f, t, Zxx = signal.stft(audio_data, fs=sample_rate, nperseg=400)
+        
+        # Get frequency band energies - focus on speech fundamentals (85-255 Hz)
+        speech_band_indices = np.logical_and(f >= 85, f <= 255)
+        vowel_indices = np.logical_and(f > 255, f <= 1000)  # Vowel formants
+        mid_band_indices = np.logical_and(f > 1000, f <= 3000)  # Consonants
+        high_band_indices = f > 3000
+        
+        # Calculate energy in each band
+        speech_energy = np.mean(np.abs(Zxx[speech_band_indices, :]))
+        vowel_energy = np.mean(np.abs(Zxx[vowel_indices, :]))
+        mid_energy = np.mean(np.abs(Zxx[mid_band_indices, :]))
+        high_energy = np.mean(np.abs(Zxx[high_band_indices, :]))
+        
+        # Calculate speech-to-noise ratio (higher for speech)
+        speech_to_noise = (speech_energy + vowel_energy) / (mid_energy + high_energy + 1e-10)
+        
+        # Analyze energy variance over time (speech has dynamic patterns)
+        frame_energy = np.sum(np.abs(Zxx) ** 2, axis=0)
+        energy_variance = np.var(frame_energy)
+        energy_range = np.max(frame_energy) - np.min(frame_energy)
+        
+        # Spectral flux - measures frame-to-frame spectral change (speech is dynamic)
+        spectral_flux = 0.0
+        if len(t) > 1:
+            flux_sum = np.sum(np.diff(np.abs(Zxx), axis=1)**2)
+            spectral_flux = flux_sum / (len(t)-1)
+        
+        # Calculate harmonicity - speech has harmonic structure
+        # Simplified measure: ratio of energy in harmonic bands vs total
+        harmonic_ratio = (speech_energy + vowel_energy) / (np.mean(np.abs(Zxx)) + 1e-10)
+        
+        # Store all features for logging and debugging
+        features = {
+            "rms": float(rms),
+            "zcr": float(zcr),
+            "speech_energy": float(speech_energy),
+            "vowel_energy": float(vowel_energy),
+            "mid_energy": float(mid_energy),
+            "high_energy": float(high_energy),
+            "speech_to_noise": float(speech_to_noise),
+            "energy_variance": float(energy_variance),
+            "energy_range": float(energy_range),
+            "spectral_flux": float(spectral_flux),
+            "harmonic_ratio": float(harmonic_ratio)
+        }
+        
+        # Calculate comprehensive speech confidence score (0-1)
+        # Each factor contributes to the final confidence score
+        
+        # 1. ZCR factor - speech has characteristic ZCR
+        # Typical speech ZCR is around 0.05-0.15
+        zcr_factor = min(1.0, max(0.0, 1.0 - abs(zcr - 0.1) / 0.1))
+        
+        # 2. Speech-to-noise ratio - higher for speech 
+        stn_factor = min(1.0, speech_to_noise / 2.0)
+        
+        # 3. Energy variance - speech has temporal variation
+        var_factor = min(1.0, energy_variance / 0.01)
+        
+        # 4. Harmonic structure - speech has harmonic components
+        harmonic_factor = min(1.0, harmonic_ratio / 2.0)
+        
+        # 5. Spectral flux - speech changes over time
+        flux_factor = min(1.0, spectral_flux / 0.5) 
+        
+        # Combine all factors with appropriate weights
+        # More weight on the most reliable indicators
+        speech_confidence = (0.15 * zcr_factor + 
+                            0.25 * stn_factor + 
+                            0.2 * var_factor + 
+                            0.25 * harmonic_factor +
+                            0.15 * flux_factor)
+        
+        # Debug logging
+        logger.debug(f"Speech detection features: ZCR={zcr_factor:.2f}, STN={stn_factor:.2f}, " 
+                    f"VAR={var_factor:.2f}, HARM={harmonic_factor:.2f}, FLUX={flux_factor:.2f}")
+        
+        # Decision thresholds based on audio level
+        if rms > 0.05:  # Loud audio
+            confidence_threshold = 0.45  # Lower threshold for loud audio
+        else:
+            confidence_threshold = 0.55  # Higher threshold for quiet audio
+        
+        # Make final decision
+        is_speech = speech_confidence > confidence_threshold and rms > 0.008
+        
+        # Include decision factors in features
+        features["speech_confidence"] = float(speech_confidence)
+        features["confidence_threshold"] = float(confidence_threshold)
+        features["is_speech"] = is_speech
+        
+        logger.debug(f"Speech detection result: {is_speech} (confidence: {speech_confidence:.2f}, threshold: {confidence_threshold:.2f})")
+        return is_speech, speech_confidence, features
+        
+    except Exception as e:
+        logger.error(f"Error in speech analysis: {str(e)}", exc_info=True)
+        return False, 0.0, {"error": str(e)}
+
+# Modify the process_speech_with_sentiment function to use our new speech detection function
 def process_speech_with_sentiment(audio_data):
     """
     Process speech audio, transcribe it and analyze sentiment.
@@ -931,6 +1061,26 @@ def process_speech_with_sentiment(audio_data):
         # Use reflect padding to extend short audio naturally
         concatenated_audio = np.pad(concatenated_audio, (0, pad_size), mode='reflect')
         logger.info(f"Padded speech audio to size: {len(concatenated_audio)} samples ({len(concatenated_audio)/RATE:.1f} seconds)")
+    
+    # NEW: First run speech detection to verify this is real speech before attempting transcription
+    is_speech, speech_confidence, speech_features = is_likely_real_speech(concatenated_audio, RATE)
+    
+    # Log the speech detection results
+    logger.info(f"Speech verification: is_speech={is_speech}, confidence={speech_confidence:.2f}")
+    
+    # Only proceed with transcription if we're confident this is real speech
+    if not is_speech:
+        logger.info(f"Audio doesn't contain real human speech (confidence: {speech_confidence:.2f})")
+        return {
+            "text": "",
+            "sentiment": {
+                "category": "Neutral", 
+                "original_emotion": "neutral",
+                "confidence": 0.5,
+                "emoji": "😐"
+            },
+            "speech_features": speech_features  # Return features for debugging
+        }
     
     # Calculate the RMS value of the audio to gauge its "loudness"
     rms = np.sqrt(np.mean(np.square(concatenated_audio)))
