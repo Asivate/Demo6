@@ -173,7 +173,7 @@ tf_lock = Lock()
 tf_graph = tf.compat.v1.Graph()
 tf_session = tf.compat.v1.Session(graph=tf_graph)
 ast_lock = Lock()
-speech_lock = Lock() # Lock for speech processing
+speech_lock = Lock()  # Lock for speech processing
 
 # Dictionary to store model-specific info
 model_info = {
@@ -194,7 +194,7 @@ socketio = SocketIO(app, async_mode=async_mode)
 thread = None
 thread_lock = Lock()
 
-# thresholds
+# Thresholds
 PREDICTION_THRES = 0.15  # Lower from 0.25/0.30 to 0.15
 FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
 DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
@@ -207,9 +207,6 @@ SPEECH_BIAS_CORRECTION = 0.3
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
-
-# Add flag to disable Google Speech by default - use Whisper instead
-# USE_GOOGLE_SPEECH_API = False  # Set to False to avoid dependency on google-cloud-speech
 
 # Define model-specific contexts based on SoundWatch research (20 high-priority sound classes)
 # High-priority sounds (like alarms, knocks) are listed first as they are most important for DHH users
@@ -241,9 +238,9 @@ core_sounds = [
     'cooking'          # Cooking sounds
 ]
 
-# contexts - use only the valid sound labels the model can recognize
+# Contexts - use only the valid sound labels the model can recognize
 context = core_sounds
-# use this context for active detection
+# Use this context for active detection
 active_context = core_sounds
 
 CHANNELS = 1
@@ -357,7 +354,7 @@ def load_models():
         os.makedirs(os.path.dirname(model_filename), exist_ok=True)
         
         homesounds_model = Path(model_filename)
-        if (not homesounds_model.is_file()):
+        if not homesounds_model.is_file():
             print("Downloading example_model.hdf5 [867MB]: ")
             wget.download(MODEL_URL, MODEL_PATH)
         
@@ -446,135 +443,7 @@ def debug_predictions(predictions, label_list):
             print(f"{label_list[idx]}: {pred:.6f}")
     print("=======================================================")
 
-# ###########################
-# # Setup models - we'll support both old and new models
-# ###########################
-
-# Old TensorFlow model settings
-MODEL_URL = "https://www.dropbox.com/s/cq1d7uqg0l28211/example_model.hdf5?dl=1"
-MODEL_PATH = "models/example_model.hdf5"
-print("=====")
-print("Setting up sound recognition models...")
-
-# Flag to determine which model to use
-USE_AST_MODEL = os.environ.get('USE_AST_MODEL', '1') == '1'  # Default to enabled
-print(f"AST model {'enabled' if USE_AST_MODEL else 'disabled'} based on environment settings")
-
-# Load the AST model
-try:
-    print("Loading AST model...")
-    # Use SDPA (Scaled Dot Product Attention) for better performance on CPU
-    # Define the best AST model for our use case
-    ast_model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
-    
-    # Check if torch version supports SDPA
-    ast_kwargs = {}
-    if torch.__version__ >= '2.1.1':
-        ast_kwargs["attn_implementation"] = "sdpa"
-        print("Using Scaled Dot Product Attention (SDPA) for faster inference")
-    
-    # Load in a CPU-optimized way - lower precision for faster inference
-    # but only if adequate hardware support exists
-    # Always use float32 for maximum compatibility
-    ast_kwargs = {
-        "torch_dtype": torch.float32  # Always use float32 for maximum compatibility
-    }
-    
-    # Load model with optimizations
-    with ast_lock:
-        # Load the AST model with optimizations
-        models["ast"], models["feature_extractor"] = ast_model.load_ast_model(
-            model_name=ast_model_name,
-            **ast_kwargs
-        )
-        # Initialize class labels for aggregation
-        ast_model.initialize_class_labels(models["ast"])
-        print("AST model loaded successfully")
-except Exception as e:
-    print(f"Error loading AST model: {e}")
-    traceback.print_exc()
-    USE_AST_MODEL = False  # Fall back to TensorFlow model if AST fails to load
-
-# Optionally load TensorFlow model (as fallback or if USE_AST_MODEL is False)
-model_filename = os.path.abspath(MODEL_PATH)
-if not USE_AST_MODEL or True:  # We'll load it anyway as backup
-    print("Loading TensorFlow model as backup...")
-    os.makedirs(os.path.dirname(model_filename), exist_ok=True)
-    
-    homesounds_model = Path(model_filename)
-    if (not homesounds_model.is_file()):
-        print("Downloading example_model.hdf5 [867MB]: ")
-        wget.download(MODEL_URL, MODEL_PATH)
-    
-    print("Using TensorFlow model: %s" % (model_filename))
-    
-    try:
-        with tf_graph.as_default():
-            with tf_session.as_default():
-                # Load model using a more explicit approach
-                models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                
-                # Create function that uses the session directly
-                model = models["tensorflow"]
-                
-                # Create a custom predict function that uses the session directly
-                def custom_predict(x):
-                    # Get input and output tensors
-                    input_tensor = model.inputs[0]
-                    output_tensor = model.outputs[0]
-                    # Run prediction in the session
-                    return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                
-                # Replace the model's predict function with our custom one
-                models["tensorflow"].predict = custom_predict
-                model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                
-                # Test it
-                dummy_input = np.zeros((1, 96, 64, 1))
-                _ = models["tensorflow"].predict(dummy_input)
-                print("Custom prediction function initialized successfully")
-            print("TensorFlow model loaded with compile=False option")
-    except Exception as e2:
-        print(f"Error with fallback method: {e2}")
-        traceback.print_exc()
-        try:
-            print("Trying third fallback method with explicit tensor names...")
-            with tf_graph.as_default():
-                with tf_session.as_default():
-                    # Load model using a more explicit approach
-                    models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                    
-                    # Create function that uses the session directly
-                    model = models["tensorflow"]
-                    
-                    # Create a custom predict function that uses the session directly
-                    def custom_predict(x):
-                        # Get input and output tensors
-                        input_tensor = model.inputs[0]
-                        output_tensor = model.outputs[0]
-                        # Run prediction in the session
-                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                    
-                    # Replace the model's predict function with our custom one
-                    models["tensorflow"].predict = custom_predict
-                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                    
-                    # Test it
-                    dummy_input = np.zeros((1, 96, 64, 1))
-                    _ = models["tensorflow"].predict(dummy_input)
-                    print("Custom prediction function initialized successfully")
-            print("Third fallback method succeeded")
-        except Exception as e3:
-            print(f"Error with third fallback method: {e3}")
-            traceback.print_exc()
-            if not USE_AST_MODEL:
-                raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
-
-print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
-
-# ##############################
-# # Setup Audio Callback
-# ##############################
+# Setup Audio Callback
 def audio_samples(in_data, frame_count, time_info, status_flags):
     np_wav = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0  # Convert to [-1.0, +1.0]
     # Compute RMS and convert to dB
@@ -596,7 +465,7 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
         context_prediction = np.take(
             prediction[0], [homesounds.labels[x] for x in active_context])
         m = np.argmax(context_prediction)
-        if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+        if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
             print("Prediction: %s (%0.2f)" % (
                 homesounds.to_human_labels[active_context[m]], context_prediction[m]))
 
@@ -803,7 +672,8 @@ def handle_source(json_data):
                 # Process as speech
                 adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
-                    # ... existing speech processing code ...
+                    # Placeholder for existing speech processing code
+                    pass
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
                     socketio.emit('audio_label', {
@@ -1015,7 +885,6 @@ def background_thread():
                       {'data': 'Server generated event', 'count': count},
                       namespace='/test')
 
-
 @app.route('/')
 def index():
     return send_from_directory(app.static_folder, 'index.html')
@@ -1087,8 +956,8 @@ def disconnect_request():
         disconnect()
 
     session['receive_count'] = session.get('receive_count', 0) + 1
-    # for this emit we use a callback function
-    # when the callback function is invoked we know that the message has been
+    # For this emit we use a callback function
+    # When the callback function is invoked we know that the message has been
     # received and it is safe to disconnect
     emit('my_response',
          {'data': 'Disconnected!', 'count': session['receive_count']},
@@ -1102,11 +971,9 @@ def test_connect():
             thread = socketio.start_background_task(background_thread)
     emit('my_response', {'data': 'Connected', 'count': 0})
 
-
 @socketio.on('disconnect', namespace='/test')
 def test_disconnect():
     print('Client disconnected', request.sid)
-
 
 @socketio.on('connect')
 def handle_connect():
@@ -1311,7 +1178,8 @@ def handle_source(json_data):
                 # Process as speech
                 adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
-                    # ... existing speech processing code ...
+                    # Placeholder for existing speech processing code
+                    pass
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
                     socketio.emit('audio_label', {
@@ -1407,33 +1275,6 @@ if __name__ == '__main__':
     
     logger.info("="*60)
     logger.info("SONARITY SERVER STARTED")
-    logger.info("="*60)
-    
-    if ip_addresses:
-        logger.info("Server is available at:")
-        for i, ip in enumerate(ip_addresses):
-            logger.info(f"{i+1}. http://{ip}:{args.port}")
-            logger.info(f"   WebSocket: ws://{ip}:{args.port}")
-        
-        # Add external IP information
-        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
-        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
-        
-        logger.info("\nPreferred connection address: http://%s:%d" % (ip_addresses[0], args.port))
-        logger.info("Preferred WebSocket address: ws://%s:%d" % (ip_addresses[0], args.port))
-    else:
-        logger.warning("Could not determine IP address. Make sure you're connected to a network.")
-        logger.info(f"Try connecting to your server's IP address on port {args.port}")
-        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
-        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
-    
-    logger.info("="*60 + "\n")
-    
-    # Get port from environment variable if set (for cloud platforms)
-    port = int(os.environ.get('PORT', args.port))
-    
-    # Run the server on all network interfaces (0.0.0.0) so external devices can connect
-    socketio.run(app, host='0.0.0.0', port=port, debug=args.debug)
     logger.info("="*60)
     
     if ip_addresses:
