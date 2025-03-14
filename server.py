@@ -194,6 +194,11 @@ socketio = SocketIO(app, async_mode=async_mode)
 thread = None
 thread_lock = Lock()
 
+# Add notification cooldown tracking
+last_notification_time = 0
+last_notification_sound = None
+NOTIFICATION_COOLDOWN_SECONDS = 1.0  # Minimum seconds between notifications
+
 # Thresholds
 PREDICTION_THRES = 0.15  # Lower from 0.25/0.30 to 0.15
 FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
@@ -204,6 +209,7 @@ CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
 SPEECH_PREDICTION_THRES = 0.65  # Lowered from 0.7 to 0.65 for better speech detection
 SPEECH_DETECTION_THRES = 0.55  # Lowered from 0.6 to 0.55 for secondary speech detection
 SPEECH_BIAS_CORRECTION = 0.25  # Reduced from 0.3 to 0.25 to avoid excessive correction
+KNOCK_LOWER_THRESHOLD = 0.05  # Lower threshold for knock detection
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -523,6 +529,17 @@ def tensorflow_predict(x_input, db_level=None):
                                     # Standard case
                                     correction = SPEECH_BIAS_CORRECTION
                                 
+                                # Special case: if knock detection is also high, apply stronger speech correction
+                                # This helps prevent speech from overwhelming knock detection
+                                knock_idx = homesounds.labels.get('knock', 11)
+                                if knock_idx < len(predictions[i]) and predictions[i][knock_idx] > 0.05:
+                                    # The more confident the knock, the more we reduce speech
+                                    knock_confidence = predictions[i][knock_idx]
+                                    # Scale correction: 0.05 confidence = +10%, 0.2 confidence = +40% correction
+                                    additional_correction = min(0.8, knock_confidence * 2.0)
+                                    correction *= (1.0 + additional_correction)
+                                    print(f"Applied additional speech correction due to knock detection ({knock_confidence:.4f})")
+                                
                                 # Only apply correction if speech is high confidence
                                 if original_confidence > 0.6:
                                     # Apply correction factor to reduce speech confidence
@@ -577,13 +594,7 @@ def handle_source(json_data):
         # ENHANCED SILENCE DETECTION: Check if audio is silent - emit silence and return early
         if db < SILENCE_THRES:
             print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
-            socketio.emit('audio_label', {
-                'label': 'Silent',
-                'accuracy': '1.0',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
+            emit_sound_notification('Silent', '1.0', db, time_data, record_time)
             return
         
         # Check original audio size - SoundWatch requires exactly 1 second (16000 samples) of audio
@@ -610,11 +621,7 @@ def handle_source(json_data):
         # Basic sanity check for x
         if x.shape[0] == 0:
             print("Error: Empty audio features")
-            socketio.emit('audio_label', {
-                'label': 'Error: Empty Audio Features',
-                'accuracy': '0.0',
-                'db': str(db)
-            })
+            emit_sound_notification('Error: Empty Audio Features', '0.0', db, time_data, record_time)
             return
         
         # Reshape for model input - model expects shape (1, 96, 64, 1)
@@ -644,11 +651,7 @@ def handle_source(json_data):
         
         if not valid_indices:
             print("Error: No valid sound labels found in current context")
-            socketio.emit('audio_label', {
-                'label': 'Error: Invalid Sound Context',
-                'accuracy': '0.0',
-                'db': str(db)
-            })
+            emit_sound_notification('Error: Invalid Sound Context', '0.0', db, time_data, record_time)
             return
         
         # Take predictions from the valid indices
@@ -658,6 +661,20 @@ def handle_source(json_data):
         # Get the corresponding label from the valid indices
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
+        
+        # Check for knock specifically (with lower threshold) before main processing
+        knock_idx = homesounds.labels.get('knock', 11)
+        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
+            print(f"Found potential knock with confidence: {predictions[0][knock_idx]:.4f}")
+            
+            # If knock confidence is significant or higher than other predictions except speech
+            # or if we have a moderate knock confidence with loud audio, emit knock notification
+            if (predictions[0][knock_idx] > 0.2 or 
+                (predictions[0][knock_idx] > 0.1 and db > 60) or
+                (predictions[0][knock_idx] == context_prediction[m] and predicted_label == 'knock')):
+                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {db} dB")
+                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), db, time_data, record_time)
+                return
         
         # Print prediction information
         print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}, db: {db})")
@@ -669,11 +686,7 @@ def handle_source(json_data):
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                socketio.emit('audio_label', {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '0.2',
-                    'db': str(db)
-                })
+                emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
                 return
             
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
@@ -684,13 +697,7 @@ def handle_source(json_data):
                 if context_prediction[m] > adaptive_threshold:
                     # Speech detection passed threshold - emit the prediction and handle speech processing
                     logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
-                    socketio.emit('audio_label', {
-                        'label': human_label,
-                        'accuracy': str(context_prediction[m]),
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
-                    })
+                    emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
                     
                     # Continue with speech processing if needed
                     # If we're in debug mode, emit a debug message
@@ -698,22 +705,12 @@ def handle_source(json_data):
                         logger.debug("Speech recognition passed threshold and was emitted to client")
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    socketio.emit('audio_label', {
-                        'label': 'Unrecognized Sound',
-                        'accuracy': '0.2',
-                        'db': str(db)
-                    })
+                    emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
                     return
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
-                socketio.emit('audio_label', {
-                    'label': human_label,
-                    'accuracy': str(context_prediction[m]),
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
+                emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
         else:
             # Sound didn't meet thresholds
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
@@ -721,36 +718,21 @@ def handle_source(json_data):
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:
+            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and db > DBLEVEL_THRES:
                 print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence as fallback!")
-                socketio.emit('audio_label', {
-                    'label': 'Knocking',
-                    'accuracy': str(predictions[0][knock_idx]),
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
+                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), db, time_data, record_time)
                 return
             
-            socketio.emit('audio_label', {
-                'label': 'Unrecognized Sound',
-                'accuracy': '0.5',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
+            emit_sound_notification('Unrecognized Sound', '0.5', db, time_data, record_time)
             print(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
         traceback.print_exc()
         # Send error message to client
-        socketio.emit('audio_label', {
-            'label': 'Error',
-            'accuracy': '0.0',
-            'db': str(db) if 'db' in locals() else '-100',
-            'time': str(time_data) if 'time_data' in locals() else '0',
-            'record_time': str(record_time) if 'record_time' in locals() and record_time else ''
-        })
+        emit_sound_notification('Error', '0.0', 
+            str(db) if 'db' in locals() else '-100',
+            str(time_data) if 'time_data' in locals() else '0',
+            str(record_time) if 'record_time' in locals() and record_time else '')
 
 # Keep track of recent audio buffers for better speech transcription
 recent_audio_buffer = []
@@ -1111,13 +1093,7 @@ def handle_source(json_data):
         # ENHANCED SILENCE DETECTION: Check if audio is silent
         if db < SILENCE_THRES:
             logger.debug(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
-            socketio.emit('audio_label', {
-                'label': 'Silent',
-                'accuracy': '1.0',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
+            emit_sound_notification('Silent', '1.0', db, time_data, record_time)
             return
             
         # Convert feature data to numpy array - handle both new and old formats
@@ -1144,6 +1120,19 @@ def handle_source(json_data):
         pred = tensorflow_predict(x, db)
         logger.debug(f"Raw prediction shape: {pred[0].shape}")
         
+        # Check for knock specifically (with lower threshold) before main processing
+        knock_idx = homesounds.labels.get('knock', 11)
+        if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
+            logger.debug(f"Found potential knock with confidence: {pred[0][knock_idx]:.4f}")
+            
+            # If knock confidence is significant or higher than other predictions except speech
+            # or if we have a moderate knock confidence with loud audio, emit knock notification
+            if (pred[0][knock_idx] > 0.2 or 
+                (pred[0][knock_idx] > 0.1 and db > 60)):
+                logger.debug(f"Knock detection triggered with {pred[0][knock_idx]:.4f} confidence at {db} dB")
+                emit_sound_notification('Knocking', str(pred[0][knock_idx]), db, time_data, record_time)
+                return
+        
         # Find maximum prediction for active context
         valid_indices = []
         for label in active_context:
@@ -1154,13 +1143,7 @@ def handle_source(json_data):
                 
         if not valid_indices:
             logger.error("No valid sound labels found in current context")
-            socketio.emit('audio_label', {
-                'label': 'Error: Invalid Sound Context',
-                'accuracy': '0.0',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
+            emit_sound_notification('Error: Invalid Sound Context', '0.0', db, time_data, record_time)
             return
             
         # Take predictions from the valid indices
@@ -1187,11 +1170,7 @@ def handle_source(json_data):
             # Special case for "Chopping" - use higher threshold
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 logger.debug(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                socketio.emit('audio_label', {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '0.2',
-                    'db': str(db)
-                })
+                emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
                 return
                 
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
@@ -1202,13 +1181,7 @@ def handle_source(json_data):
                 if context_prediction[m] > adaptive_threshold:
                     # Speech detection passed threshold - emit the prediction and handle speech processing
                     logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
-                    socketio.emit('audio_label', {
-                        'label': human_label,
-                        'accuracy': str(context_prediction[m]),
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
-                    })
+                    emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
                     
                     # Continue with speech processing if needed
                     # If we're in debug mode, emit a debug message
@@ -1216,47 +1189,25 @@ def handle_source(json_data):
                         logger.debug("Speech recognition passed threshold and was emitted to client")
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    socketio.emit('audio_label', {
-                        'label': 'Unrecognized Sound',
-                        'accuracy': '0.2',
-                        'db': str(db)
-                    })
+                    emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
                     return
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
-                socketio.emit('audio_label', {
-                    'label': human_label,
-                    'accuracy': str(context_prediction[m]),
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
+                emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
         else:
             # Sound didn't meet thresholds
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            logger.debug(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
+            logger.debug(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db={db})")
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(pred[0]) and pred[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:
+            if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_LOWER_THRESHOLD and db > DBLEVEL_THRES:
                 logger.debug(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
-                socketio.emit('audio_label', {
-                    'label': 'Knocking',
-                    'accuracy': str(pred[0][knock_idx]),
-                    'db': str(db),
-                    'time': str(time_data),
-                    'record_time': str(record_time) if record_time else ''
-                })
+                emit_sound_notification('Knocking', str(pred[0][knock_idx]), db, time_data, record_time)
                 return
             
-            socketio.emit('audio_label', {
-                'label': 'Unrecognized Sound',
-                'accuracy': '0.5',
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
-            })
+            emit_sound_notification('Unrecognized Sound', '0.5', db, time_data, record_time)
             logger.debug(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
         logger.error(f"Error in audio_feature_data handler: {str(e)}", exc_info=True)
@@ -1277,6 +1228,73 @@ def get_adaptive_threshold(db_level, base_threshold):
     elif db_level < 40:  # Very quiet
         return base_threshold * 1.2
     return base_threshold
+
+# Function to check if we should send a notification based on cooldown
+def should_send_notification(sound_label):
+    """
+    Check if enough time has passed since the last notification.
+    Also prevents duplicate notifications of the same sound in rapid succession.
+    
+    Args:
+        sound_label: The sound label to potentially notify
+        
+    Returns:
+        True if notification should be sent, False otherwise
+    """
+    global last_notification_time, last_notification_sound
+    
+    current_time = time.time()
+    time_since_last = current_time - last_notification_time
+    
+    # Always allow the first notification
+    if last_notification_time == 0:
+        last_notification_time = current_time
+        last_notification_sound = sound_label
+        return True
+    
+    # If we're sending the same sound again, require longer cooldown
+    if sound_label == last_notification_sound:
+        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
+    else:
+        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS
+    
+    # Special case: knocking interrupts other sounds with shorter cooldown
+    if sound_label == "Knocking" and last_notification_sound != "Knocking":
+        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.5
+    
+    # If enough time has passed, allow the notification
+    if time_since_last >= required_cooldown:
+        last_notification_time = current_time
+        last_notification_sound = sound_label
+        return True
+    
+    # Not enough time has passed
+    logger.debug(f"Skipping notification for '{sound_label}' due to cooldown ({time_since_last:.2f}s < {required_cooldown:.2f}s)")
+    return False
+
+# Function to emit sound notifications with cooldown management
+def emit_sound_notification(label, accuracy, db, time_data="", record_time=""):
+    """
+    Emit sound notification with cooldown management.
+    
+    Args:
+        label: Sound label to emit
+        accuracy: Confidence value
+        db: Decibel level
+        time_data: Time data from client
+        record_time: Record time from client
+    """
+    if should_send_notification(label):
+        logger.debug(f"Emitting notification: {label} ({accuracy})")
+        socketio.emit('audio_label', {
+            'label': label,
+            'accuracy': str(accuracy),
+            'db': str(db),
+            'time': str(time_data),
+            'record_time': str(record_time) if record_time else ''
+        })
+    else:
+        logger.debug(f"Notification for '{label}' suppressed due to cooldown")
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
