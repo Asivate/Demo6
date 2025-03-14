@@ -29,8 +29,11 @@ logger = logging.getLogger(__name__)
 
 # Define model URLs for different languages
 VOSK_MODEL_URLS = {
+    # Small model: ~40MB, fast but less accurate
     "en-us-small": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+    # Medium model: ~100MB, balanced performance
     "en-us-medium": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
+    # Large model: ~1.5GB, slower but more accurate, better for complex audio
     "en-us-large": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42.zip"
 }
 
@@ -129,8 +132,8 @@ class VoskSpeechToText:
             model_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
             os.makedirs(model_dir, exist_ok=True)
             
-            # Define model path
-            model_name = "vosk-model-small-en-us-0.15"
+            # Define model path - using large model for better accuracy
+            model_name = "vosk-model-large-en-us-0.42"
             model_path = os.path.join(model_dir, model_name)
             
             # Check if model exists, if not download it
@@ -138,8 +141,8 @@ class VoskSpeechToText:
                 with model_download_lock:
                     # Check again in case another thread downloaded it while we were waiting
                     if not os.path.exists(model_path) or not os.listdir(model_path):
-                        logger.info(f"Downloading Vosk model {model_name}...")
-                        model_url = VOSK_MODEL_URLS["en-us-small"]
+                        logger.info(f"Downloading Vosk large model {model_name}...")
+                        model_url = VOSK_MODEL_URLS["en-us-large"]
                         zip_path = os.path.join(model_dir, f"{model_name}.zip")
                         
                         # Download the model with retry logic
@@ -208,9 +211,10 @@ class VoskSpeechToText:
             retry_count = 0
             while retry_count < self._max_retries:
                 try:
-                    logger.info(f"Loading Vosk model from {model_path}...")
+                    logger.info(f"Loading Vosk large model from {model_path}...")
+                    logger.info(f"Note: This may take a while as the large model is approximately 1.5GB in size")
                     self.model = Model(model_path)
-                    logger.info("Vosk model loaded successfully")
+                    logger.info("Vosk large model loaded successfully - this should provide better transcription accuracy")
                     break
                 except Exception as e:
                     retry_count += 1
@@ -228,7 +232,8 @@ class VoskSpeechToText:
             
             # Mark as initialized
             VoskSpeechToText._is_initialized = True
-            logger.info("Vosk speech recognition initialized successfully")
+            logger.info("Vosk speech recognition initialized successfully with large model")
+            logger.info("Note: Large model provides better accuracy but requires more memory and processing time")
             
         except Exception as e:
             error_msg = f"Error initializing Vosk speech recognition: {str(e)}"

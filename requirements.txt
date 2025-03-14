@@ -29,7 +29,7 @@ sentencepiece==0.1.99
 pyctcdecode==0.5.0
 openai-whisper==20240930
 emoji==2.8.0
-vosk==0.3.45
+vosk==0.3.50
 
 # Utility packages
 wget==3.2
