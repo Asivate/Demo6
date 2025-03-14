@@ -1299,6 +1299,10 @@ def handle_source(json_data):
 # Adjust the notification cooldown settings
 NOTIFICATION_COOLDOWN_SECONDS = 2.0  # Increased from 1.0 to 2.0 seconds
 SPEECH_NOTIFICATION_COOLDOWN = 3.0  # Longer cooldown specifically for speech
+UNRECOGNIZED_SOUND_COOLDOWN = 5.0  # Much longer cooldown for "Unrecognized Sound" to reduce frequency
+
+# Add a minimum volume threshold for Unrecognized Sound to reduce frequency
+UNRECOGNIZED_SOUND_MIN_DB = 55  # Only emit Unrecognized Sound notifications when above this dB level
 
 # Update should_send_notification function to use sound-specific cooldowns
 def should_send_notification(sound_label):
@@ -1333,14 +1337,17 @@ def should_send_notification(sound_label):
     # Use sound-specific cooldowns
     if sound_label == "Speech":
         required_cooldown = SPEECH_NOTIFICATION_COOLDOWN  # Longer cooldown for speech 
+    # For Unrecognized Sound, use much longer cooldown to reduce frequency
+    elif sound_label == "Unrecognized Sound":
+        required_cooldown = UNRECOGNIZED_SOUND_COOLDOWN
     # Important sounds (like water running, doorbell) use reduced cooldown
     elif sound_label in ["Knocking", "Water Running", "Doorbell In-Use", "Baby Crying", "Phone Ringing", "Alarm Clock"]:
-        # For important sounds, apply a shorter cooldown and interrupt other sounds
-        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.5
+        # For important sounds, apply a consistent cooldown and interrupt other sounds
+        required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.75  # Use consistent 1.5s cooldown for all critical sounds
         # Allow interruption of non-critical sounds
         if last_notification_sound not in ["Fire/Smoke Alarm", "Knocking", "Water Running", "Doorbell In-Use", 
                                           "Baby Crying", "Phone Ringing", "Alarm Clock"]:
-            required_cooldown = 0.2  # Very short cooldown to interrupt non-critical sounds
+            required_cooldown = 0.5  # Slightly longer cooldown to interrupt non-critical sounds
     # If we're sending the same sound again, require longer cooldown
     elif sound_label == last_notification_sound:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
@@ -1371,6 +1378,17 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         record_time: Record time from client
         sentiment_data: Optional sentiment analysis data
     """
+    # For Unrecognized Sound, enforce a minimum dB level to reduce notifications in quieter environments
+    if label == 'Unrecognized Sound':
+        try:
+            db_level = float(db)
+            if db_level < UNRECOGNIZED_SOUND_MIN_DB:
+                logger.debug(f"Suppressing Unrecognized Sound notification due to low volume: {db_level} dB < {UNRECOGNIZED_SOUND_MIN_DB} dB threshold")
+                return
+        except (ValueError, TypeError):
+            # If db can't be converted to float, just continue with notification
+            pass
+            
     if should_send_notification(label):
         logger.debug(f"Emitting notification: {label} ({accuracy})")
         
