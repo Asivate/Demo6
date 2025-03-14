@@ -898,7 +898,7 @@ def process_speech_with_sentiment(audio_data):
         Dictionary with transcription and sentiment
     """
     # Settings for improved speech processing
-    SPEECH_MAX_BUFFER_SIZE = 8  # Number of audio chunks to keep in buffer for speech only
+    SPEECH_MAX_BUFFER_SIZE = 16  # Increased from 8 to 16 for much longer buffer (about 8-10 seconds of audio)
     MIN_WORD_COUNT = 2   # Reduced from 3 to 2 for better sensitivity
     MIN_CONFIDENCE = 0.7  # Minimum confidence level for speech detection
     
@@ -915,7 +915,7 @@ def process_speech_with_sentiment(audio_data):
     
     # For better transcription, use concatenated audio from multiple chunks if available
     if len(process_speech_with_sentiment.recent_audio_buffer) > 1:
-        # Use up to 8 chunks for speech recognition
+        # Use up to 16 chunks for speech recognition (about 8-10 seconds for better speech API performance)
         num_chunks = min(SPEECH_MAX_BUFFER_SIZE, len(process_speech_with_sentiment.recent_audio_buffer))
         logger.info(f"Using concatenated audio from {num_chunks} chunks for speech transcription")
         
@@ -924,8 +924,8 @@ def process_speech_with_sentiment(audio_data):
     else:
         concatenated_audio = audio_data
     
-    # Ensure minimum audio length for better transcription - increase to 4.0 seconds
-    min_samples = RATE * 4.0  # At least 4.0 seconds of audio for speech
+    # Ensure minimum audio length for better transcription - increase to 8.0 seconds
+    min_samples = RATE * 8.0  # At least 8.0 seconds of audio for speech (doubled from 4.0)
     if len(concatenated_audio) < min_samples:
         pad_size = int(min_samples) - len(concatenated_audio)
         # Use reflect padding to extend short audio naturally
@@ -986,9 +986,23 @@ def process_speech_with_sentiment(audio_data):
     
     # Transcribe audio using the selected speech-to-text processor
     if USE_GOOGLE_SPEECH_API:
-        # Use Google Cloud Speech-to-Text
+        # Use Google Cloud Speech-to-Text with improved settings
         try:
-            transcription = transcribe_with_google(concatenated_audio, RATE)
+            # Add debug print to see audio length
+            logger.info(f"Sending {len(concatenated_audio)/RATE:.2f} seconds of audio to Google Speech API")
+            
+            # Set enhanced configuration options for better results
+            options = {
+                "language_code": "en-US",
+                "sample_rate_hertz": RATE,
+                "enable_automatic_punctuation": True,
+                "use_enhanced": True,  # Use enhanced model for better accuracy
+                "model": "command_and_search",  # Better for short commands/phrases
+                "audio_channel_count": 1
+            }
+            
+            # Make the API call with the enhanced settings
+            transcription = transcribe_with_google(concatenated_audio, RATE, **options)
             logger.info(f"Google transcription result: '{transcription}'")
         except Exception as e:
             logger.error(f"Error with Google Speech API: {str(e)}.")

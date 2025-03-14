@@ -281,13 +281,19 @@ class GoogleSpeechToText:
             return ""
 
 # Function for use in the main server code
-def transcribe_with_google(audio_data, sample_rate=16000):
+def transcribe_with_google(audio_data, sample_rate=16000, **options):
     """
     Transcribe audio using Google Cloud Speech-to-Text API.
     
     Args:
         audio_data: Audio data as numpy array
         sample_rate: Sample rate of the audio data
+        **options: Additional options to pass to the RecognitionConfig
+            - language_code: Language code (default: "en-US")
+            - model: Model to use (default: "command_and_search")
+            - use_enhanced: Whether to use enhanced model (default: True)
+            - enable_automatic_punctuation: Whether to enable automatic punctuation (default: True)
+            - audio_channel_count: Number of audio channels (default: 1)
         
     Returns:
         Transcribed text
@@ -297,6 +303,22 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         return ""
     
     try:
+        # Log audio properties for debugging
+        duration = len(audio_data) / sample_rate
+        logger.info(f"Transcribing {duration:.2f} seconds of audio (samples: {len(audio_data)})")
+        
+        # Calculate audio energy to detect silence
+        rms = np.sqrt(np.mean(audio_data**2))
+        if rms < 0.001:  # Very quiet audio
+            logger.info(f"Audio is nearly silent (RMS: {rms:.6f}), skipping transcription")
+            return ""
+            
+        # Boost quiet audio if needed
+        if rms < 0.05:
+            boost_factor = min(0.1 / max(rms, 0.001), 10.0)
+            audio_data = audio_data * boost_factor
+            logger.info(f"Boosted quiet audio by factor of {boost_factor:.2f}")
+        
         # Ensure audio is in the correct format (16-bit PCM)
         audio_data = (audio_data * 32767).astype(np.int16)
         
@@ -310,15 +332,23 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         # Create a speech client
         client = speech.SpeechClient()
         
+        # Extract options with defaults
+        language_code = options.get("language_code", "en-US")
+        model = options.get("model", "command_and_search")  # command_and_search is better for short phrases
+        use_enhanced = options.get("use_enhanced", True)
+        enable_automatic_punctuation = options.get("enable_automatic_punctuation", True)
+        audio_channel_count = options.get("audio_channel_count", 1)
+        
         # Configure the audio settings
         audio = speech.RecognitionAudio(content=byte_io.read())
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
-            language_code="en-US",
-            model="default",
-            enable_automatic_punctuation=True,
-            use_enhanced=True,
+            language_code=language_code,
+            model=model,
+            enable_automatic_punctuation=enable_automatic_punctuation,
+            use_enhanced=use_enhanced,
+            audio_channel_count=audio_channel_count,
             # Add speech contexts to improve recognition of specific phrases
             speech_contexts=[
                 speech.SpeechContext(
@@ -327,11 +357,19 @@ def transcribe_with_google(audio_data, sample_rate=16000):
                              "vacuum", "drill", "alarm", "clock", "cough", "snore", "typing", 
                              "blender", "dishwasher", "flush", "toilet", "hair dryer", "shaver", 
                              "toothbrush", "cooking", "chopping", "cutting", "hammer", "saw", 
-                             "car horn", "engine", "hazard", "finger snap", "hand clap", "applause"],
-                    boost=10.0
+                             "car horn", "engine", "hazard", "finger snap", "hand clap", "applause",
+                             # Common speech phrases for improved accuracy
+                             "hello", "hi", "hey", "okay", "yes", "no", "please", "thank you",
+                             "I need help", "help me", "emergency", "call", "message", "text",
+                             "I don't feel well", "I'm not feeling well", "I feel sick", "I'm sick",
+                             "I'm fine", "I am okay", "I'm okay", "I need assistance"],
+                    boost=15.0  # Increased boost for better detection
                 )
             ]
         )
+        
+        # Log the request configuration
+        logger.info(f"Speech recognition request: {duration:.2f}s audio, model={model}, enhanced={use_enhanced}")
         
         # Detect speech in the audio
         logger.info("Sending audio to Google Cloud Speech-to-Text API...")
@@ -339,12 +377,39 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         
         # Process the response
         transcript = ""
+        confidence = 0.0
+        
+        # Extract all results and their confidence scores
+        all_results = []
         for result in response.results:
-            transcript += result.alternatives[0].transcript
+            if result.alternatives:
+                alt = result.alternatives[0]
+                all_results.append((alt.transcript, alt.confidence if hasattr(alt, 'confidence') else 0.0))
+                
+        # Sort by confidence
+        all_results.sort(key=lambda x: x[1], reverse=True)
+        
+        # Log all detected alternatives for debugging
+        for idx, (text, conf) in enumerate(all_results):
+            logger.info(f"Alternative {idx+1}: '{text}' (confidence: {conf:.2f})")
+            
+        # Use the highest confidence result
+        if all_results:
+            transcript, confidence = all_results[0]
+            
+        # If confidence is very low, be cautious about returning results
+        if confidence < 0.3 and transcript:
+            logger.warning(f"Low confidence transcription ({confidence:.2f}): '{transcript}'")
+            
+            # For very low confidence, don't return potentially incorrect transcriptions
+            if confidence < 0.15:
+                logger.info("Confidence too low, discarding transcription")
+                return ""
         
         # Filter out hallucinations
         transcript = filter_hallucinations(transcript)
         
+        logger.info(f"Final transcription: '{transcript}' (confidence: {confidence:.2f})")
         return transcript
     
     except Exception as e:
