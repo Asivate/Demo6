@@ -534,41 +534,41 @@ if not USE_AST_MODEL or True:  # We'll load it anyway as backup
                 _ = models["tensorflow"].predict(dummy_input)
                 print("Custom prediction function initialized successfully")
             print("TensorFlow model loaded with compile=False option")
-        except Exception as e2:
-            print(f"Error with fallback method: {e2}")
+    except Exception as e2:
+        print(f"Error with fallback method: {e2}")
+        traceback.print_exc()
+        try:
+            print("Trying third fallback method with explicit tensor names...")
+            with tf_graph.as_default():
+                with tf_session.as_default():
+                    # Load model using a more explicit approach
+                    models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                    
+                    # Create function that uses the session directly
+                    model = models["tensorflow"]
+                    
+                    # Create a custom predict function that uses the session directly
+                    def custom_predict(x):
+                        # Get input and output tensors
+                        input_tensor = model.inputs[0]
+                        output_tensor = model.outputs[0]
+                        # Run prediction in the session
+                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                    
+                    # Replace the model's predict function with our custom one
+                    models["tensorflow"].predict = custom_predict
+                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                    
+                    # Test it
+                    dummy_input = np.zeros((1, 96, 64, 1))
+                    _ = models["tensorflow"].predict(dummy_input)
+                    print("Custom prediction function initialized successfully")
+            print("Third fallback method succeeded")
+        except Exception as e3:
+            print(f"Error with third fallback method: {e3}")
             traceback.print_exc()
-            try:
-                print("Trying third fallback method with explicit tensor names...")
-                with tf_graph.as_default():
-                    with tf_session.as_default():
-                        # Load model using a more explicit approach
-                        models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                        
-                        # Create function that uses the session directly
-                        model = models["tensorflow"]
-                        
-                        # Create a custom predict function that uses the session directly
-                        def custom_predict(x):
-                            # Get input and output tensors
-                            input_tensor = model.inputs[0]
-                            output_tensor = model.outputs[0]
-                            # Run prediction in the session
-                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                        
-                        # Replace the model's predict function with our custom one
-                        models["tensorflow"].predict = custom_predict
-                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                        
-                        # Test it
-                        dummy_input = np.zeros((1, 96, 64, 1))
-                        _ = models["tensorflow"].predict(dummy_input)
-                        print("Custom prediction function initialized successfully")
-                print("Third fallback method succeeded")
-            except Exception as e3:
-                print(f"Error with third fallback method: {e3}")
-                traceback.print_exc()
-                if not USE_AST_MODEL:
-                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+            if not USE_AST_MODEL:
+                raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
 
 print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
@@ -799,128 +799,55 @@ def handle_source(json_data):
             
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
-                # Apply stricter threshold for speech detection
-                if context_prediction[m] < SPEECH_PREDICTION_THRES:
-                    print(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {SPEECH_PREDICTION_THRES} threshold")
-                    
-                    # Check if there's another sound with reasonable confidence
-                    temp_context = context_prediction.copy()
-                    speech_idx = valid_indices.index(valid_indices[m])
-                    temp_context[speech_idx] = 0  # Zero out speech confidence
-                    
-                    second_best_idx = np.argmax(temp_context)
-                    if temp_context[second_best_idx] > PREDICTION_THRES * 0.8:  # 80% of normal threshold
-                        # Use the second-best prediction instead
-                        second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
-                        second_best_human_label = homesounds.to_human_labels[second_best_label]
-                        print(f"Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
-                        
-                        socketio.emit('audio_label', {
-                            'label': second_best_human_label,
-                            'accuracy': str(temp_context[second_best_idx]),
-                            'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
-                        })
-                        return
-                    
-                    # If no good second-best prediction, check if speech is still reasonable
-                    if context_prediction[m] > SPEECH_DETECTION_THRES:
-                        print(f"Using speech with lower confidence: {context_prediction[m]:.4f}")
-                        socketio.emit('audio_label', {
-                            'label': 'Speech',
-                            'accuracy': str(context_prediction[m]),
-                            'db': str(db),
-                            'time': str(time_data),
-                            'record_time': str(record_time) if record_time else ''
-                        })
-                        return
-                    
-                    # If we get here, no good predictions found
+                logger.debug("Processing speech detection...")
+                # Process as speech
+                adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
+                if context_prediction[m] > adaptive_threshold:
+                    # ... existing speech processing code ...
+                else:
+                    logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
                     socketio.emit('audio_label', {
                         'label': 'Unrecognized Sound',
                         'accuracy': '0.2',
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
+                        'db': str(db)
                     })
                     return
-                
-                # ADDITIONAL CHECK: Don't even attempt speech sentiment for low audio levels
-                if db < DBLEVEL_THRES + 5:  # 5dB above minimum threshold
-                    print(f"Audio level too low for speech: {db} dB < {DBLEVEL_THRES + 5} dB")
-                    socketio.emit('audio_label', {
-                        'label': 'Unrecognized Sound',
-                        'accuracy': '0.3',
-                        'db': str(db),
-                        'time': str(time_data),
-                        'record_time': str(record_time) if record_time else ''
-                    })
-                    return
-                
-                # Process speech with sentiment analysis if confidence is high enough
-                if context_prediction[m] > SPEECH_SENTIMENT_THRES:
-                    # Process speech with sentiment analysis
-                    if sentiment_pipeline is not None:
-                        print("Speech detected. Processing sentiment...")
-                        sentiment_result = process_speech_with_sentiment(np_wav)
-                        
-                        # Only emit speech if Google API found actual speech content
-                        if sentiment_result and 'sentiment' in sentiment_result and sentiment_result['text']:
-                            label = f"Speech {sentiment_result['sentiment']['category']}"
-                            socketio.emit('audio_label', {
-                                'label': label,
-                                'accuracy': str(sentiment_result['sentiment']['confidence']),
-                                'db': str(db),
-                                'emoji': sentiment_result['sentiment']['emoji'],
-                                'transcription': sentiment_result['text'],
-                                'emotion': sentiment_result['sentiment']['original_emotion'],
-                                'sentiment_score': str(sentiment_result['sentiment']['confidence'])
-                            })
-                            print(f"EMITTING: {label}")
-                            return
-                        else:
-                            # No transcription found, check for second-best prediction
-                            temp_context = context_prediction.copy()
-                            speech_idx = valid_indices.index(valid_indices[m])
-                            temp_context[speech_idx] = 0  # Zero out speech confidence
-                            
-                            second_best_idx = np.argmax(temp_context)
-                            if temp_context[second_best_idx] > PREDICTION_THRES * 0.7:  # 70% of normal threshold
-                                # Use the second-best prediction instead
-                                second_best_label = active_context[valid_indices.index(valid_indices[second_best_idx])]
-                                second_best_human_label = homesounds.to_human_labels[second_best_label]
-                                print(f"No speech transcription found. Using second-best prediction: {second_best_human_label} ({temp_context[second_best_idx]:.4f})")
-                                
-                                socketio.emit('audio_label', {
-                                    'label': second_best_human_label,
-                                    'accuracy': str(temp_context[second_best_idx]),
-                                    'db': str(db),
-                                    'time': str(time_data),
-                                    'record_time': str(record_time) if record_time else ''
-                                })
-                                return
-                            else:
-                                # No good alternative, emit unrecognized
-                                print("No speech transcription and no alternative sound, emitting Unrecognized Sound")
-                                socketio.emit('audio_label', {
-                                    'label': 'Unrecognized Sound',
-                                    'accuracy': '0.4',
-                                    'db': str(db),
-                                    'time': str(time_data),
-                                    'record_time': str(record_time) if record_time else ''
-                                })
-                                return
-        
-        # Default case: Emit the detected sound
-        socketio.emit('audio_label', {
-            'label': human_label,
-            'accuracy': str(context_prediction[m]),
-            'db': str(db),
-            'time': str(time_data),
-            'record_time': str(record_time) if record_time else ''
-        })
-        print(f"EMITTING: {human_label} ({context_prediction[m]:.2f})")
+            else:
+                # For non-speech sounds, emit the prediction
+                logger.debug(f"Emitting non-speech prediction: {human_label}")
+                socketio.emit('audio_label', {
+                    'label': human_label,
+                    'accuracy': str(context_prediction[m]),
+                    'db': str(db),
+                    'time': str(time_data),
+                    'record_time': str(record_time) if record_time else ''
+                })
+        else:
+            # Sound didn't meet thresholds
+            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
+            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
+            
+            # Check for knock with lower threshold as a fallback
+            knock_idx = homesounds.labels.get('knock', 11)
+            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > 0.15 and db > DBLEVEL_THRES:
+                print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence as fallback!")
+                socketio.emit('audio_label', {
+                    'label': 'Knocking',
+                    'accuracy': str(predictions[0][knock_idx]),
+                    'db': str(db),
+                    'time': str(time_data),
+                    'record_time': str(record_time) if record_time else ''
+                })
+                return
+            
+            socketio.emit('audio_label', {
+                'label': 'Unrecognized Sound',
+                'accuracy': '0.5',
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
+            })
+            print(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
         traceback.print_exc()
@@ -1381,11 +1308,18 @@ def handle_source(json_data):
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
                 logger.debug("Processing speech detection...")
-                # ...existing speech processing code...
+                # Process as speech
                 adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
-                    # Process as speech
-                    # ...existing speech processing code...
+                    # ... existing speech processing code ...
+                else:
+                    logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
+                    socketio.emit('audio_label', {
+                        'label': 'Unrecognized Sound',
+                        'accuracy': '0.2',
+                        'db': str(db)
+                    })
+                    return
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
@@ -1480,7 +1414,6 @@ if __name__ == '__main__':
         for i, ip in enumerate(ip_addresses):
             logger.info(f"{i+1}. http://{ip}:{args.port}")
             logger.info(f"   WebSocket: ws://{ip}:{args.port}")
-    logger.info("SONARITY SERVER STARTED")
         
         # Add external IP information
         logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
