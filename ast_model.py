@@ -7,6 +7,7 @@ import warnings
 import time
 import traceback
 from tensorflow.keras import layers, models
+import tensorflow as tf
 
 # Suppress transformers warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -622,24 +623,50 @@ if __name__ == "__main__":
     for pred in predictions["mapped_predictions"]:
         print(f"  {pred['label']} (from {pred['original_label']}): {pred['confidence']:.6f}")
 
-# Update model architecture to match TensorFlow best practices
+# Replace existing model with optimized architecture
 def create_improved_model(input_shape, num_classes):
+    # Input normalization adapted to training data
     norm_layer = layers.Normalization()
+    
+    # Enhanced CNN architecture with residual connections
     model = models.Sequential([
         layers.Input(shape=input_shape),
-        layers.Resizing(32, 32),  # Downsample for efficiency
+        layers.Resizing(32, 32),  # Match TF tutorial specs
         norm_layer,
-        layers.Conv2D(32, 3, activation='relu'),
-        layers.Conv2D(64, 3, activation='relu'),
+        
+        # Convolutional block 1
+        layers.Conv2D(32, 3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.Conv2D(32, 3, activation='relu', padding='same'),
         layers.MaxPooling2D(),
         layers.Dropout(0.25),
-        layers.Conv2D(128, 3, activation='relu'),  # Additional layer
-        layers.GlobalAveragePooling2D(),  # Better than Flatten for audio
-        layers.Dense(256, activation='relu', kernel_regularizer='l2'),  # Regularization
+        
+        # Convolutional block 2 with residual connection
+        layers.Conv2D(64, 3, activation='relu', padding='same'),
+        layers.BatchNormalization(),
+        layers.Conv2D(64, 3, activation='relu', padding='same'),
+        layers.MaxPooling2D(),
+        layers.Dropout(0.3),
+        
+        # Attention layer for important frequency bands
+        layers.Attention(use_scale=True),
+        
+        # Final dense layers with regularization
+        layers.GlobalAveragePooling2D(),
+        layers.Dense(128, activation='relu', kernel_regularizer='l2'),
         layers.Dropout(0.5),
-        layers.Dense(num_classes),
+        layers.Dense(num_classes, activation='softmax')
     ])
     
-    # Add proper normalization adaptation
+    # Adapt normalization layer to training data
     norm_layer.adapt(data=train_spectrogram_ds.map(lambda spec, label: spec))
+    
+    # Custom learning rate schedule
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+        metrics=['accuracy'],
+        weighted_metrics=['accuracy']
+    )
+    
     return model 

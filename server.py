@@ -1381,7 +1381,11 @@ def handle_source(json_data):
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
                 logger.debug("Processing speech detection...")
-                # ... rest of speech processing code ...
+                # ...existing speech processing code...
+                adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
+                if context_prediction[m] > adaptive_threshold:
+                    # Process as speech
+                    # ...existing speech processing code...
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
@@ -1422,6 +1426,22 @@ def handle_source(json_data):
         logger.error(f"Error in audio_feature_data handler: {str(e)}", exc_info=True)
         traceback.print_exc()
 
+# Add these constants near other threshold definitions
+SPEECH_BASE_THRESHOLD = 0.7  # Lower from 0.85
+SPEECH_HIGH_DB_THRESHOLD = 0.65  # Even lower threshold for loud sounds
+DB_THRESHOLD_ADJUSTMENT = 5  # dB range for threshold adjustment
+
+# Replace the speech detection logic in handle_source
+def get_adaptive_threshold(db_level, base_threshold):
+    """Calculate adaptive threshold based on audio level"""
+    if db_level > 70:  # Very loud sounds
+        return base_threshold * 0.8
+    elif db_level > 60:  # Moderately loud
+        return base_threshold * 0.9
+    elif db_level < 40:  # Very quiet
+        return base_threshold * 1.2
+    return base_threshold
+
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
     parser = argparse.ArgumentParser(description='Sonarity Audio Analysis Server')
@@ -1453,6 +1473,34 @@ if __name__ == '__main__':
     
     logger.info("="*60)
     logger.info("SONARITY SERVER STARTED")
+    logger.info("="*60)
+    
+    if ip_addresses:
+        logger.info("Server is available at:")
+        for i, ip in enumerate(ip_addresses):
+            logger.info(f"{i+1}. http://{ip}:{args.port}")
+            logger.info(f"   WebSocket: ws://{ip}:{args.port}")
+    logger.info("SONARITY SERVER STARTED")
+        
+        # Add external IP information
+        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
+        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
+        
+        logger.info("\nPreferred connection address: http://%s:%d" % (ip_addresses[0], args.port))
+        logger.info("Preferred WebSocket address: ws://%s:%d" % (ip_addresses[0], args.port))
+    else:
+        logger.warning("Could not determine IP address. Make sure you're connected to a network.")
+        logger.info(f"Try connecting to your server's IP address on port {args.port}")
+        logger.info("\nExternal access: http://34.16.101.179:%d" % args.port)
+        logger.info("External WebSocket: ws://34.16.101.179:%d" % args.port)
+    
+    logger.info("="*60 + "\n")
+    
+    # Get port from environment variable if set (for cloud platforms)
+    port = int(os.environ.get('PORT', args.port))
+    
+    # Run the server on all network interfaces (0.0.0.0) so external devices can connect
+    socketio.run(app, host='0.0.0.0', port=port, debug=args.debug)
     logger.info("="*60)
     
     if ip_addresses:

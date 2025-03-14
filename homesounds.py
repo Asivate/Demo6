@@ -126,46 +126,100 @@ to_human_labels = {
     'conversation': "Conversation",
 }
 
-# Add dynamic threshold configuration
+# Enhanced threshold configuration with temporal smoothing
 SOUND_THRESHOLDS = {
-    'speech': 0.65,
-    'hazard-alarm': 0.4,
-    'door': 0.5,
-    'water-running': 0.55,
-    # Add other class-specific thresholds
+    # Base thresholds (db > 60)
+    'speech': {'base': 0.65, 'min': 0.4, 'priority': 1},
+    'hazard-alarm': {'base': 0.4, 'min': 0.3, 'priority': 3},
+    'door': {'base': 0.5, 'min': 0.35, 'priority': 2},
+    'water-running': {'base': 0.55, 'min': 0.4, 'priority': 2},
+    'baby-cry': {'base': 0.45, 'min': 0.3, 'priority': 3},
+    # ... other classes
 }
 
 CONTEXT_WEIGHTS = {
-    'kitchen': {'water-running': 1.5, 'hazard-alarm': 2.0},
-    'bedroom': {'baby-cry': 2.0, 'snore': 1.8},
-    # Add other context boosts
+    'kitchen': {
+        'weights': {'water-running': 1.5, 'hazard-alarm': 2.0},
+        'suppress': ['speech', 'music']
+    },
+    'bedroom': {
+        'weights': {'baby-cry': 2.0, 'snore': 1.8},
+        'suppress': ['drill', 'hammer']
+    },
+    # ... other contexts
 }
 
-def process_predictions(predictions, context='general', db_level=70):
-    # Apply context-aware weighting
-    weighted_preds = apply_context_weights(predictions, context)
+# Stateful prediction history for temporal smoothing 
+PREDICTION_HISTORY = {}
+
+def process_predictions(preds, context, db_level, history_length=5):
+    """Stateful prediction processing with temporal analysis"""
+    global PREDICTION_HISTORY
     
-    # Dynamic threshold adjustment based on dB level
-    base_threshold = 0.5
-    db_adjustment = np.clip((db_level - 60) / 20, -0.2, 0.2)
-    dynamic_threshold = base_threshold + db_adjustment
+    # Dynamic threshold adjustment
+    thresholds = {
+        k: max(v['min'], v['base'] * (db_level/70)) 
+        for k, v in SOUND_THRESHOLDS.items()
+    }
     
-    # Multi-label approach
-    valid_predictions = []
-    for label, prob in weighted_preds.items():
-        threshold = SOUND_THRESHOLDS.get(label, dynamic_threshold)
-        if prob >= threshold:
-            valid_predictions.append((label, prob))
+    # Context weighting
+    weighted = {
+        label: prob * CONTEXT_WEIGHTS[context]['weights'].get(label, 1)
+        for label, prob in preds.items()
+    }
     
-    # Temporal smoothing (requires state management)
-    if not valid_predictions:
-        return handle_ambient_sounds(db_level)
+    # Temporal smoothing
+    current_time = time.time()
+    PREDICTION_HISTORY.setdefault(context, []).append({
+        'time': current_time,
+        'predictions': weighted,
+        'db': db_level
+    })
     
-    return sorted(valid_predictions, key=lambda x: x[1], reverse=True)
+    # Remove old entries
+    PREDICTION_HISTORY[context] = [
+        entry for entry in PREDICTION_HISTORY[context]
+        if current_time - entry['time'] < history_length
+    ]
+    
+    # Calculate moving averages
+    temporal_predictions = defaultdict(list)
+    for entry in PREDICTION_HISTORY[context]:
+        for label, prob in entry['predictions'].items():
+            temporal_predictions[label].append(prob)
+    
+    averaged = {
+        label: np.mean(probs) * (1 + 0.2*np.std(probs))
+        for label, probs in temporal_predictions.items()
+    }
+    
+    # Apply final thresholds
+    valid = [
+        (label, prob) 
+        for label, prob in averaged.items() 
+        if prob >= thresholds.get(label, 0.5)
+    ]
+    
+    return sorted(valid, key=lambda x: x[1], reverse=True)
 
 # Update data preparation pipeline
 def create_optimized_dataset(dataset):
-    return dataset.cache().shuffle(10000).prefetch(tf.data.AUTOTUNE).batch(32)
+    """Enhanced data pipeline with augmentation"""
+    augmentation = tf.keras.Sequential([
+        layers.RandomZoom(0.2),
+        layers.RandomContrast(0.1),
+        layers.GaussianNoise(0.001)
+    ])
+    
+    return dataset \
+        .map(lambda x, y: (augmentation(x, training=True), y), 
+             num_parallel_calls=tf.data.AUTOTUNE) \
+        .cache() \
+        .shuffle(10000, reshuffle_each_iteration=True) \
+        .batch(32) \
+        .prefetch(tf.data.AUTOTUNE) \
+        .map(lambda x, y: (tf.image.per_image_standardization(x), y),
+             num_parallel_calls=tf.data.AUTOTUNE)
 
 def apply_speech_correction(preds, db_level):
     speech_prob = preds.get('speech', 0)
