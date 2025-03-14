@@ -73,9 +73,10 @@ USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API (defa
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
-        from google_speech import transcribe_with_google, GoogleSpeechToText
+from google_speech import transcribe_with_google, GoogleSpeechToText
 
 # Memory optimization settings
+import os
 MEMORY_OPTIMIZATION_LEVEL = os.environ.get('MEMORY_OPTIMIZATION', '1')  # 0=None, 1=Moderate, 2=Aggressive
 if MEMORY_OPTIMIZATION_LEVEL == '1':
     logger.info("Using moderate memory optimization")
@@ -813,16 +814,29 @@ def handle_source(json_data):
                     try:
                         # Use the same audio data that was used for detection
                         sentiment_result = process_speech_with_sentiment(combined_audio)
-                    
-                    if sentiment_result and 'sentiment' in sentiment_result:
+                        
+                        if sentiment_result and 'sentiment' in sentiment_result:
                             logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
-                            
+                    except Exception as e:
+                        logger.error(f"Error in initial sentiment processing: {str(e)}")
+                        sentiment_result = None
+                        # Emit notification with sentiment data
+                        emit_sound_notification(
+                            human_label, 
+                            str(context_prediction[m]), 
+                            combined_db, 
+                            time_data, 
+                                record_time,
+                                sentiment_result
+                            )
+                        if sentiment_result and 'sentiment' in sentiment_result:
+                            logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
                             # Emit notification with sentiment data
                             emit_sound_notification(
                                 human_label, 
                                 str(context_prediction[m]), 
                                 combined_db, 
-                                time_data, 
+                                time_data,
                                 record_time,
                                 sentiment_result
                             )
@@ -1330,7 +1344,7 @@ def should_send_notification(sound_label):
     # If we're sending the same sound again, require longer cooldown
     elif sound_label == last_notification_sound:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
-            else:
+    else:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS
     
     # If enough time has passed, allow the notification
@@ -1384,7 +1398,7 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Emit the notification
         socketio.emit('audio_label', notification_data)
-        else:
+    else:
         logger.debug(f"Notification for '{label}' suppressed due to cooldown")
 
 if __name__ == '__main__':
