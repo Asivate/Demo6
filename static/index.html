@@ -158,6 +158,36 @@
             margin-top: 10px;
             font-style: italic;
         }
+        .engine-selector {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #f5f5f5;
+            border-radius: 5px;
+        }
+        .engine-selector h3 {
+            margin-top: 0;
+        }
+        .engine-button {
+            padding: 8px 15px;
+            margin: 5px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .engine-button.active {
+            background-color: #4CAF50;
+            color: white;
+        }
+        .engine-button:not(.active) {
+            background-color: #e0e0e0;
+            color: #333;
+        }
+        .engine-info {
+            margin-top: 10px;
+            font-size: 0.9em;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -180,6 +210,18 @@
             <h3>Test Audio</h3>
             <button id="audio-btn" class="audio-btn" disabled>Start Recording</button>
             <div id="audio-status" class="audio-status">Connect to server to enable recording</div>
+        </div>
+        
+        <div class="engine-selector">
+            <h3>Speech Recognition Engine</h3>
+            <div class="engine-buttons">
+                <button id="engineAuto" class="engine-button active" data-engine="auto">Auto (Google+Vosk)</button>
+                <button id="engineGoogle" class="engine-button" data-engine="google">Google Only</button>
+                <button id="engineVosk" class="engine-button" data-engine="vosk">Vosk Only (Offline)</button>
+            </div>
+            <div class="engine-info">
+                <p id="engineInfo">Using Auto mode: Google Speech API with Vosk fallback</p>
+            </div>
         </div>
         
         <h2>Sound Predictions</h2>
@@ -436,6 +478,75 @@
             
             fileReader.readAsArrayBuffer(audioBlob);
         }
+
+        // Add code for speech engine selection
+        const engineButtons = document.querySelectorAll('.engine-button');
+        const engineInfo = document.getElementById('engineInfo');
+
+        // Update UI to show currently selected engine
+        function updateEngineUI(selectedEngine) {
+            engineButtons.forEach(button => {
+                const engine = button.getAttribute('data-engine');
+                if (engine === selectedEngine) {
+                    button.classList.add('active');
+                } else {
+                    button.classList.remove('active');
+                }
+            });
+
+            // Update info text
+            switch(selectedEngine) {
+                case 'auto':
+                    engineInfo.textContent = 'Using Auto mode: Google Speech API with Vosk fallback';
+                    break;
+                case 'google':
+                    engineInfo.textContent = 'Using Google Speech API only (requires internet)';
+                    break;
+                case 'vosk':
+                    engineInfo.textContent = 'Using Vosk only (offline mode, may be less accurate)';
+                    break;
+            }
+        }
+
+        // Handle engine selection
+        engineButtons.forEach(button => {
+            button.addEventListener('click', function() {
+                const engine = this.getAttribute('data-engine');
+                
+                // Send request to change engine
+                fetch('/api/toggle-speech-recognition', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ speech_engine: engine })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        updateEngineUI(engine);
+                        addResult('System', `Speech recognition engine changed to: ${engine}`, 'info');
+                    } else {
+                        addResult('Error', `Failed to change speech engine: ${data.message}`, 'error');
+                    }
+                })
+                .catch(error => {
+                    addResult('Error', `Error changing speech engine: ${error}`, 'error');
+                });
+            });
+        });
+
+        // Get initial engine setting on page load
+        fetch('/status')
+            .then(response => response.json())
+            .then(data => {
+                if (data.speech_recognition) {
+                    updateEngineUI(data.speech_recognition);
+                }
+            })
+            .catch(error => {
+                console.error('Error fetching server status:', error);
+            });
     </script>
 </body>
 </html> 

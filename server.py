@@ -28,6 +28,13 @@ import queue
 from transformers import pipeline
 import logging
 
+# Import Vosk speech recognition
+try:
+    from vosk_speech import transcribe_with_vosk, VOSK_AVAILABLE
+except ImportError:
+    VOSK_AVAILABLE = False
+    print("WARNING: Vosk speech recognition not available")
+
 # Configure logging with more detailed format
 logging.basicConfig(
     level=logging.DEBUG,  # Set to DEBUG level for maximum information
@@ -70,6 +77,14 @@ import ast_model
 
 # Global flags for speech recognition - defined BEFORE they're referenced
 USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API (default)
+
+# Define speech recognition engine options
+SPEECH_ENGINE_AUTO = "auto"      # Use Google with Vosk fallback (default)
+SPEECH_ENGINE_GOOGLE = "google"  # Use Google only (no fallback)
+SPEECH_ENGINE_VOSK = "vosk"      # Use Vosk only (offline mode)
+
+# Current speech recognition engine setting
+SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_AUTO  # Default to automatic mode
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
@@ -816,22 +831,17 @@ def handle_source(json_data):
                         sentiment_result = process_speech_with_sentiment(combined_audio)
                         
                         if sentiment_result and 'sentiment' in sentiment_result:
-                            logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
-                    except Exception as e:
-                        logger.error(f"Error in initial sentiment processing: {str(e)}")
-                        sentiment_result = None
-                        # Emit notification with sentiment data
-                        emit_sound_notification(
-                            human_label, 
-                            str(context_prediction[m]), 
-                            combined_db, 
-                            time_data, 
-                                record_time,
-                                sentiment_result
-                            )
-                        if sentiment_result and 'sentiment' in sentiment_result:
-                            logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
-                            # Emit notification with sentiment data
+                            # Extract and log the speech engine used
+                            engine_used = sentiment_result.get('transcription_engine', 'unknown')
+                            transcription = sentiment_result.get('text', '')
+                            logger.info(f"Speech processed using {engine_used} engine: '{transcription}'")
+                            logger.debug(f"Speech sentiment: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
+                            
+                            # Log Google API errors if they occurred but Vosk was successful
+                            if engine_used == 'vosk' and sentiment_result.get('google_api_error'):
+                                logger.warning(f"Google Speech API error: {sentiment_result['google_api_error']}, but Vosk fallback worked")
+                            
+                            # Emit notification with sentiment and engine data
                             emit_sound_notification(
                                 human_label, 
                                 str(context_prediction[m]), 
@@ -841,20 +851,25 @@ def handle_source(json_data):
                                 sentiment_result
                             )
                         else:
-                            # If sentiment processing failed, just emit regular notification
-                            logger.debug("Speech sentiment processing failed or returned no results")
+                            # If sentiment processing failed to return useful data, just emit regular notification
+                            logger.debug("Speech sentiment processing returned no useful results")
                             emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
                     except Exception as e:
                         logger.error(f"Error processing speech sentiment: {str(e)}", exc_info=True)
+                        # Still emit the basic speech notification even if sentiment processing failed
                         emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
                     
                     # If we're in debug mode, emit a debug message
                     if DEBUG_MODE:
                         logger.debug("Speech recognition passed threshold and was emitted to client")
+                    else:
+                        logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
+                        emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
+                        return
                 else:
-                    logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
-                    return
+                    # For non-speech sounds, emit the prediction
+                    logger.debug(f"Emitting non-speech prediction: {human_label}")
+                    emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
@@ -1134,38 +1149,215 @@ def process_speech_with_sentiment(audio_data):
     
     logger.info("Transcribing speech to text...")
     
-    # Transcribe audio using the selected speech-to-text processor
-    if USE_GOOGLE_SPEECH_API:
-        # Use Google Cloud Speech-to-Text with improved settings
-        try:
-            # Add debug print to see audio length
-            logger.info(f"Sending {len(concatenated_audio)/RATE:.2f} seconds of audio to Google Speech API")
-            
-            # Set enhanced configuration options for better results
-            options = {
-                "language_code": "en-US",
-                "sample_rate_hertz": RATE,
-                "enable_automatic_punctuation": True,
-                "use_enhanced": True,  # Use enhanced model for better accuracy
-                "model": "command_and_search",  # Better for short commands/phrases
-                "audio_channel_count": 1
+    # Variable to store transcription
+    transcription = ""
+    google_api_error = None
+    vosk_fallback_used = False
+    
+    # Check for configured speech recognition engine
+    if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_VOSK:
+        # Use Vosk Only
+        if VOSK_AVAILABLE:
+            logger.info("Using Vosk for speech recognition (as configured)")
+            try:
+                start_time = time.time()
+                transcription = transcribe_with_vosk(concatenated_audio, RATE)
+                processing_time = time.time() - start_time
+                logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                vosk_fallback_used = True
+            except Exception as e:
+                logger.error(f"Error with Vosk speech recognition: {str(e)}")
+                return {
+                    "text": "",
+                    "sentiment": {
+                        "category": "Neutral",
+                        "original_emotion": "neutral",
+                        "confidence": 0.5,
+                        "emoji": "😐"
+                    },
+                    "transcription_engine": "vosk",
+                    "error": str(e)
+                }
+        else:
+            logger.error("Vosk is configured but not available. Please install it with: pip install vosk")
+            return {
+                "text": "",
+                "sentiment": {
+                    "category": "Neutral",
+                    "original_emotion": "neutral",
+                    "confidence": 0.5,
+                    "emoji": "😐"
+                },
+                "error": "Vosk is not available but was selected as speech engine"
             }
-            
-            # Make the API call with the enhanced settings
-            transcription = transcribe_with_google(concatenated_audio, RATE, **options)
-            logger.info(f"Google transcription result: '{transcription}'")
-        except Exception as e:
-            logger.error(f"Error with Google Speech API: {str(e)}.")
-            return None
+    elif SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_GOOGLE:
+        # Use Google Only - No Fallback
+        if USE_GOOGLE_SPEECH_API:
+            try:
+                logger.info(f"Using Google Speech API only (as configured)")
+                start_time = time.time()
+                # Set enhanced configuration options for better results
+                options = {
+                    "language_code": "en-US",
+                    "sample_rate_hertz": RATE,
+                    "enable_automatic_punctuation": True,
+                    "use_enhanced": True,  # Use enhanced model for better accuracy
+                    "model": "command_and_search",  # Better for short commands/phrases
+                    "audio_channel_count": 1
+                }
+                
+                # Make the API call with the enhanced settings
+                transcription = transcribe_with_google(concatenated_audio, RATE, **options)
+                processing_time = time.time() - start_time
+                logger.info(f"Google transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+            except Exception as e:
+                google_api_error = str(e)
+                logger.error(f"Error with Google Speech API (no fallback configured): {google_api_error}")
+                return {
+                    "text": "",
+                    "sentiment": {
+                        "category": "Neutral",
+                        "original_emotion": "neutral",
+                        "confidence": 0.5,
+                        "emoji": "😐"
+                    },
+                    "transcription_engine": "google",
+                    "google_api_error": google_api_error
+                }
+        else:
+            logger.error("Google Speech API is required but not available")
+            return {
+                "text": "",
+                "sentiment": {
+                    "category": "Neutral",
+                    "original_emotion": "neutral",
+                    "confidence": 0.5,
+                    "emoji": "😐"
+                },
+                "error": "Google Speech API is not available but was selected as speech engine"
+            }
     else:
-        # No speech recognition available
-        logger.error("No speech recognition system available")
-        return None
+        # Auto Mode (default) - Try Google first, then Vosk as fallback
+        if USE_GOOGLE_SPEECH_API:
+            try:
+                # Add debug print to see audio length
+                logger.info(f"Using Auto mode: Google first, then Vosk fallback. Sending {len(concatenated_audio)/RATE:.2f} seconds of audio to Google Speech API")
+                
+                # Set enhanced configuration options for better results
+                options = {
+                    "language_code": "en-US",
+                    "sample_rate_hertz": RATE,
+                    "enable_automatic_punctuation": True,
+                    "use_enhanced": True,  # Use enhanced model for better accuracy
+                    "model": "command_and_search",  # Better for short commands/phrases
+                    "audio_channel_count": 1
+                }
+                
+                start_time = time.time()
+                # Make the API call with the enhanced settings
+                transcription = transcribe_with_google(concatenated_audio, RATE, **options)
+                processing_time = time.time() - start_time
+                logger.info(f"Google transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                
+                # If Google returns empty result, try Vosk as fallback
+                if not transcription and VOSK_AVAILABLE:
+                    logger.info("Google Speech API returned empty result, trying Vosk as fallback")
+                    vosk_fallback_used = True
+                    start_time = time.time()
+                    transcription = transcribe_with_vosk(concatenated_audio, RATE)
+                    processing_time = time.time() - start_time
+                    logger.info(f"Vosk fallback transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+            except Exception as e:
+                google_api_error = str(e)
+                logger.error(f"Error with Google Speech API: {google_api_error}")
+                
+                # Try Vosk as fallback if Google fails
+                if VOSK_AVAILABLE:
+                    logger.info("Trying Vosk as fallback due to Google Speech API error")
+                    vosk_fallback_used = True
+                    try:
+                        start_time = time.time()
+                        transcription = transcribe_with_vosk(concatenated_audio, RATE)
+                        processing_time = time.time() - start_time
+                        logger.info(f"Vosk fallback transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                    except Exception as vosk_error:
+                        logger.error(f"Error with Vosk fallback: {str(vosk_error)}")
+                        # Log both errors for debugging
+                        logger.error(f"Speech recognition failed with both engines - Google: {google_api_error}, Vosk: {str(vosk_error)}")
+                        return {
+                            "text": "",
+                            "sentiment": {
+                                "category": "Neutral",
+                                "original_emotion": "neutral",
+                                "confidence": 0.5,
+                                "emoji": "😐"
+                            },
+                            "errors": {
+                                "google": google_api_error,
+                                "vosk": str(vosk_error)
+                            }
+                        }
+                else:
+                    logger.error("No fallback available: Vosk is not installed or available")
+                    return {
+                        "text": "",
+                        "sentiment": {
+                            "category": "Neutral",
+                            "original_emotion": "neutral",
+                            "confidence": 0.5,
+                            "emoji": "😐"
+                        },
+                        "google_api_error": google_api_error
+                    }
+        elif VOSK_AVAILABLE:
+            # If Google Speech API is disabled but we're in auto mode, try Vosk
+            logger.info("Auto mode with Google disabled, using Vosk for transcription")
+            vosk_fallback_used = True
+            try:
+                start_time = time.time()
+                transcription = transcribe_with_vosk(concatenated_audio, RATE)
+                processing_time = time.time() - start_time
+                logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+            except Exception as e:
+                logger.error(f"Error with Vosk: {str(e)}")
+                return {
+                    "text": "",
+                    "sentiment": {
+                        "category": "Neutral",
+                        "original_emotion": "neutral",
+                        "confidence": 0.5,
+                        "emoji": "😐"
+                    },
+                    "error": str(e)
+                }
+        else:
+            # No speech recognition available
+            logger.error("No speech recognition system available")
+            return {
+                "text": "",
+                "sentiment": {
+                    "category": "Neutral",
+                    "original_emotion": "neutral",
+                    "confidence": 0.5,
+                    "emoji": "😐"
+                },
+                "error": "No speech recognition system available"
+            }
     
     # Check for valid transcription with sufficient content
     if not transcription:
         logger.info("No valid transcription found")
-        return None
+        return {
+            "text": "",
+            "sentiment": {
+                "category": "Neutral",
+                "original_emotion": "neutral",
+                "confidence": 0.5,
+                "emoji": "😐"
+            },
+            "transcription_engine": "vosk" if vosk_fallback_used else "google",
+            "google_api_error": google_api_error
+        }
     
     # Filter out short or meaningless transcriptions
     common_words = ["the", "a", "an", "and", "but", "or", "if", "then", "so", "to", "of", "for", "in", "on", "at"]
@@ -1173,7 +1365,17 @@ def process_speech_with_sentiment(audio_data):
     
     if len(meaningful_words) < MIN_WORD_COUNT:
         logger.info(f"Transcription has too few meaningful words: '{transcription}'")
-        return None
+        return {
+            "text": transcription,
+            "sentiment": {
+                "category": "Neutral",
+                "original_emotion": "neutral",
+                "confidence": 0.5,
+                "emoji": "😐"
+            },
+            "transcription_engine": "vosk" if vosk_fallback_used else "google",
+            "google_api_error": google_api_error
+        }
     
     logger.info(f"Valid transcription found: '{transcription}'")
     
@@ -1183,12 +1385,24 @@ def process_speech_with_sentiment(audio_data):
     if sentiment:
         result = {
             "text": transcription,
-            "sentiment": sentiment
+            "sentiment": sentiment,
+            "transcription_engine": "vosk" if vosk_fallback_used else "google",
+            "google_api_error": google_api_error
         }
-        logger.info(f"Sentiment analysis result: Speech {sentiment['category']} with emoji {sentiment['emoji']}")
+        logger.info(f"Sentiment analysis result: Speech {sentiment['category']} with emoji {sentiment['emoji']} (using {result['transcription_engine']})")
         return result
     
-    return None
+    return {
+        "text": transcription,
+        "sentiment": {
+            "category": "Neutral",
+            "original_emotion": "neutral",
+            "confidence": 0.5,
+            "emoji": "😐"
+        },
+        "transcription_engine": "vosk" if vosk_fallback_used else "google",
+        "google_api_error": google_api_error
+    }
 
 def background_thread():
     """Example of how to send server generated events to clients."""
@@ -1225,7 +1439,9 @@ def status():
         'tensorflow_model_loaded': models["tensorflow"] is not None,
         'ast_model_loaded': models["ast"] is not None,
         'using_ast_model': USE_AST_MODEL,
-        'speech_recognition': 'Google Cloud' if USE_GOOGLE_SPEECH_API else 'Disabled',
+        'speech_recognition': SPEECH_RECOGNITION_ENGINE,  # Updated to show current engine
+        'speech_google_available': USE_GOOGLE_SPEECH_API,
+        'speech_vosk_available': VOSK_AVAILABLE,
         'sentiment_analysis_enabled': True,
         'ip_addresses': ip_addresses,
         'uptime': time.time() - start_time,
@@ -1236,7 +1452,7 @@ def status():
 @app.route('/api/toggle-speech-recognition', methods=['POST'])
 def toggle_speech_recognition():
     """Toggle Google Cloud Speech-to-Text on or off"""
-    global USE_GOOGLE_SPEECH_API
+    global USE_GOOGLE_SPEECH_API, SPEECH_RECOGNITION_ENGINE
     data = request.get_json()
     
     if data and 'use_google_speech' in data:
@@ -1247,13 +1463,40 @@ def toggle_speech_recognition():
             "message": f"Speech recognition {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}",
             "use_google_speech": USE_GOOGLE_SPEECH_API
         })
+    elif data and 'speech_engine' in data:
+        # New option to set specific speech engine
+        engine = data['speech_engine']
+        if engine in [SPEECH_ENGINE_AUTO, SPEECH_ENGINE_GOOGLE, SPEECH_ENGINE_VOSK]:
+            SPEECH_RECOGNITION_ENGINE = engine
+            
+            # Update USE_GOOGLE_SPEECH_API flag for backward compatibility
+            USE_GOOGLE_SPEECH_API = (engine != SPEECH_ENGINE_VOSK)
+            
+            logger.info(f"Speech recognition engine set to: {SPEECH_RECOGNITION_ENGINE}")
+            return jsonify({
+                "success": True,
+                "message": f"Speech recognition engine set to: {SPEECH_RECOGNITION_ENGINE}",
+                "speech_engine": SPEECH_RECOGNITION_ENGINE,
+                "use_google_speech": USE_GOOGLE_SPEECH_API
+            })
+        else:
+            return jsonify({
+                "success": False,
+                "message": f"Invalid speech engine option: {engine}",
+                "valid_options": [SPEECH_ENGINE_AUTO, SPEECH_ENGINE_GOOGLE, SPEECH_ENGINE_VOSK]
+            }), 400
     else:
         # Toggle the current value if no specific value provided
         USE_GOOGLE_SPEECH_API = not USE_GOOGLE_SPEECH_API
-        logger.info(f"Speech recognition toggled to {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}")
+        
+        # Update the engine setting to match
+        SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_GOOGLE if USE_GOOGLE_SPEECH_API else SPEECH_ENGINE_VOSK
+        
+        logger.info(f"Speech recognition toggled to: {SPEECH_RECOGNITION_ENGINE}")
         return jsonify({
             "success": True,
-            "message": f"Speech recognition toggled to {'enabled' if USE_GOOGLE_SPEECH_API else 'disabled'}",
+            "message": f"Speech recognition toggled to: {SPEECH_RECOGNITION_ENGINE}",
+            "speech_engine": SPEECH_RECOGNITION_ENGINE,
             "use_google_speech": USE_GOOGLE_SPEECH_API
         })
 
@@ -1558,11 +1801,11 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Prepare notification data
         notification_data = {
-                'label': label,
+            'label': label,
             'accuracy': str(accuracy),
-                'db': str(db),
-                'time': str(time_data),
-                'record_time': str(record_time) if record_time else ''
+            'db': str(db),
+            'time': str(time_data),
+            'record_time': str(record_time) if record_time else ''
         }
         
         # Add sentiment data if available
@@ -1577,6 +1820,16 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
                 # Add emoji for visual representation
                 if 'emoji' in sentiment_data['sentiment']:
                     notification_data['emoji'] = sentiment_data['sentiment']['emoji']
+            
+            # Add speech recognition engine information
+            if 'transcription_engine' in sentiment_data:
+                notification_data['transcription_engine'] = sentiment_data['transcription_engine']
+                logger.info(f"Speech recognized using {sentiment_data['transcription_engine']} engine")
+            
+            # Include error information for debugging if available
+            if 'google_api_error' in sentiment_data and sentiment_data['google_api_error']:
+                notification_data['google_api_error'] = sentiment_data['google_api_error']
+                logger.debug(f"Google API error included in notification: {sentiment_data['google_api_error']}")
         
         # Emit the notification
         socketio.emit('audio_label', notification_data)
@@ -1589,6 +1842,8 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=int, default=8080, help='Port to run the server on (default: 8080)')
     parser.add_argument('--debug', action='store_true', help='Run in debug mode')
     parser.add_argument('--use-google-speech', action='store_true', default=True, help='Use Google Cloud Speech-to-Text (enabled by default)')
+    parser.add_argument('--speech-engine', type=str, choices=[SPEECH_ENGINE_AUTO, SPEECH_ENGINE_GOOGLE, SPEECH_ENGINE_VOSK], 
+                        default=SPEECH_ENGINE_AUTO, help='Speech recognition engine to use')
     args = parser.parse_args()
     
     # Enable debug mode if specified
@@ -1597,13 +1852,20 @@ if __name__ == '__main__':
         logger.setLevel(logging.DEBUG)
         logger.info("Debug mode enabled")
     
-    # Update speech recognition setting based on command line argument
-    if args.use_google_speech:
+    # Update speech recognition setting based on command line arguments
+    if args.speech_engine:
+        SPEECH_RECOGNITION_ENGINE = args.speech_engine
+        # Update USE_GOOGLE_SPEECH_API flag based on speech engine selection
+        USE_GOOGLE_SPEECH_API = (SPEECH_RECOGNITION_ENGINE != SPEECH_ENGINE_VOSK)
+        logger.info(f"Using speech recognition engine: {SPEECH_RECOGNITION_ENGINE}")
+    elif not args.use_google_speech:
+        # For backward compatibility with --use-google-speech flag
+        USE_GOOGLE_SPEECH_API = False
+        SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_VOSK
+        logger.info("Using Vosk for speech recognition (Google Speech API disabled)")
+    else:
         USE_GOOGLE_SPEECH_API = True
         logger.info("Using Google Cloud Speech-to-Text for speech recognition")
-    else:
-        USE_GOOGLE_SPEECH_API = False
-        logger.info("Speech recognition disabled")
     
     # Initialize and load all models
     logger.info("Setting up sound recognition models...")

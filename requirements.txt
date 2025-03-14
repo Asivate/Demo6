@@ -19,7 +19,7 @@ PyAudio==0.2.13
 # Deep learning frameworks
 tensorflow>=2.4.0
 torch>=1.9.0
-transformers>=4.8.2
+transformers==4.18.0
 torchaudio==0.13.0
 huggingface-hub==0.16.4
 
@@ -29,6 +29,7 @@ sentencepiece==0.1.99
 pyctcdecode==0.5.0
 openai-whisper==20240930
 emoji==2.8.0
+vosk==0.3.45
 
 # Utility packages
 wget==3.2
