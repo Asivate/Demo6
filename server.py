@@ -1273,7 +1273,7 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
         else:
             # Same top prediction, but confidence may have changed
             label = label_list[orig_top_idx] if orig_top_idx < len(label_list) else "unknown"
-            logger.info(f"Aggregation kept same top prediction: {label}, confidence: {new_prediction[orig_top_idx]:.4f} -> {aggregated[orig_top_idx]:.4f}")
+            logger.info(f"Aggregation kept same top prediction: {label}, confidence: {new_prediction[orig_top_idx]:.4f} -> {aggregated[agg_top_idx]:.4f}")
         
         return aggregated
 

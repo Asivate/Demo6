@@ -125,3 +125,51 @@ to_human_labels = {
     'female-conversation': "Female Speech",
     'conversation': "Conversation",
 }
+
+# Add dynamic threshold configuration
+SOUND_THRESHOLDS = {
+    'speech': 0.65,
+    'hazard-alarm': 0.4,
+    'door': 0.5,
+    'water-running': 0.55,
+    # Add other class-specific thresholds
+}
+
+CONTEXT_WEIGHTS = {
+    'kitchen': {'water-running': 1.5, 'hazard-alarm': 2.0},
+    'bedroom': {'baby-cry': 2.0, 'snore': 1.8},
+    # Add other context boosts
+}
+
+def process_predictions(predictions, context='general', db_level=70):
+    # Apply context-aware weighting
+    weighted_preds = apply_context_weights(predictions, context)
+    
+    # Dynamic threshold adjustment based on dB level
+    base_threshold = 0.5
+    db_adjustment = np.clip((db_level - 60) / 20, -0.2, 0.2)
+    dynamic_threshold = base_threshold + db_adjustment
+    
+    # Multi-label approach
+    valid_predictions = []
+    for label, prob in weighted_preds.items():
+        threshold = SOUND_THRESHOLDS.get(label, dynamic_threshold)
+        if prob >= threshold:
+            valid_predictions.append((label, prob))
+    
+    # Temporal smoothing (requires state management)
+    if not valid_predictions:
+        return handle_ambient_sounds(db_level)
+    
+    return sorted(valid_predictions, key=lambda x: x[1], reverse=True)
+
+# Update data preparation pipeline
+def create_optimized_dataset(dataset):
+    return dataset.cache().shuffle(10000).prefetch(tf.data.AUTOTUNE).batch(32)
+
+def apply_speech_correction(preds, db_level):
+    speech_prob = preds.get('speech', 0)
+    # Dynamic correction based on dB levels and presence of other sounds
+    correction = 0.3 * (1 - np.exp(-db_level/60))
+    corrected_prob = max(speech_prob - correction, 0)
+    return {**preds, 'speech': corrected_prob}

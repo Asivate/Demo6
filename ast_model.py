@@ -6,6 +6,7 @@ from transformers import AutoFeatureExtractor, AutoModelForAudioClassification
 import warnings
 import time
 import traceback
+from tensorflow.keras import layers, models
 
 # Suppress transformers warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -619,4 +620,26 @@ if __name__ == "__main__":
     
     print("\nMapped predictions for SoundWatch:")
     for pred in predictions["mapped_predictions"]:
-        print(f"  {pred['label']} (from {pred['original_label']}): {pred['confidence']:.6f}") 
+        print(f"  {pred['label']} (from {pred['original_label']}): {pred['confidence']:.6f}")
+
+# Update model architecture to match TensorFlow best practices
+def create_improved_model(input_shape, num_classes):
+    norm_layer = layers.Normalization()
+    model = models.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Resizing(32, 32),  # Downsample for efficiency
+        norm_layer,
+        layers.Conv2D(32, 3, activation='relu'),
+        layers.Conv2D(64, 3, activation='relu'),
+        layers.MaxPooling2D(),
+        layers.Dropout(0.25),
+        layers.Conv2D(128, 3, activation='relu'),  # Additional layer
+        layers.GlobalAveragePooling2D(),  # Better than Flatten for audio
+        layers.Dense(256, activation='relu', kernel_regularizer='l2'),  # Regularization
+        layers.Dropout(0.5),
+        layers.Dense(num_classes),
+    ])
+    
+    # Add proper normalization adaptation
+    norm_layer.adapt(data=train_spectrogram_ds.map(lambda spec, label: spec))
+    return model 
