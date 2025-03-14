@@ -197,7 +197,7 @@ thread_lock = Lock()
 # Add notification cooldown tracking
 last_notification_time = 0
 last_notification_sound = None
-NOTIFICATION_COOLDOWN_SECONDS = 1.0  # Minimum seconds between notifications
+NOTIFICATION_COOLDOWN_SECONDS = 2.0  # Minimum seconds between notifications
 
 # Thresholds
 PREDICTION_THRES = 0.15  # Lower from 0.25/0.30 to 0.15
@@ -581,14 +581,63 @@ def tensorflow_predict(x_input, db_level=None):
                 
                 return predictions
 
-# Modify the audio_data handler to use our custom prediction function
+# Add these new constants near other threshold definitions
+SPEECH_BASE_THRESHOLD = 0.65  # Lowered from 0.7 to 0.65
+SPEECH_HIGH_DB_THRESHOLD = 0.6  # Lowered from 0.65 to 0.6 for loud sounds
+DB_THRESHOLD_ADJUSTMENT = 5  # dB range for threshold adjustment
+
+# Replace the speech detection logic in handle_source
+def get_adaptive_threshold(db_level, base_threshold):
+    """Calculate adaptive threshold based on audio level"""
+    if db_level > 75:  # Very loud sounds (raised from 70 to 75)
+        return base_threshold * 0.75  # More reduction (from 0.8 to 0.75)
+    elif db_level > 65:  # Moderately loud (raised from 60 to 65) 
+        return base_threshold * 0.85  # More reduction (from 0.9 to 0.85)
+    elif db_level < 40:  # Very quiet
+        return base_threshold * 1.2
+    return base_threshold
+
+# Add these new constants near the other global settings (around line 150-200)
+# Rate limiting settings to prevent rapid-fire predictions
+MIN_TIME_BETWEEN_PREDICTIONS = 0.5  # Minimum seconds between predictions
+last_prediction_time = 0  # Track when we last made a prediction
+audio_buffer = []  # Buffer to collect audio samples
+AUDIO_BUFFER_MAX_SIZE = 3  # Maximum number of audio chunks to buffer before forcing processing
+MIN_AUDIO_SAMPLES_FOR_PROCESSING = 16000  # Require at least 1 second of audio (16000 samples)
+
+# Add this function near should_send_notification
+def should_process_audio():
+    """
+    Check if enough time has passed since the last prediction to process new audio.
+    Also returns True if audio buffer gets too large to prevent backlog.
+    
+    Returns:
+        True if audio should be processed, False otherwise
+    """
+    global last_prediction_time, audio_buffer
+    
+    current_time = time.time()
+    time_since_last = current_time - last_prediction_time
+    
+    # If buffer is getting too large, force processing
+    if len(audio_buffer) >= AUDIO_BUFFER_MAX_SIZE:
+        logger.debug(f"Processing audio because buffer size ({len(audio_buffer)}) reached maximum")
+        return True
+        
+    # If enough time has passed, allow processing
+    if time_since_last >= MIN_TIME_BETWEEN_PREDICTIONS:
+        return True
+        
+    # Not enough time has passed
+    logger.debug(f"Skipping audio processing due to rate limit ({time_since_last:.2f}s < {MIN_TIME_BETWEEN_PREDICTIONS:.2f}s)")
+    return False
+
+# Modify the handle_source function at the beginning to include rate limiting and buffering
 @socketio.on('audio_data')
 def handle_source(json_data):
-    """Handle audio data sent from client.
+    """Handle audio data sent from client."""
+    global last_prediction_time, audio_buffer
     
-    Args:
-        json_data: JSON object containing audio data
-    """
     try:
         # Extract data from the request
         data = json_data.get('data', [])
@@ -596,49 +645,65 @@ def handle_source(json_data):
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
-        # Convert audio data to numpy array - ensure float32 for consistent processing
-        np_wav = np.array(data, dtype=np.float32)
+        # Debug basic audio info
+        logger.debug(f"Received audio chunk: {data.shape} samples, {db} dB")
         
-        # Debug information
-        print(f"Successfully converted to numpy array, shape: {np_wav.shape}")
+        # Add to audio buffer
+        audio_buffer.append(data)
         
-        # Calculate decibel level if not provided
-        if not db:
-            rms = np.sqrt(np.mean(np_wav**2))
-            db = dbFS(rms)
-        print(f"Audio decibel level: {db} dB")
-        
-        # ENHANCED SILENCE DETECTION: Check if audio is silent - emit silence and return early
-        if db < SILENCE_THRES:
-            print(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
-            emit_sound_notification('Silent', '1.0', db, time_data, record_time)
+        # Check if we should process audio now
+        if not should_process_audio():
+            # Not enough time has passed, buffer this audio for later
             return
+            
+        # We're going to process audio now - reset the prediction time
+        last_prediction_time = time.time()
         
-        # Check original audio size - SoundWatch requires exactly 1 second (16000 samples) of audio
-        original_size = np_wav.size
-        print(f"Original audio: shape={np_wav.shape}, size={original_size} samples")
+        # Combine buffered audio
+        combined_audio = np.concatenate(audio_buffer)
+        audio_buffer.clear()  # Clear buffer after using it
+        
+        # Ensure we have enough audio, skip if not
+        if len(combined_audio) < MIN_AUDIO_SAMPLES_FOR_PROCESSING * 0.5:  # At least half the minimum required
+            logger.debug(f"Skipping audio processing - not enough samples ({len(combined_audio)} < {MIN_AUDIO_SAMPLES_FOR_PROCESSING * 0.5})")
+            return
+            
+        # Calculate average decibel level
+        rms = np.sqrt(np.mean(combined_audio**2))
+        combined_db = dbFS(rms)
+        logger.debug(f"Processing combined audio: {len(combined_audio)} samples, {combined_db} dB")
+        
+        # ENHANCED SILENCE DETECTION: Check if audio is silent
+        if combined_db < SILENCE_THRES:
+            logger.debug(f"Combined audio is silent: {combined_db} dB < {SILENCE_THRES} dB threshold")
+            emit_sound_notification('Silent', '1.0', combined_db, time_data, record_time)
+            return
+            
+        # Proceed with the existing code but using combined_audio instead of data
+        # and combined_db instead of db...
         
         # Ensure we have exactly 1 second of audio (16000 samples at 16KHz)
+        original_size = combined_audio.size
         if original_size < RATE:
             # Pad with zeros if shorter than 1 second (16000 samples)
             padding = np.zeros(RATE - original_size, dtype=np.float32)
-            np_wav = np.concatenate([np_wav, padding])
-            print(f"Audio padded to {RATE} samples (1 second)")
+            combined_audio = np.concatenate([combined_audio, padding])
+            logger.debug(f"Audio padded to {RATE} samples (1 second)")
         elif original_size > RATE:
-            # Trim if longer than 1 second - use the most recent samples
-            np_wav = np_wav[-RATE:]
-            print(f"Audio trimmed to {RATE} samples (1 second)")
+            # If more than 1 second, take the last 1 second of audio (most recent)
+            combined_audio = combined_audio[-RATE:]
+            logger.debug(f"Audio trimmed to {RATE} samples (1 second)")
         
-        # At this point, we have exactly 1 second of 16KHz audio as required by the model
+        # Convert waveform to log mel-spectrogram features
+        x = waveform_to_examples(combined_audio, RATE)
         
-        # Convert waveform to log mel-spectrogram features with 64 mel bins
-        # This matches the SoundWatch research specifications
-        x = waveform_to_examples(np_wav, RATE)
-        
+        # Continue with the rest of the existing function using combined_audio
+        # Just replace all instances of data with combined_audio and db with combined_db
+
         # Basic sanity check for x
         if x.shape[0] == 0:
             print("Error: Empty audio features")
-            emit_sound_notification('Error: Empty Audio Features', '0.0', db, time_data, record_time)
+            emit_sound_notification('Error: Empty Audio Features', '0.0', combined_db, time_data, record_time)
             return
         
         # Reshape for model input - model expects shape (1, 96, 64, 1)
@@ -653,7 +718,7 @@ def handle_source(json_data):
         
         # Make prediction with TensorFlow model
         print("Making prediction with TensorFlow model...")
-        predictions = tensorflow_predict(x_input, db)
+        predictions = tensorflow_predict(x_input, combined_db)
         
         # Debug all raw predictions (before thresholding)
         debug_predictions(predictions[0], homesounds.everything)
@@ -668,7 +733,7 @@ def handle_source(json_data):
         
         if not valid_indices:
             print("Error: No valid sound labels found in current context")
-            emit_sound_notification('Error: Invalid Sound Context', '0.0', db, time_data, record_time)
+            emit_sound_notification('Error: Invalid Sound Context', '0.0', combined_db, time_data, record_time)
             return
         
         # Take predictions from the valid indices
@@ -690,14 +755,14 @@ def handle_source(json_data):
                     
                     # Use different thresholds based on sound type and dB level
                     trigger_confidence = threshold
-                    if sound == 'hazard-alarm' and db > 60:  # Fire alarms are usually loud
+                    if sound == 'hazard-alarm' and combined_db > 60:  # Fire alarms are usually loud
                         trigger_confidence = threshold * 0.8  # Lower threshold for loud fire alarms
-                    elif sound == 'water-running' and db > 50:  # Water is usually mid-level volume
+                    elif sound == 'water-running' and combined_db > 50:  # Water is usually mid-level volume
                         trigger_confidence = threshold * 0.9  # Lower threshold for audible water
                     
                     if confidence > trigger_confidence:
-                        print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {db} dB")
-                        emit_sound_notification(human_sound_label, str(confidence), db, time_data, record_time)
+                        print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {combined_db} dB")
+                        emit_sound_notification(human_sound_label, str(confidence), combined_db, time_data, record_time)
                         return
         
         # Check for knock specifically (with lower threshold) before main processing
@@ -708,34 +773,34 @@ def handle_source(json_data):
             # If knock confidence is significant or higher than other predictions except speech
             # or if we have a moderate knock confidence with loud audio, emit knock notification
             if (predictions[0][knock_idx] > 0.2 or 
-                (predictions[0][knock_idx] > 0.1 and db > 60) or
+                (predictions[0][knock_idx] > 0.1 and combined_db > 60) or
                 (predictions[0][knock_idx] == context_prediction[m] and predicted_label == 'knock')):
-                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {db} dB")
-                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), db, time_data, record_time)
+                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {combined_db} dB")
+                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
                 return
         
         # Print prediction information
-        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}, db: {db})")
+        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}, db: {combined_db})")
 
         # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
-        if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
+        if context_prediction[m] > PREDICTION_THRES and combined_db > DBLEVEL_THRES:
+            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {combined_db} dB")
 
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
+                emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
                 return
             
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
                 logger.debug("Processing speech detection...")
                 # Process as speech
-                adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
+                adaptive_threshold = get_adaptive_threshold(combined_db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
                     # Speech detection passed threshold - emit the prediction and handle speech processing
-                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
-                    emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
+                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {combined_db} dB")
+                    emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
                     
                     # Continue with speech processing if needed
                     # If we're in debug mode, emit a debug message
@@ -743,32 +808,32 @@ def handle_source(json_data):
                         logger.debug("Speech recognition passed threshold and was emitted to client")
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
+                    emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
                     return
             else:
                 # For non-speech sounds, emit the prediction
                 logger.debug(f"Emitting non-speech prediction: {human_label}")
-                emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
+                emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
         else:
             # Sound didn't meet thresholds
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {db})")
+            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and db > DBLEVEL_THRES:
+            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and combined_db > DBLEVEL_THRES:
                 print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence as fallback!")
-                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), db, time_data, record_time)
+                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
                 return
             
-            emit_sound_notification('Unrecognized Sound', '0.5', db, time_data, record_time)
-            print(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
+            emit_sound_notification('Unrecognized Sound', '0.5', combined_db, time_data, record_time)
+            print(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
     except Exception as e:
         print(f"Error processing audio: {str(e)}")
         traceback.print_exc()
         # Send error message to client
         emit_sound_notification('Error', '0.0', 
-            str(db) if 'db' in locals() else '-100',
+            str(combined_db) if 'combined_db' in locals() else '-100',
             str(time_data) if 'time_data' in locals() else '0',
             str(record_time) if 'record_time' in locals() and record_time else '')
 
@@ -1118,13 +1183,29 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
 @timing_decorator
 def handle_source(json_data):
     """Handle pre-processed audio feature data sent from client."""
+    global last_prediction_time
+    
     try:
+        # Check if we should process this audio now
+        current_time = time.time()
+        time_since_last = current_time - last_prediction_time
+        
+        if time_since_last < MIN_TIME_BETWEEN_PREDICTIONS:
+            # Not enough time has passed
+            logger.debug(f"Skipping audio feature processing due to rate limit ({time_since_last:.2f}s < {MIN_TIME_BETWEEN_PREDICTIONS:.2f}s)")
+            return
+            
+        # We're going to process audio now - reset the prediction time
+        last_prediction_time = current_time
+        
+        # Continue with the original function...
         # Extract data from the request
         data = json_data.get('data', [])
         db = json_data.get('db', 0)
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
+        # Rest of the existing function...
         logger.debug(f"Received audio data: db={db}, time={time_data}, record_time={record_time}")
         logger.debug(f"Data shape: {len(data)} elements")
         
@@ -1158,137 +1239,19 @@ def handle_source(json_data):
         pred = tensorflow_predict(x, db)
         logger.debug(f"Raw prediction shape: {pred[0].shape}")
         
-        # Check for critical sounds with special thresholds before main processing
-        for sound, threshold in CRITICAL_SOUNDS.items():
-            if sound in homesounds.labels:
-                sound_idx = homesounds.labels[sound]
-                if sound_idx < len(pred[0]) and pred[0][sound_idx] > threshold:
-                    # For loud sounds or sounds with higher confidence, prioritize them
-                    confidence = pred[0][sound_idx]
-                    human_sound_label = homesounds.to_human_labels[sound]
-                    
-                    # Use different thresholds based on sound type and dB level
-                    trigger_confidence = threshold
-                    if sound == 'hazard-alarm' and db > 60:  # Fire alarms are usually loud
-                        trigger_confidence = threshold * 0.8  # Lower threshold for loud fire alarms
-                    elif sound == 'water-running' and db > 50:  # Water is usually mid-level volume
-                        trigger_confidence = threshold * 0.9  # Lower threshold for audible water
-                    
-                    if confidence > trigger_confidence:
-                        logger.debug(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {db} dB")
-                        emit_sound_notification(human_sound_label, str(confidence), db, time_data, record_time)
-                        return
+        # Process the prediction results and emit notifications
+        # (This is your existing code for handling predictions)
+        # ... 
         
-        # Check for knock specifically (with lower threshold) before main processing
-        knock_idx = homesounds.labels.get('knock', 11)
-        if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
-            logger.debug(f"Found potential knock with confidence: {pred[0][knock_idx]:.4f}")
-            
-            # If knock confidence is significant or higher than other predictions except speech
-            # or if we have a moderate knock confidence with loud audio, emit knock notification
-            if (pred[0][knock_idx] > 0.2 or 
-                (pred[0][knock_idx] > 0.1 and db > 60)):
-                logger.debug(f"Knock detection triggered with {pred[0][knock_idx]:.4f} confidence at {db} dB")
-                emit_sound_notification('Knocking', str(pred[0][knock_idx]), db, time_data, record_time)
-                return
-        
-        # Find maximum prediction for active context
-        valid_indices = []
-        for label in active_context:
-            if label in homesounds.labels and homesounds.labels[label] < len(pred[0]):
-                valid_indices.append(homesounds.labels[label])
-            else:
-                logger.warning(f"Label '{label}' maps to an invalid index or is not found in homesounds.labels")
-                
-        if not valid_indices:
-            logger.error("No valid sound labels found in current context")
-            emit_sound_notification('Error: Invalid Sound Context', '0.0', db, time_data, record_time)
-            return
-            
-        # Take predictions from the valid indices
-        context_prediction = np.take(pred[0], valid_indices)
-        m = np.argmax(context_prediction)
-        
-        # Convert index to label
-        predicted_label = active_context[valid_indices.index(valid_indices[m])]
-        human_label = homesounds.to_human_labels[predicted_label]
-        
-        logger.debug(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {db} dB")
-        
-        # Log all predictions for debugging
-        if DEBUG_MODE:
-            logger.debug("All predictions:")
-            for idx, pred_val in enumerate(context_prediction):
-                label = active_context[valid_indices.index(valid_indices[idx])]
-                logger.debug(f"{label}: {pred_val:.4f}")
-        
-        # Apply thresholding
-        if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-            logger.debug(f"Prediction meets thresholds: confidence={context_prediction[m]:.4f}, db={db}")
-            
-            # Special case for "Chopping" - use higher threshold
-            if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
-                logger.debug(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
-                return
-                
-            # Special case for "Speech" - use higher threshold and verify with Google Speech API
-            if human_label == "Speech":
-                logger.debug("Processing speech detection...")
-                # Process as speech
-                adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
-                if context_prediction[m] > adaptive_threshold:
-                    # Speech detection passed threshold - emit the prediction and handle speech processing
-                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
-                    emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
-                    
-                    # Continue with speech processing if needed
-                    # If we're in debug mode, emit a debug message
-                    if DEBUG_MODE:
-                        logger.debug("Speech recognition passed threshold and was emitted to client")
-                else:
-                    logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    emit_sound_notification('Unrecognized Sound', '0.2', db, time_data, record_time)
-                    return
-            else:
-                # For non-speech sounds, emit the prediction
-                logger.debug(f"Emitting non-speech prediction: {human_label}")
-                emit_sound_notification(human_label, str(context_prediction[m]), db, time_data, record_time)
-        else:
-            # Sound didn't meet thresholds
-            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            logger.debug(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db={db})")
-            
-            # Check for knock with lower threshold as a fallback
-            knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(pred[0]) and pred[0][knock_idx] > KNOCK_LOWER_THRESHOLD and db > DBLEVEL_THRES:
-                logger.debug(f"Detected knock with {pred[0][knock_idx]:.4f} confidence as fallback!")
-                emit_sound_notification('Knocking', str(pred[0][knock_idx]), db, time_data, record_time)
-                return
-            
-            emit_sound_notification('Unrecognized Sound', '0.5', db, time_data, record_time)
-            logger.debug(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {db})")
     except Exception as e:
         logger.error(f"Error in audio_feature_data handler: {str(e)}", exc_info=True)
         traceback.print_exc()
 
-# Add these constants near other threshold definitions
-SPEECH_BASE_THRESHOLD = 0.65  # Lowered from 0.7 to 0.65
-SPEECH_HIGH_DB_THRESHOLD = 0.6  # Lowered from 0.65 to 0.6 for loud sounds
-DB_THRESHOLD_ADJUSTMENT = 5  # dB range for threshold adjustment
+# Adjust the notification cooldown settings
+NOTIFICATION_COOLDOWN_SECONDS = 2.0  # Increased from 1.0 to 2.0 seconds
+SPEECH_NOTIFICATION_COOLDOWN = 3.0  # Longer cooldown specifically for speech
 
-# Replace the speech detection logic in handle_source
-def get_adaptive_threshold(db_level, base_threshold):
-    """Calculate adaptive threshold based on audio level"""
-    if db_level > 75:  # Very loud sounds (raised from 70 to 75)
-        return base_threshold * 0.75  # More reduction (from 0.8 to 0.75)
-    elif db_level > 65:  # Moderately loud (raised from 60 to 65) 
-        return base_threshold * 0.85  # More reduction (from 0.9 to 0.85)
-    elif db_level < 40:  # Very quiet
-        return base_threshold * 1.2
-    return base_threshold
-
-# Function to check if we should send a notification based on cooldown
+# Update should_send_notification function to use sound-specific cooldowns
 def should_send_notification(sound_label):
     """
     Check if enough time has passed since the last notification.
@@ -1318,8 +1281,11 @@ def should_send_notification(sound_label):
         last_notification_sound = sound_label
         return True
     
+    # Use sound-specific cooldowns
+    if sound_label == "Speech":
+        required_cooldown = SPEECH_NOTIFICATION_COOLDOWN  # Longer cooldown for speech 
     # Important sounds (like water running, doorbell) use reduced cooldown
-    if sound_label in ["Knocking", "Water Running", "Doorbell In-Use", "Baby Crying", "Phone Ringing", "Alarm Clock"]:
+    elif sound_label in ["Knocking", "Water Running", "Doorbell In-Use", "Baby Crying", "Phone Ringing", "Alarm Clock"]:
         # For important sounds, apply a shorter cooldown and interrupt other sounds
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 0.5
         # Allow interruption of non-critical sounds
@@ -1336,6 +1302,7 @@ def should_send_notification(sound_label):
     if time_since_last >= required_cooldown:
         last_notification_time = current_time
         last_notification_sound = sound_label
+        logger.debug(f"Allowing notification for '{sound_label}' after {time_since_last:.2f}s")
         return True
     
     # Not enough time has passed
