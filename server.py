@@ -222,13 +222,13 @@ KNOCK_LOWER_THRESHOLD = 0.05  # Lower threshold for knock detection
 
 # Define critical sounds that get priority treatment
 CRITICAL_SOUNDS = {
-    'hazard-alarm': 0.05,   # Fire alarm - extremely critical with very low threshold
-    'knock': 0.05,          # Knock - already implemented
-    'doorbell': 0.07,       # Doorbell - important for awareness
-    'baby-cry': 0.1,        # Baby crying - important for caregivers
-    'water-running': 0.1,   # Water running - requested by user
-    'phone-ring': 0.1,      # Phone ringing - important communication
-    'alarm-clock': 0.1      # Alarm clock - important for time management
+    'hazard-alarm': 0.15,   # Fire alarm - still sensitive but less false positives
+    'knock': 0.20,          # Knock - increased substantially to reduce false detections
+    'doorbell': 0.20,       # Doorbell - increased to reduce false detections
+    'baby-cry': 0.25,       # Baby crying - increased threshold 
+    'water-running': 0.25,  # Water running - increased threshold
+    'phone-ring': 0.25,     # Phone ringing - increased threshold
+    'alarm-clock': 0.25     # Alarm clock - increased threshold
 }
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
