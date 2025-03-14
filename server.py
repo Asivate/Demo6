@@ -69,20 +69,11 @@ def timing_decorator(func):
 import ast_model
 
 # Global flags for speech recognition - defined BEFORE they're referenced
-USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API if available
-USE_GOOGLE_SPEECH = False  # Set to True to use Google Cloud Speech-to-Text instead of Whisper
+USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API (default)
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
-from speech_to_text import transcribe_audio, SpeechToText
-
-# Conditionally import Google speech module
-if USE_GOOGLE_SPEECH_API:
-    try:
-        from google_speech import transcribe_with_google, GoogleSpeechToText
-    except ImportError:
-        print("Google Cloud Speech module not available. Using Whisper instead.")
-        USE_GOOGLE_SPEECH_API = False
+from google_speech import transcribe_with_google, GoogleSpeechToText
 
 # Memory optimization settings
 MEMORY_OPTIMIZATION_LEVEL = os.environ.get('MEMORY_OPTIMIZATION', '1')  # 0=None, 1=Moderate, 2=Aggressive
@@ -308,7 +299,6 @@ models = {
 }
 
 # Initialize speech recognition systems
-speech_processor = SpeechToText()
 google_speech_processor = None  # Will be lazy-loaded when needed
 
 # Load models
@@ -321,8 +311,7 @@ def load_models():
         "tensorflow": None,
         "ast": None,
         "feature_extractor": None,
-        "sentiment_analyzer": None,
-        "speech_processor": None
+        "sentiment_analyzer": None
     }
     
     # Flag to determine which model to use
@@ -441,16 +430,27 @@ def load_models():
 
     print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
 
-    # Load the Whisper speech recognition model if needed
+    # Load the sentiment analysis model
     try:
-        if not USE_GOOGLE_SPEECH:
-            print("Loading Whisper model for speech recognition...")
-            speech_processor = SpeechToText()
-            print("Whisper model loaded successfully")
-            models["speech_processor"] = speech_processor
+        print("Loading sentiment analysis model...")
+        # Use the _get_sentiment_model function from sentiment_analyzer
+        from sentiment_analyzer import _get_sentiment_model
+        _get_sentiment_model()  # This loads the model if not already loaded
+        print("Sentiment analysis model loaded successfully")
     except Exception as e:
-        print(f"Error loading Whisper model: {e}")
+        print(f"Error loading sentiment analysis model: {e}")
         traceback.print_exc()
+        
+    # Initialize Google Speech API if specified
+    if USE_GOOGLE_SPEECH_API:
+        try:
+            from google_speech import GoogleSpeechToText
+            print("Initializing Google Cloud Speech-to-Text...")
+            # We don't need to fully initialize it now, just make sure the module is available
+            print("Google Cloud Speech-to-Text will be used for speech recognition")
+        except ImportError:
+            print("Google Cloud Speech module not available.")
+            USE_GOOGLE_SPEECH_API = False
 
 # Add a comprehensive debug function
 def debug_predictions(predictions, label_list):
@@ -803,9 +803,32 @@ def handle_source(json_data):
                 if context_prediction[m] > adaptive_threshold:
                     # Speech detection passed threshold - emit the prediction and handle speech processing
                     logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {combined_db} dB")
-                    emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
                     
-                    # Continue with speech processing if needed
+                    # Process the speech for sentiment analysis
+                    try:
+                        # Use the same audio data that was used for detection
+                        sentiment_result = process_speech_with_sentiment(combined_audio)
+                        
+                        if sentiment_result and 'sentiment' in sentiment_result:
+                            logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
+                            
+                            # Emit notification with sentiment data
+                            emit_sound_notification(
+                                human_label, 
+                                str(context_prediction[m]), 
+                                combined_db, 
+                                time_data, 
+                                record_time,
+                                sentiment_result
+                            )
+                        else:
+                            # If sentiment processing failed, just emit regular notification
+                            logger.debug("Speech sentiment processing failed or returned no results")
+                            emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
+                    except Exception as e:
+                        logger.error(f"Error processing speech sentiment: {str(e)}", exc_info=True)
+                        emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
+                    
                     # If we're in debug mode, emit a debug message
                     if DEBUG_MODE:
                         logger.debug("Speech recognition passed threshold and was emitted to client")
@@ -943,19 +966,18 @@ def process_speech_with_sentiment(audio_data):
     logger.info("Transcribing speech to text...")
     
     # Transcribe audio using the selected speech-to-text processor
-    if USE_GOOGLE_SPEECH and USE_GOOGLE_SPEECH_API:
-        # Use Google Cloud Speech-to-Text if available
+    if USE_GOOGLE_SPEECH_API:
+        # Use Google Cloud Speech-to-Text
         try:
             transcription = transcribe_with_google(concatenated_audio, RATE)
             logger.info(f"Google transcription result: '{transcription}'")
         except Exception as e:
-            logger.error(f"Error with Google Speech API: {str(e)}. Falling back to Whisper.")
-            transcription = speech_processor.transcribe(concatenated_audio, RATE)
-            logger.info(f"Whisper transcription result: '{transcription}'")
+            logger.error(f"Error with Google Speech API: {str(e)}.")
+            return None
     else:
-        # Use Whisper (default)
-        transcription = speech_processor.transcribe(concatenated_audio, RATE)
-        logger.info(f"Whisper transcription result: '{transcription}'")
+        # No speech recognition available
+        logger.error("No speech recognition system available")
+        return None
     
     # Check for valid transcription with sufficient content
     if not transcription:
@@ -1313,7 +1335,7 @@ def should_send_notification(sound_label):
     return False
 
 # Function to emit sound notifications with cooldown management
-def emit_sound_notification(label, accuracy, db, time_data="", record_time=""):
+def emit_sound_notification(label, accuracy, db, time_data="", record_time="", sentiment_data=None):
     """
     Emit sound notification with cooldown management.
     
@@ -1323,16 +1345,35 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time=""):
         db: Decibel level
         time_data: Time data from client
         record_time: Record time from client
+        sentiment_data: Optional sentiment analysis data
     """
     if should_send_notification(label):
         logger.debug(f"Emitting notification: {label} ({accuracy})")
-        socketio.emit('audio_label', {
+        
+        # Prepare notification data
+        notification_data = {
             'label': label,
             'accuracy': str(accuracy),
             'db': str(db),
             'time': str(time_data),
             'record_time': str(record_time) if record_time else ''
-        })
+        }
+        
+        # Add sentiment data if available
+        if sentiment_data and isinstance(sentiment_data, dict):
+            # Include transcription and sentiment information
+            if 'text' in sentiment_data:
+                notification_data['transcription'] = sentiment_data['text']
+            
+            if 'sentiment' in sentiment_data:
+                notification_data['sentiment'] = sentiment_data['sentiment']
+                
+                # Add emoji for visual representation
+                if 'emoji' in sentiment_data['sentiment']:
+                    notification_data['emoji'] = sentiment_data['sentiment']['emoji']
+        
+        # Emit the notification
+        socketio.emit('audio_label', notification_data)
     else:
         logger.debug(f"Notification for '{label}' suppressed due to cooldown")
 
@@ -1341,7 +1382,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Sonarity Audio Analysis Server')
     parser.add_argument('--port', type=int, default=8080, help='Port to run the server on (default: 8080)')
     parser.add_argument('--debug', action='store_true', help='Run in debug mode')
-    parser.add_argument('--use-google-speech', action='store_true', help='Use Google Cloud Speech-to-Text instead of Whisper')
+    parser.add_argument('--use-google-speech', action='store_true', default=True, help='Use Google Cloud Speech-to-Text (enabled by default)')
     args = parser.parse_args()
     
     # Enable debug mode if specified
@@ -1352,11 +1393,11 @@ if __name__ == '__main__':
     
     # Update speech recognition setting based on command line argument
     if args.use_google_speech:
-        USE_GOOGLE_SPEECH = True
+        USE_GOOGLE_SPEECH_API = True
         logger.info("Using Google Cloud Speech-to-Text for speech recognition")
     else:
-        USE_GOOGLE_SPEECH = False
-        logger.info("Using Whisper for speech recognition")
+        USE_GOOGLE_SPEECH_API = False
+        logger.info("Speech recognition disabled")
     
     # Initialize and load all models
     logger.info("Setting up sound recognition models...")
