@@ -73,7 +73,7 @@ USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API (defa
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
-from google_speech import transcribe_with_google, GoogleSpeechToText
+        from google_speech import transcribe_with_google, GoogleSpeechToText
 
 # Memory optimization settings
 MEMORY_OPTIMIZATION_LEVEL = os.environ.get('MEMORY_OPTIMIZATION', '1')  # 0=None, 1=Moderate, 2=Aggressive
@@ -707,7 +707,7 @@ def handle_source(json_data):
         
         # Continue with the rest of the existing function using combined_audio
         # Just replace all instances of data with combined_audio and db with combined_db
-
+        
         # Basic sanity check for x
         if x.shape[0] == 0:
             print("Error: Empty audio features")
@@ -748,7 +748,7 @@ def handle_source(json_data):
         context_prediction = np.take(predictions[0], valid_indices)
         m = np.argmax(context_prediction)
         
-        # Get the corresponding label from the valid indices
+            # Get the corresponding label from the valid indices
         predicted_label = active_context[valid_indices.index(valid_indices[m])]
         human_label = homesounds.to_human_labels[predicted_label]
         
@@ -793,13 +793,13 @@ def handle_source(json_data):
         # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
         if context_prediction[m] > PREDICTION_THRES and combined_db > DBLEVEL_THRES:
             print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {combined_db} dB")
-
+            
             # Special case for "Chopping" - use higher threshold to prevent false positives
             if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
                 print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
                 emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
                 return
-            
+                
             # Special case for "Speech" - use higher threshold and verify with Google Speech API
             if human_label == "Speech":
                 logger.debug("Processing speech detection...")
@@ -813,8 +813,8 @@ def handle_source(json_data):
                     try:
                         # Use the same audio data that was used for detection
                         sentiment_result = process_speech_with_sentiment(combined_audio)
-                        
-                        if sentiment_result and 'sentiment' in sentiment_result:
+                    
+                    if sentiment_result and 'sentiment' in sentiment_result:
                             logger.debug(f"Speech sentiment processed: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
                             
                             # Emit notification with sentiment data
@@ -1330,7 +1330,7 @@ def should_send_notification(sound_label):
     # If we're sending the same sound again, require longer cooldown
     elif sound_label == last_notification_sound:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
-    else:
+            else:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS
     
     # If enough time has passed, allow the notification
@@ -1362,11 +1362,11 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Prepare notification data
         notification_data = {
-            'label': label,
+                'label': label,
             'accuracy': str(accuracy),
-            'db': str(db),
-            'time': str(time_data),
-            'record_time': str(record_time) if record_time else ''
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
         }
         
         # Add sentiment data if available
@@ -1384,7 +1384,7 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Emit the notification
         socketio.emit('audio_label', notification_data)
-    else:
+        else:
         logger.debug(f"Notification for '{label}' suppressed due to cooldown")
 
 if __name__ == '__main__':
