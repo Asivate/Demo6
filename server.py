@@ -201,9 +201,9 @@ DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
 SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
 SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
-SPEECH_PREDICTION_THRES = 0.7  # Lowered from 0.85 to 0.7 for better speech detection
-SPEECH_DETECTION_THRES = 0.6  # Secondary threshold for speech detection
-SPEECH_BIAS_CORRECTION = 0.3
+SPEECH_PREDICTION_THRES = 0.65  # Lowered from 0.7 to 0.65 for better speech detection
+SPEECH_DETECTION_THRES = 0.55  # Lowered from 0.6 to 0.55 for secondary speech detection
+SPEECH_BIAS_CORRECTION = 0.25  # Reduced from 0.3 to 0.25 to avoid excessive correction
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -506,14 +506,24 @@ def tensorflow_predict(x_input, db_level=None):
                                 # Check if speech confidence is unusually high for potentially silent audio
                                 is_silent = db_level is not None and db_level < DBLEVEL_THRES
                                 
-                                # Apply stronger correction for silent/near-silent audio
-                                correction = SPEECH_BIAS_CORRECTION * 1.5 if is_silent else SPEECH_BIAS_CORRECTION
-                                
                                 # Get original speech confidence
                                 original_confidence = predictions[i][speech_idx]
                                 
-                                # Only apply correction if speech is very high confidence
-                                # This prevents over-correction for genuine speech
+                                # Smarter bias correction based on db level and confidence
+                                # 1. High db (>70dB) with high confidence (>0.8) = likely real speech = less correction
+                                # 2. Low db with high confidence = likely false positive = more correction
+                                # 3. Medium case = standard correction
+                                if db_level is not None and db_level > 70 and original_confidence > 0.8:
+                                    # Very loud, high confidence speech - apply minimal correction
+                                    correction = SPEECH_BIAS_CORRECTION * 0.5  # 50% of normal correction
+                                elif is_silent:
+                                    # Silent/near-silent but high speech confidence = false positive
+                                    correction = SPEECH_BIAS_CORRECTION * 1.5
+                                else:
+                                    # Standard case
+                                    correction = SPEECH_BIAS_CORRECTION
+                                
+                                # Only apply correction if speech is high confidence
                                 if original_confidence > 0.6:
                                     # Apply correction factor to reduce speech confidence
                                     predictions[i][speech_idx] -= correction
@@ -672,8 +682,20 @@ def handle_source(json_data):
                 # Process as speech
                 adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
-                    # Placeholder for existing speech processing code
-                    pass
+                    # Speech detection passed threshold - emit the prediction and handle speech processing
+                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
+                    socketio.emit('audio_label', {
+                        'label': human_label,
+                        'accuracy': str(context_prediction[m]),
+                        'db': str(db),
+                        'time': str(time_data),
+                        'record_time': str(record_time) if record_time else ''
+                    })
+                    
+                    # Continue with speech processing if needed
+                    # If we're in debug mode, emit a debug message
+                    if DEBUG_MODE:
+                        logger.debug("Speech recognition passed threshold and was emitted to client")
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
                     socketio.emit('audio_label', {
@@ -1178,8 +1200,20 @@ def handle_source(json_data):
                 # Process as speech
                 adaptive_threshold = get_adaptive_threshold(db, SPEECH_BASE_THRESHOLD)
                 if context_prediction[m] > adaptive_threshold:
-                    # Placeholder for existing speech processing code
-                    pass
+                    # Speech detection passed threshold - emit the prediction and handle speech processing
+                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {db} dB")
+                    socketio.emit('audio_label', {
+                        'label': human_label,
+                        'accuracy': str(context_prediction[m]),
+                        'db': str(db),
+                        'time': str(time_data),
+                        'record_time': str(record_time) if record_time else ''
+                    })
+                    
+                    # Continue with speech processing if needed
+                    # If we're in debug mode, emit a debug message
+                    if DEBUG_MODE:
+                        logger.debug("Speech recognition passed threshold and was emitted to client")
                 else:
                     logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
                     socketio.emit('audio_label', {
@@ -1229,17 +1263,17 @@ def handle_source(json_data):
         traceback.print_exc()
 
 # Add these constants near other threshold definitions
-SPEECH_BASE_THRESHOLD = 0.7  # Lower from 0.85
-SPEECH_HIGH_DB_THRESHOLD = 0.65  # Even lower threshold for loud sounds
+SPEECH_BASE_THRESHOLD = 0.65  # Lowered from 0.7 to 0.65
+SPEECH_HIGH_DB_THRESHOLD = 0.6  # Lowered from 0.65 to 0.6 for loud sounds
 DB_THRESHOLD_ADJUSTMENT = 5  # dB range for threshold adjustment
 
 # Replace the speech detection logic in handle_source
 def get_adaptive_threshold(db_level, base_threshold):
     """Calculate adaptive threshold based on audio level"""
-    if db_level > 70:  # Very loud sounds
-        return base_threshold * 0.8
-    elif db_level > 60:  # Moderately loud
-        return base_threshold * 0.9
+    if db_level > 75:  # Very loud sounds (raised from 70 to 75)
+        return base_threshold * 0.75  # More reduction (from 0.8 to 0.75)
+    elif db_level > 65:  # Moderately loud (raised from 60 to 65) 
+        return base_threshold * 0.85  # More reduction (from 0.9 to 0.85)
     elif db_level < 40:  # Very quiet
         return base_threshold * 1.2
     return base_threshold

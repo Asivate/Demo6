@@ -103,7 +103,7 @@ Write-Host "Starting the SoundWatch server..."
 try {
     # Set environment variables for the server
     $env:APPLY_SPEECH_BIAS_CORRECTION = "True"  # Enable speech bias correction
-    $env:SPEECH_BIAS_CORRECTION = "0.3"  # Set speech bias correction amount
+    $env:SPEECH_BIAS_CORRECTION = "0.25"  # Reduced from 0.3 to 0.25 to match server.py
     
     # Start the server
     python server.py --port 8080

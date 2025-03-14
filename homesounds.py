@@ -224,6 +224,7 @@ def create_optimized_dataset(dataset):
 def apply_speech_correction(preds, db_level):
     speech_prob = preds.get('speech', 0)
     # Dynamic correction based on dB levels and presence of other sounds
-    correction = 0.3 * (1 - np.exp(-db_level/60))
+    # Reduced correction factor from 0.3 to 0.25
+    correction = 0.25 * (1 - np.exp(-db_level/60))
     corrected_prob = max(speech_prob - correction, 0)
     return {**preds, 'speech': corrected_prob}
