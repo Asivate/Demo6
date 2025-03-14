@@ -645,11 +645,14 @@ def handle_source(json_data):
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
-        # Debug basic audio info
-        logger.debug(f"Received audio chunk: {data.shape} samples, {db} dB")
+        # Debug basic audio info - fix the shape attribute error by using len() instead
+        logger.debug(f"Received audio chunk: {len(data)} samples, {db} dB")
+        
+        # Convert list to numpy array before adding to buffer
+        np_data = np.array(data, dtype=np.float32)
         
         # Add to audio buffer
-        audio_buffer.append(data)
+        audio_buffer.append(np_data)
         
         # Check if we should process audio now
         if not should_process_audio():
@@ -1205,7 +1208,7 @@ def handle_source(json_data):
         time_data = json_data.get('time', 0)
         record_time = json_data.get('record_time', None)
         
-        # Rest of the existing function...
+        # Debug info - use len instead of shape for lists
         logger.debug(f"Received audio data: db={db}, time={time_data}, record_time={record_time}")
         logger.debug(f"Data shape: {len(data)} elements")
         
