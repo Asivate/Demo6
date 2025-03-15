@@ -101,11 +101,11 @@ class GoogleSpeechToText:
                 # Try to find credentials in these locations
                 possible_locations = [
                     # Check server directory first
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "asivate-452914-5c12101797af.json"),
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "asivate-452914-9778a9b91269.json"),
                     # Check home directory on Linux
-                    "/home/hirwa0250/asivate-452914-5c12101797af.json",
+                    "/home/hirwa0250/asivate-452914-9778a9b91269.json",
                     # Check parent directory of server (for Sonarity-server structure)
-                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "asivate-452914-5c12101797af.json")
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "asivate-452914-9778a9b91269.json")
                 ]
                 
                 # Find the first existing file
