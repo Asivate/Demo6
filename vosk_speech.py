@@ -33,8 +33,8 @@ VOSK_MODEL_URLS = {
     "en-us-small": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
     # Medium model: ~100MB, balanced performance
     "en-us-medium": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
-    # Large model: ~1.5GB, slower but more accurate, better for complex audio
-    "en-us-large": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42.zip"
+    # Large model: ~1.6GB, slower but more accurate, better for complex audio
+    "en-us-large": "https://alphacephei.com/vosk/models/vosk-model-en-us-0.21.zip"
 }
 
 # Define model download lock to prevent multiple simultaneous downloads
@@ -133,7 +133,7 @@ class VoskSpeechToText:
             os.makedirs(model_dir, exist_ok=True)
             
             # Define model path - using large model for better accuracy
-            model_name = "vosk-model-large-en-us-0.42"
+            model_name = "vosk-model-en-us-0.21"
             model_path = os.path.join(model_dir, model_name)
             
             # Check if model exists, if not download it
@@ -212,7 +212,7 @@ class VoskSpeechToText:
             while retry_count < self._max_retries:
                 try:
                     logger.info(f"Loading Vosk large model from {model_path}...")
-                    logger.info(f"Note: This may take a while as the large model is approximately 1.5GB in size")
+                    logger.info(f"Note: This may take a while as the large model is approximately 1.6GB in size")
                     self.model = Model(model_path)
                     logger.info("Vosk large model loaded successfully - this should provide better transcription accuracy")
                     break
@@ -232,7 +232,7 @@ class VoskSpeechToText:
             
             # Mark as initialized
             VoskSpeechToText._is_initialized = True
-            logger.info("Vosk speech recognition initialized successfully with large model")
+            logger.info("Vosk speech recognition initialized successfully with large model (0.21)")
             logger.info("Note: Large model provides better accuracy but requires more memory and processing time")
             
         except Exception as e:
