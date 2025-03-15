@@ -133,29 +133,43 @@ class GoogleSpeechToText:
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=16000,
                 language_code="en-US",
-                model="command_and_search",  # Better for short phrases than "video"
+                model="phone_call",  # Changed from "command_and_search" to "phone_call" for better handling of noisy audio
                 use_enhanced=True,
                 profanity_filter=False,
                 enable_automatic_punctuation=True,
                 # Increase alternatives to get better results
-                max_alternatives=3,
-                # Enable speech adaptation to improve recognition of specific contexts
+                max_alternatives=5,  # Increased from 3 to 5 to get more alternatives
+                # Enhanced speech adaptation with much broader context
                 speech_contexts=[speech.SpeechContext(
                     phrases=[
+                        # Common conversational phrases
                         "okay", "not okay", "I am not okay", "I'm not okay", 
                         "I am", "help", "emergency", "alert",
                         "I am tired", "so tired", "feeling tired", "I'm tired",
                         "I am so tired", "I'm so tired", "I am very tired",
                         "happy", "sad", "angry", "confused", "scared", "tired", "sleepy",
                         "good", "bad", "fine", "great", "terrible", "awful",
-                        "I feel", "I'm feeling", "I am feeling"
+                        "I feel", "I'm feeling", "I am feeling",
+                        # Additional common phrases for better recognition
+                        "hello", "hi", "hey", "yes", "no", "please", "thank you",
+                        "what", "where", "when", "who", "why", "how",
+                        "can you", "I need", "I want", "I would like",
+                        "help me", "listen", "understand", "hear", "talk", "speak",
+                        "morning", "afternoon", "evening", "night", "today", "tomorrow",
+                        "the", "a", "an", "is", "are", "was", "were", "be", "been"
                     ],
-                    boost=25.0  # Increased boost for better detection
+                    boost=20.0  # Adjusted for optimal recognition
                 )],
                 # Enable word-level confidence
                 enable_word_confidence=True,
                 # Enable word time offsets for timing
-                enable_word_time_offsets=True
+                enable_word_time_offsets=True,
+                # Enable speaker diarization for better speech detection
+                diarization_config=speech.SpeakerDiarizationConfig(
+                    enable_speaker_diarization=True,
+                    min_speaker_count=1,
+                    max_speaker_count=1,
+                ),
             )
             
             # Create a streaming config as well
@@ -191,19 +205,52 @@ class GoogleSpeechToText:
         
         # Calculate RMS value to check audio level
         rms = np.sqrt(np.mean(processed_audio**2))
+        logger.info(f"Original audio RMS: {rms:.6f}")
         
-        # Boost low volume audio for better recognition
+        # Enhance speech with spectral subtraction for noise reduction
+        try:
+            # Apply a pre-emphasis filter to boost high frequencies
+            # This helps with speech clarity as human speech has more information in higher frequencies
+            pre_emphasis = 0.97
+            emphasized_audio = np.append(processed_audio[0], processed_audio[1:] - pre_emphasis * processed_audio[:-1])
+            
+            # Apply a gentle high-pass filter (40Hz instead of 80Hz) to reduce only very low frequency noise
+            # This preserves more of the speech content
+            try:
+                b, a = signal.butter(2, 40/(sample_rate/2), 'highpass')  # Lower order (2 instead of 4) and lower cutoff (40Hz)
+                filtered_audio = signal.filtfilt(b, a, emphasized_audio)
+                logger.info("Applied gentle high-pass filter (40Hz) for noise reduction")
+                processed_audio = filtered_audio
+            except Exception as e:
+                logger.warning(f"Error applying high-pass filter: {str(e)}")
+                processed_audio = emphasized_audio
+                
+            # Apply a low-pass filter to remove high-frequency noise above speech range
+            try:
+                b, a = signal.butter(3, 8000/(sample_rate/2), 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
+                filtered_audio = signal.filtfilt(b, a, processed_audio)
+                logger.info("Applied low-pass filter (8000Hz) to focus on speech frequencies")
+                processed_audio = filtered_audio
+            except Exception as e:
+                logger.warning(f"Error applying low-pass filter: {str(e)}")
+        except Exception as e:
+            logger.warning(f"Error in spectral processing: {str(e)}")
+        
+        # Boost low volume audio for better recognition with a more aggressive approach
         if rms < 0.05:  # If audio is very quiet
             # Calculate boost factor (more boost for quieter audio)
-            boost_factor = min(0.1 / rms if rms > 0 else 10, 5)  # Cap at 5x boost (reduced from 10x)
+            boost_factor = min(0.15 / rms if rms > 0 else 15, 8)  # Cap at 8x boost (increased from 5x)
             processed_audio = processed_audio * boost_factor
             logger.info(f"Boosted quiet audio by factor of {boost_factor:.2f}")
         
-        # Skip filtering for faster processing
-        # Normalize audio to 16-bit range for LINEAR16 encoding
+        # Apply normalization to ensure consistent volume
         max_val = np.max(np.abs(processed_audio))
         if max_val > 0:
-            processed_audio = processed_audio / max_val * 32767
+            processed_audio = processed_audio / max_val * 0.9 * 32767  # Scale to 90% of max to prevent clipping
+        
+        # Calculate new RMS after processing
+        new_rms = np.sqrt(np.mean(np.square(processed_audio)))
+        logger.info(f"Processed audio RMS: {new_rms:.6f} (gain: {new_rms/rms:.2f}x)")
         
         # Convert to int16 for Google Speech API
         return processed_audio.astype(np.int16)
@@ -239,25 +286,37 @@ class GoogleSpeechToText:
                     encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
                     sample_rate_hertz=sample_rate,
                     language_code="en-US",
-                    model="command_and_search",  # Better for short phrases than "video"
+                    model="phone_call",  # Changed from "command_and_search" to "phone_call" for better handling of noisy audio
                     use_enhanced=True,
                     profanity_filter=False,
                     enable_automatic_punctuation=True,
-                    max_alternatives=3,
+                    max_alternatives=5,  # Increased from 3 to 5
                     speech_contexts=[speech.SpeechContext(
                         phrases=[
+                            # Common conversational phrases
                             "okay", "not okay", "I am not okay", "I'm not okay", 
                             "I am", "help", "emergency", "alert",
                             "I am tired", "so tired", "feeling tired", "I'm tired",
                             "I am so tired", "I'm so tired", "I am very tired",
                             "happy", "sad", "angry", "confused", "scared", "tired", "sleepy",
                             "good", "bad", "fine", "great", "terrible", "awful",
-                            "I feel", "I'm feeling", "I am feeling"
+                            "I feel", "I'm feeling", "I am feeling",
+                            # Additional common phrases for better recognition
+                            "hello", "hi", "hey", "yes", "no", "please", "thank you",
+                            "what", "where", "when", "who", "why", "how",
+                            "can you", "I need", "I want", "I would like",
+                            "help me", "listen", "understand", "hear", "talk", "speak"
                         ],
-                        boost=25.0  # Increased boost for better detection
+                        boost=20.0  # Adjusted for optimal recognition
                     )],
                     enable_word_confidence=True,
-                    enable_word_time_offsets=True
+                    enable_word_time_offsets=True,
+                    # Enable speaker diarization for better speech detection
+                    diarization_config=speech.SpeakerDiarizationConfig(
+                        enable_speaker_diarization=True,
+                        min_speaker_count=1,
+                        max_speaker_count=1,
+                    ),
                 )
             
             # Detect speech using Google Cloud Speech-to-Text
@@ -290,7 +349,7 @@ def transcribe_with_google(audio_data, sample_rate=16000, **options):
         sample_rate: Sample rate of the audio data
         **options: Additional options to pass to the RecognitionConfig
             - language_code: Language code (default: "en-US")
-            - model: Model to use (default: "command_and_search")
+            - model: Model to use (default: "phone_call")
             - use_enhanced: Whether to use enhanced model (default: True)
             - enable_automatic_punctuation: Whether to enable automatic punctuation (default: True)
             - audio_channel_count: Number of audio channels (default: 1)
@@ -334,7 +393,7 @@ def transcribe_with_google(audio_data, sample_rate=16000, **options):
         
         # Extract options with defaults
         language_code = options.get("language_code", "en-US")
-        model = options.get("model", "command_and_search")  # command_and_search is better for short phrases
+        model = options.get("model", "phone_call")  # Changed from "command_and_search" to "phone_call"
         use_enhanced = options.get("use_enhanced", True)
         enable_automatic_punctuation = options.get("enable_automatic_punctuation", True)
         audio_channel_count = options.get("audio_channel_count", 1)
@@ -349,7 +408,7 @@ def transcribe_with_google(audio_data, sample_rate=16000, **options):
             enable_automatic_punctuation=enable_automatic_punctuation,
             use_enhanced=use_enhanced,
             audio_channel_count=audio_channel_count,
-            # Add speech contexts to improve recognition of specific phrases
+            # Enhanced speech adaptation with broader context
             speech_contexts=[
                 speech.SpeechContext(
                     phrases=["fire alarm", "doorbell", "phone", "baby", "crying", "water", "running", 
@@ -362,10 +421,26 @@ def transcribe_with_google(audio_data, sample_rate=16000, **options):
                              "hello", "hi", "hey", "okay", "yes", "no", "please", "thank you",
                              "I need help", "help me", "emergency", "call", "message", "text",
                              "I don't feel well", "I'm not feeling well", "I feel sick", "I'm sick",
-                             "I'm fine", "I am okay", "I'm okay", "I need assistance"],
-                    boost=15.0  # Increased boost for better detection
+                             "I'm fine", "I am okay", "I'm okay", "I need assistance",
+                             # Additional common words and phrases
+                             "what", "where", "when", "who", "why", "how",
+                             "can you", "I need", "I want", "I would like", 
+                             "listen", "understand", "hear", "talk", "speak",
+                             "morning", "afternoon", "evening", "night", "today", "tomorrow",
+                             "the", "a", "an", "is", "are", "was", "were", "be", "been"],
+                    boost=20.0  # Increased boost for better detection
                 )
-            ]
+            ],
+            # Improved configuration for better transcription
+            enable_word_confidence=True,
+            enable_word_time_offsets=True,
+            # Lower the threshold for acceptable confidence
+            enable_separate_recognition_per_channel=False,
+            diarization_config=speech.SpeakerDiarizationConfig(
+                enable_speaker_diarization=True,
+                min_speaker_count=1,
+                max_speaker_count=1,
+            ),
         )
         
         # Log the request configuration
@@ -398,11 +473,11 @@ def transcribe_with_google(audio_data, sample_rate=16000, **options):
             transcript, confidence = all_results[0]
             
         # If confidence is very low, be cautious about returning results
-        if confidence < 0.3 and transcript:
+        if confidence < 0.2 and transcript:
             logger.warning(f"Low confidence transcription ({confidence:.2f}): '{transcript}'")
             
             # For very low confidence, don't return potentially incorrect transcriptions
-            if confidence < 0.15:
+            if confidence < 0.08:
                 logger.info("Confidence too low, discarding transcription")
                 return ""
         

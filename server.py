@@ -1141,9 +1141,18 @@ def process_speech_with_sentiment(audio_data):
     # Apply high-pass filter to reduce background noise
     try:
         # Create a high-pass filter to reduce background noise
-        b, a = signal.butter(4, 80/(RATE/2), 'highpass')  # 80Hz high-pass filter
+        b, a = signal.butter(2, 40/(RATE/2), 'highpass')  # Changed from 4th order 80Hz to 2nd order 40Hz filter
         filtered_audio = signal.filtfilt(b, a, concatenated_audio)
-        logger.info("Applied high-pass filter for noise reduction")
+        logger.info("Applied gentle high-pass filter (40Hz) for noise reduction")
+        
+        # Apply a low-pass filter to reduce high-frequency noise above speech range
+        try:
+            b, a = signal.butter(3, 8000/(RATE/2), 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
+            filtered_audio = signal.filtfilt(b, a, filtered_audio)
+            logger.info("Applied low-pass filter to focus on speech frequencies")
+        except Exception as e:
+            logger.warning(f"Error applying low-pass filter: {str(e)}")
+            
         concatenated_audio = filtered_audio
     except Exception as e:
         logger.warning(f"Error applying high-pass filter: {str(e)}")
