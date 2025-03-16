@@ -227,7 +227,10 @@ class GoogleSpeechToText:
                 
             # Apply a low-pass filter to remove high-frequency noise above speech range
             try:
-                b, a = signal.butter(3, 8000/(sample_rate/2), 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
+                # Ensure normalized frequency is correct (must be between 0 and 1)
+                # 8000Hz at 16000Hz sample rate = 0.5
+                normalized_freq = min(8000 / (sample_rate/2), 0.99)
+                b, a = signal.butter(3, normalized_freq, 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
                 filtered_audio = signal.filtfilt(b, a, processed_audio)
                 logger.info("Applied low-pass filter (8000Hz) to focus on speech frequencies")
                 processed_audio = filtered_audio
