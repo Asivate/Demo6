@@ -12,7 +12,7 @@ import threading
 import logging
 import numpy as np
 try:
-from google.cloud import speech
+    from google.cloud import speech
     GOOGLE_SPEECH_AVAILABLE = True
 except ImportError:
     GOOGLE_SPEECH_AVAILABLE = False
