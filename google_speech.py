@@ -128,6 +128,25 @@ class GoogleSpeechToText:
             self.client = speech.SpeechClient()
             logger.info("Google Cloud Speech-to-Text client initialized successfully")
             
+            # Verify credentials with a minimal test request to check authentication
+            try:
+                logger.info("Verifying Google Cloud credentials with test request...")
+                # Create a minimal audio content (silence) for testing
+                test_audio = speech.RecognitionAudio(content=b"\0" * 1600)  # 0.1 seconds of silence
+                test_config = speech.RecognitionConfig(
+                    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                    sample_rate_hertz=16000,
+                    language_code="en-US",
+                )
+                # Make a minimal request to verify API access
+                self.client.recognize(config=test_config, audio=test_audio)
+                logger.info("✅ Google Cloud credentials verified successfully")
+            except Exception as e:
+                logger.error(f"❌ Google Cloud credentials verification failed: {str(e)}")
+                logger.error("This will cause transcription to fail - please check your credentials")
+                # We don't raise an exception here to allow the system to continue running,
+                # but transcription will likely fail later
+            
             # Create recognition config
             self.config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -139,26 +158,18 @@ class GoogleSpeechToText:
                 enable_automatic_punctuation=True,
                 # Increase alternatives to get better results
                 max_alternatives=5,  # Increased from 3 to 5 to get more alternatives
-                # Enhanced speech adaptation with much broader context
+                # Enhanced speech adaptation with a more focused context
                 speech_contexts=[speech.SpeechContext(
                     phrases=[
-                        # Common conversational phrases
-                        "okay", "not okay", "I am not okay", "I'm not okay", 
-                        "I am", "help", "emergency", "alert",
-                        "I am tired", "so tired", "feeling tired", "I'm tired",
-                        "I am so tired", "I'm so tired", "I am very tired",
-                        "happy", "sad", "angry", "confused", "scared", "tired", "sleepy",
-                        "good", "bad", "fine", "great", "terrible", "awful",
-                        "I feel", "I'm feeling", "I am feeling",
-                        # Additional common phrases for better recognition
-                        "hello", "hi", "hey", "yes", "no", "please", "thank you",
-                        "what", "where", "when", "who", "why", "how",
-                        "can you", "I need", "I want", "I would like",
-                        "help me", "listen", "understand", "hear", "talk", "speak",
-                        "morning", "afternoon", "evening", "night", "today", "tomorrow",
-                        "the", "a", "an", "is", "are", "was", "were", "be", "been"
+                        # Common conversational phrases - minimal set to avoid biasing too much
+                        "okay", "help", "emergency", "alert",
+                        "tired", "happy", "sad", "angry", "confused", "scared",
+                        "good", "bad", "fine", "not okay", "I need help",
+                        # Important function words that help with sentence structure
+                        "I am", "I'm", "the", "a", "an", "is", "are", "was", "were",
+                        "what", "where", "when", "who", "why", "how"
                     ],
-                    boost=20.0  # Adjusted for optimal recognition
+                    boost=5.0  # Reduced from 20.0 to 5.0 to minimize hallucinations
                 )],
                 # Enable word-level confidence
                 enable_word_confidence=True,
@@ -340,157 +351,82 @@ class GoogleSpeechToText:
             return ""
 
 # Function for use in the main server code
-def transcribe_with_google(audio_data, sample_rate=16000, **options):
+def transcribe_with_google(audio_data, sample_rate=16000):
     """
     Transcribe audio using Google Cloud Speech-to-Text API.
     
     Args:
         audio_data: Audio data as numpy array
-        sample_rate: Sample rate of the audio data
-        **options: Additional options to pass to the RecognitionConfig
-            - language_code: Language code (default: "en-US")
-            - model: Model to use (default: "phone_call")
-            - use_enhanced: Whether to use enhanced model (default: True)
-            - enable_automatic_punctuation: Whether to enable automatic punctuation (default: True)
-            - audio_channel_count: Number of audio channels (default: 1)
+        sample_rate: Sample rate of the audio
         
     Returns:
-        Transcribed text
+        Transcription text or empty string if transcription failed
     """
-    if not GOOGLE_SPEECH_AVAILABLE:
-        logger.error("Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
-        return ""
-    
     try:
-        # Log audio properties for debugging
-        duration = len(audio_data) / sample_rate
-        logger.info(f"Transcribing {duration:.2f} seconds of audio (samples: {len(audio_data)})")
+        # Initialize the Google Speech client
+        client = GoogleSpeechToText.get_client()
+        if not client:
+            return "", {"error": "Failed to initialize Google Speech client. Check credentials."}
         
-        # Calculate audio energy to detect silence
-        rms = np.sqrt(np.mean(audio_data**2))
-        if rms < 0.001:  # Very quiet audio
-            logger.info(f"Audio is nearly silent (RMS: {rms:.6f}), skipping transcription")
-            return ""
-            
-        # Boost quiet audio if needed
-        if rms < 0.05:
-            boost_factor = min(0.1 / max(rms, 0.001), 10.0)
-            audio_data = audio_data * boost_factor
-            logger.info(f"Boosted quiet audio by factor of {boost_factor:.2f}")
+        # Convert audio to the correct format for Google Speech API
+        audio_bytes = audio_data.tobytes()
         
-        # Ensure audio is in the correct format (16-bit PCM)
-        audio_data = (audio_data * 32767).astype(np.int16)
+        # Create RecognitionAudio object
+        audio = speech.RecognitionAudio(content=audio_bytes)
         
-        # Create a BytesIO object to hold the audio data
-        byte_io = io.BytesIO()
-        
-        # Write the audio data to the BytesIO object
-        byte_io.write(audio_data.tobytes())
-        byte_io.seek(0)
-        
-        # Create a speech client
-        client = speech.SpeechClient()
-        
-        # Extract options with defaults
-        language_code = options.get("language_code", "en-US")
-        model = options.get("model", "phone_call")  # Changed from "command_and_search" to "phone_call"
-        use_enhanced = options.get("use_enhanced", True)
-        enable_automatic_punctuation = options.get("enable_automatic_punctuation", True)
-        audio_channel_count = options.get("audio_channel_count", 1)
-        
-        # Configure the audio settings
-        audio = speech.RecognitionAudio(content=byte_io.read())
+        # Create RecognitionConfig with enhanced settings
         config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
-            language_code=language_code,
-            model=model,
-            enable_automatic_punctuation=enable_automatic_punctuation,
-            use_enhanced=use_enhanced,
-            audio_channel_count=audio_channel_count,
-            # Enhanced speech adaptation with broader context
+            language_code="en-US",
+            model="phone_call",  # Changed from "command_and_search" to better handle noisy audio
+            max_alternatives=5,  # Increased from 3 to get more alternatives
+            enable_automatic_punctuation=True,
+            use_enhanced=True,  # Use enhanced model for better accuracy
             speech_contexts=[
                 speech.SpeechContext(
-                    phrases=["fire alarm", "doorbell", "phone", "baby", "crying", "water", "running", 
-                             "dog", "barking", "cat", "meowing", "door", "knocking", "microwave", 
-                             "vacuum", "drill", "alarm", "clock", "cough", "snore", "typing", 
-                             "blender", "dishwasher", "flush", "toilet", "hair dryer", "shaver", 
-                             "toothbrush", "cooking", "chopping", "cutting", "hammer", "saw", 
-                             "car horn", "engine", "hazard", "finger snap", "hand clap", "applause",
-                             # Common speech phrases for improved accuracy
-                             "hello", "hi", "hey", "okay", "yes", "no", "please", "thank you",
-                             "I need help", "help me", "emergency", "call", "message", "text",
-                             "I don't feel well", "I'm not feeling well", "I feel sick", "I'm sick",
-                             "I'm fine", "I am okay", "I'm okay", "I need assistance",
-                             # Additional common words and phrases
-                             "what", "where", "when", "who", "why", "how",
-                             "can you", "I need", "I want", "I would like", 
-                             "listen", "understand", "hear", "talk", "speak",
-                             "morning", "afternoon", "evening", "night", "today", "tomorrow",
-                             "the", "a", "an", "is", "are", "was", "were", "be", "been"],
-                    boost=20.0  # Increased boost for better detection
+                    phrases=[
+                        # Minimal set of common conversational phrases
+                        "okay", "help", "emergency", "tired", "happy", "sad", "angry",
+                        "scared", "surprised", "sick", "pain", "hurt", "bathroom", "water",
+                        "food", "hungry", "thirsty", "cold", "hot", "yes", "no", "maybe",
+                        "please", "thank you", "sorry", "excuse me", "hello", "goodbye",
+                        "morning", "afternoon", "evening", "night", "today", "tomorrow",
+                        "yesterday", "now", "later", "soon", "never", "always", "sometimes",
+                        "often", "rarely", "here", "there", "this", "that", "these", "those",
+                        "what", "when", "where", "why", "who", "how", "which", "whose",
+                        "can", "could", "would", "should", "will", "shall", "may", "might",
+                        "must", "need", "want", "like", "love", "hate", "feel", "think",
+                        "know", "understand", "remember", "forget", "see", "hear", "smell",
+                        "taste", "touch", "go", "come", "stay", "leave", "arrive", "depart"
+                    ],
+                    boost=5.0  # Reduced from 20.0 to minimize hallucinations
                 )
-            ],
-            # Improved configuration for better transcription
-            enable_word_confidence=True,
-            enable_word_time_offsets=True,
-            # Lower the threshold for acceptable confidence
-            enable_separate_recognition_per_channel=False,
-            diarization_config=speech.SpeakerDiarizationConfig(
-                enable_speaker_diarization=True,
-                min_speaker_count=1,
-                max_speaker_count=1,
-            ),
+            ]
         )
         
-        # Log the request configuration
-        logger.info(f"Speech recognition request: {duration:.2f}s audio, model={model}, enhanced={use_enhanced}")
-        
-        # Detect speech in the audio
-        logger.info("Sending audio to Google Cloud Speech-to-Text API...")
+        # Perform the transcription
         response = client.recognize(config=config, audio=audio)
         
         # Process the response
-        transcript = ""
-        confidence = 0.0
+        if not response.results:
+            return "", {"error": "No transcription results returned"}
         
-        # Extract all results and their confidence scores
-        all_results = []
-        for result in response.results:
-            if result.alternatives:
-                alt = result.alternatives[0]
-                all_results.append((alt.transcript, alt.confidence if hasattr(alt, 'confidence') else 0.0))
-                
-        # Sort by confidence
-        all_results.sort(key=lambda x: x[1], reverse=True)
+        # Get the most likely transcription
+        transcription = response.results[0].alternatives[0].transcript
         
-        # Log all detected alternatives for debugging
-        for idx, (text, conf) in enumerate(all_results):
-            logger.info(f"Alternative {idx+1}: '{text}' (confidence: {conf:.2f})")
-            
-        # Use the highest confidence result
-        if all_results:
-            transcript, confidence = all_results[0]
-            
-        # If confidence is very low, be cautious about returning results
-        if confidence < 0.2 and transcript:
-            logger.warning(f"Low confidence transcription ({confidence:.2f}): '{transcript}'")
-            
-            # For very low confidence, don't return potentially incorrect transcriptions
-            if confidence < 0.08:
-                logger.info("Confidence too low, discarding transcription")
-                return ""
+        # Return the transcription
+        return transcription, None
         
-        # Filter out hallucinations
-        transcript = filter_hallucinations(transcript)
-        
-        logger.info(f"Final transcription: '{transcript}' (confidence: {confidence:.2f})")
-        return transcript
-    
     except Exception as e:
-        logger.error(f"Error in Google Speech transcription: {str(e)}")
-        traceback.print_exc()
-        return ""
+        import traceback
+        error_details = traceback.format_exc()
+        error_message = f"Google Speech API error: {str(e)}"
+        print(error_message)
+        print(error_details)
+        
+        # Return empty string and error details
+        return "", {"error": error_message, "details": error_details}
 
 class GoogleSpeechToText:
     """

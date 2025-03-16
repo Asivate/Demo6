@@ -633,6 +633,26 @@ def handle_source(json_data):
         # Convert list to numpy array before adding to buffer
         np_data = np.array(data, dtype=np.float32)
         
+        # Validate and normalize audio input
+        if len(np_data) == 0:
+            logger.warning("Received empty audio chunk, skipping")
+            return
+            
+        # Check if audio is multi-channel (stereo) and convert to mono if needed
+        if np_data.ndim > 1:
+            logger.debug(f"Converting {np_data.shape[1]}-channel audio to mono")
+            np_data = np.mean(np_data, axis=1)  # Convert to mono by averaging channels
+            
+        # Validate audio values are in expected range for float32 (-1.0 to 1.0)
+        max_abs_val = np.max(np.abs(np_data))
+        if max_abs_val > 1.0:
+            logger.warning(f"Audio values out of expected range [-1.0, 1.0], max value: {max_abs_val}. Normalizing.")
+            np_data = np_data / max_abs_val  # Normalize to [-1.0, 1.0]
+            
+        # Record detailed audio properties for debugging
+        rms = np.sqrt(np.mean(np.square(np_data)))
+        logger.debug(f"Audio properties: samples={len(np_data)}, RMS={rms:.6f}, sample_rate={RATE} Hz")
+        
         # Add to audio buffer
         audio_buffer.append(np_data)
         
@@ -857,7 +877,7 @@ def is_likely_real_speech(audio_data, sample_rate=16000):
     
     # Calculate basic audio metrics
     rms = np.sqrt(np.mean(np.square(audio_data)))
-    if rms < 0.005:  # Very quiet audio is unlikely to be speech
+    if rms < 0.003:  # Lowered from 0.005 to detect quieter speech
         logger.debug(f"Audio too quiet for speech (RMS: {rms:.6f})")
         return False, 0.0, {"reason": "too_quiet", "rms": float(rms)}
     
@@ -916,7 +936,7 @@ def is_likely_real_speech(audio_data, sample_rate=16000):
         
         # Calculate comprehensive speech confidence score (0-1)
         zcr_factor = min(1.0, max(0.0, 1.0 - abs(zcr - 0.1) / 0.1))
-        stn_factor = min(1.0, speech_to_noise / 2.0)
+        stn_factor = min(1.0, speech_to_noise / 1.8)  # Less strict SNR requirement (was 2.0)
         var_factor = min(1.0, energy_variance / 0.01)
         harmonic_factor = min(1.0, harmonic_ratio / 2.0)
         flux_factor = min(1.0, spectral_flux / 0.5) 
@@ -931,14 +951,14 @@ def is_likely_real_speech(audio_data, sample_rate=16000):
         logger.debug(f"Speech detection features: ZCR={zcr_factor:.2f}, STN={stn_factor:.2f}, " 
                     f"VAR={var_factor:.2f}, HARM={harmonic_factor:.2f}, FLUX={flux_factor:.2f}")
         
-        # Decision thresholds based on audio level
+        # Decision thresholds based on audio level - lowered thresholds
         if rms > 0.05:  # Loud audio
-            confidence_threshold = 0.45  # Lower threshold for loud audio
+            confidence_threshold = 0.40  # Lowered from 0.45
         else:
-            confidence_threshold = 0.55  # Higher threshold for quiet audio
+            confidence_threshold = 0.45  # Lowered from 0.55
         
-        # Make final decision
-        is_speech = speech_confidence > confidence_threshold and rms > 0.008
+        # Make final decision - lowered minimum RMS from 0.008 to 0.004
+        is_speech = speech_confidence > confidence_threshold and rms > 0.004
         
         # Include decision factors in features
         features["speech_confidence"] = float(speech_confidence)
@@ -954,232 +974,71 @@ def is_likely_real_speech(audio_data, sample_rate=16000):
 
 # Modify the process_speech_with_sentiment function
 def process_speech_with_sentiment(audio_data):
-    """Process speech audio, transcribe it and analyze sentiment."""
-    # Settings for improved speech processing
-    SPEECH_MAX_BUFFER_SIZE = 16  # Increased from 8 to 16 for much longer buffer
-    MIN_WORD_COUNT = 2   # Reduced from 3 to 2 for better sensitivity
-    MIN_CONFIDENCE = 0.7  # Minimum confidence level for speech detection
+    """Process speech audio to get transcription and sentiment analysis."""
+    global recent_audio_buffer
     
-    # Initialize or update audio buffer
-    if not hasattr(process_speech_with_sentiment, "recent_audio_buffer"):
-        process_speech_with_sentiment.recent_audio_buffer = []
+    # Validate audio data
+    if audio_data is None or len(audio_data) < RATE * 0.5:  # At least 0.5 seconds
+        logger.warning("Audio data too short for speech processing")
+        return None
+    
+    # Analyze audio to see if it's likely to contain speech
+    is_speech, speech_confidence, speech_features = is_likely_real_speech(audio_data)
+    
+    if not is_speech and speech_confidence < 0.4:  # Lower threshold from 0.5 to 0.4
+        logger.info(f"Audio unlikely to contain speech (confidence: {speech_confidence:.2f})")
+        return None
     
     # Add current audio to buffer
-    process_speech_with_sentiment.recent_audio_buffer.append(audio_data)
+    recent_audio_buffer.append(audio_data)
     
-    # Keep only the most recent chunks
-    if len(process_speech_with_sentiment.recent_audio_buffer) > SPEECH_MAX_BUFFER_SIZE:
-        process_speech_with_sentiment.recent_audio_buffer = process_speech_with_sentiment.recent_audio_buffer[-SPEECH_MAX_BUFFER_SIZE:]
+    # Keep buffer size limited
+    if len(recent_audio_buffer) > MAX_BUFFER_SIZE:
+        recent_audio_buffer.pop(0)
     
-    # For better transcription, use concatenated audio from multiple chunks if available
-    if len(process_speech_with_sentiment.recent_audio_buffer) > 1:
-        num_chunks = min(SPEECH_MAX_BUFFER_SIZE, len(process_speech_with_sentiment.recent_audio_buffer))
-        logger.info(f"Using concatenated audio from {num_chunks} chunks for speech transcription")
-        concatenated_audio = np.concatenate(process_speech_with_sentiment.recent_audio_buffer[-num_chunks:])
-    else:
-        concatenated_audio = audio_data
+    # Concatenate recent audio for better context
+    concatenated_audio = np.concatenate(recent_audio_buffer)
     
-    # Ensure minimum audio length for better transcription
-    min_samples = RATE * 8.0  # At least 8.0 seconds of audio for speech
-    if len(concatenated_audio) < min_samples:
-        pad_size = int(min_samples) - len(concatenated_audio)
-        concatenated_audio = np.pad(concatenated_audio, (0, pad_size), mode='reflect')
-        logger.info(f"Padded speech audio to size: {len(concatenated_audio)} samples ({len(concatenated_audio)/RATE:.1f} seconds)")
-    
-    # Run speech detection to verify this is real speech
-    is_speech, speech_confidence, speech_features = is_likely_real_speech(concatenated_audio, RATE)
-    
-    # Log the speech detection results
-    logger.info(f"Speech verification: is_speech={is_speech}, confidence={speech_confidence:.2f}")
-    
-    # Only proceed with transcription if we're confident this is real speech
-    if not is_speech:
-        logger.info(f"Audio doesn't contain real human speech (confidence: {speech_confidence:.2f})")
-        return {
-            "text": "",
-            "sentiment": {
-                "category": "Neutral", 
-                "original_emotion": "neutral",
-                "confidence": 0.5,
-                "emoji": "😐"
-            },
-            "speech_features": speech_features
-        }
-    
-    # Calculate the RMS value of the audio
+    # Calculate audio properties for logging
     rms = np.sqrt(np.mean(np.square(concatenated_audio)))
-    if rms < 0.001:
-        logger.info(f"Audio too quiet (RMS: {rms:.4f}), skipping transcription")
-        return {
-            "text": "",
-            "sentiment": {
-                "category": "Neutral",
-                "original_emotion": "neutral",
-                "confidence": 0.5,
-                "emoji": "😐"
-            }
-        }
     
-    # Enhance audio signal for better transcription if the volume is low
-    if rms < 0.05:
-        logger.info(f"Boosting audio signal (original RMS: {rms:.4f})")
-        target_rms = 0.1
-        gain_factor = target_rms / (rms + 1e-10)
-        enhanced_audio = concatenated_audio * gain_factor
-        
-        if np.max(np.abs(enhanced_audio)) > 0.99:
-            logger.info("Using peak normalization to avoid clipping")
-            peak_value = np.max(np.abs(concatenated_audio))
-            if peak_value > 0:
-                gain_factor = 0.95 / peak_value
-                enhanced_audio = concatenated_audio * gain_factor
-        
-        new_rms = np.sqrt(np.mean(np.square(enhanced_audio)))
-        logger.info(f"Audio boosted from RMS {rms:.4f} to {new_rms:.4f}")
-        concatenated_audio = enhanced_audio
-    
-    # Apply high-pass filter to reduce background noise
-    try:
-        b, a = signal.butter(2, 40/(RATE/2), 'highpass')
-        filtered_audio = signal.filtfilt(b, a, concatenated_audio)
-        logger.info("Applied gentle high-pass filter (40Hz) for noise reduction")
-        
-        try:
-            b, a = signal.butter(3, 8000/(RATE/2), 'lowpass')
-            filtered_audio = signal.filtfilt(b, a, filtered_audio)
-            logger.info("Applied low-pass filter to focus on speech frequencies")
-        except Exception as e:
-            logger.warning(f"Error applying low-pass filter: {str(e)}")
-            
-        concatenated_audio = filtered_audio
-    except Exception as e:
-        logger.warning(f"Error applying high-pass filter: {str(e)}")
-    
-    logger.info("Transcribing speech to text...")
-    
-    # Variable to store transcription
+    # Initialize variables
     transcription = ""
     google_api_error = None
     vosk_fallback_used = False
     
-    # Check for configured speech recognition engine
-    if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_VOSK:
-        if VOSK_AVAILABLE:
-            logger.info("Using Vosk for speech recognition (as configured)")
-            try:
-                start_time = time.time()
-                transcription = transcribe_with_vosk(concatenated_audio, RATE)
-                processing_time = time.time() - start_time
-                logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
-                vosk_fallback_used = True
-            except Exception as e:
-                logger.error(f"Error with Vosk speech recognition: {str(e)}")
-                return {
-                    "text": "",
-                    "sentiment": {
-                        "category": "Neutral",
-                        "original_emotion": "neutral",
-                        "confidence": 0.5,
-                        "emoji": "😐"
-                    },
-                    "transcription_engine": "vosk",
-                    "error": str(e)
-                }
-        else:
-            logger.error("Vosk is configured but not available.")
-            return {
-                "text": "",
-                "sentiment": {
-                    "category": "Neutral",
-                    "original_emotion": "neutral",
-                    "confidence": 0.5,
-                    "emoji": "😐"
-                },
-                "error": "Vosk is not available but was selected as speech engine"
-            }
-    elif SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_GOOGLE:
-        if USE_GOOGLE_SPEECH_API:
-            try:
-                logger.info(f"Using Google Speech API only (as configured)")
-                start_time = time.time()
-                options = {
-                    "language_code": "en-US",
-                    "sample_rate_hertz": RATE,
-                    "enable_automatic_punctuation": True,
-                    "use_enhanced": True,
-                    "model": "command_and_search",
-                    "audio_channel_count": 1
-                }
+    # Try Google Speech API first if enabled
+    if USE_GOOGLE_SPEECH_API and SPEECH_RECOGNITION_ENGINE != SPEECH_ENGINE_VOSK:
+        logger.info("Using Google Speech API for transcription")
+        try:
+            start_time = time.time()
+            transcription, error_info = transcribe_with_google(concatenated_audio, RATE)
+            processing_time = time.time() - start_time
+            
+            if error_info:
+                google_api_error = error_info.get("error", "Unknown error")
+                logger.warning(f"Google Speech API error: {google_api_error}")
                 
-                transcription = transcribe_with_google(concatenated_audio, RATE, **options)
-                processing_time = time.time() - start_time
-                logger.info(f"Google transcription completed in {processing_time:.2f}s, result: '{transcription}'")
-            except Exception as e:
-                google_api_error = str(e)
-                logger.error(f"Error with Google Speech API (no fallback configured): {google_api_error}")
-                return {
-                    "text": "",
-                    "sentiment": {
-                        "category": "Neutral",
-                        "original_emotion": "neutral",
-                        "confidence": 0.5,
-                        "emoji": "😐"
-                    },
-                    "transcription_engine": "google",
-                    "google_api_error": google_api_error
-                }
-        else:
-            logger.error("Google Speech API is required but not available")
-            return {
-                "text": "",
-                "sentiment": {
-                    "category": "Neutral",
-                    "original_emotion": "neutral",
-                    "confidence": 0.5,
-                    "emoji": "😐"
-                },
-                "error": "Google Speech API is not available but was selected as speech engine"
-            }
-    else:
-        if USE_GOOGLE_SPEECH_API:
-            try:
-                logger.info(f"Using Auto mode: Google first, then Vosk fallback. Sending {len(concatenated_audio)/RATE:.2f} seconds of audio to Google Speech API")
-                options = {
-                    "language_code": "en-US",
-                    "sample_rate_hertz": RATE,
-                    "enable_automatic_punctuation": True,
-                    "use_enhanced": True,
-                    "model": "command_and_search",
-                    "audio_channel_count": 1
-                }
+                # If we have error details, log them
+                if "details" in error_info:
+                    logger.debug(f"Error details: {error_info['details']}")
                 
-                start_time = time.time()
-                transcription = transcribe_with_google(concatenated_audio, RATE, **options)
-                processing_time = time.time() - start_time
-                logger.info(f"Google transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                # Emit error notification to client
+                socketio.emit('error', {'message': f'Speech recognition issue: {google_api_error}'})
                 
-                if not transcription and VOSK_AVAILABLE:
-                    logger.info("Google Speech API returned empty result, trying Vosk as fallback")
-                    vosk_fallback_used = True
-                    start_time = time.time()
-                    transcription = transcribe_with_vosk(concatenated_audio, RATE)
-                    processing_time = time.time() - start_time
-                    logger.info(f"Vosk fallback transcription completed in {processing_time:.2f}s, result: '{transcription}'")
-            except Exception as e:
-                google_api_error = str(e)
-                logger.error(f"Error with Google Speech API: {google_api_error}")
-                
-                if VOSK_AVAILABLE:
-                    logger.info("Trying Vosk as fallback due to Google Speech API error")
+                # If we're in auto mode, try Vosk as fallback
+                if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
+                    logger.info("Falling back to Vosk for transcription")
                     vosk_fallback_used = True
                     try:
                         start_time = time.time()
                         transcription = transcribe_with_vosk(concatenated_audio, RATE)
                         processing_time = time.time() - start_time
-                        logger.info(f"Vosk fallback transcription completed in {processing_time:.2f}s, result: '{transcription}'")
-                    except Exception as vosk_error:
-                        logger.error(f"Error with Vosk fallback: {str(vosk_error)}")
-                        logger.error(f"Speech recognition failed with both engines - Google: {google_api_error}, Vosk: {str(vosk_error)}")
+                        logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                    except Exception as e:
+                        logger.error(f"Vosk fallback also failed: {str(e)}")
+                        # Emit error notification to client
+                        socketio.emit('error', {'message': 'Speech recognition failed with all available engines'})
                         return {
                             "text": "",
                             "sentiment": {
@@ -1188,13 +1047,13 @@ def process_speech_with_sentiment(audio_data):
                                 "confidence": 0.5,
                                 "emoji": "😐"
                             },
-                            "errors": {
-                                "google": google_api_error,
-                                "vosk": str(vosk_error)
-                            }
+                            "error": "All speech recognition engines failed"
                         }
                 else:
-                    logger.error("No fallback available: Vosk is not installed or available")
+                    # No fallback available or not in auto mode
+                    logger.error("Google Speech API failed and no fallback available")
+                    # Emit error notification to client
+                    socketio.emit('error', {'message': 'Google Speech API failed and no fallback available'})
                     return {
                         "text": "",
                         "sentiment": {
@@ -1205,16 +1064,40 @@ def process_speech_with_sentiment(audio_data):
                         },
                         "google_api_error": google_api_error
                     }
-        elif VOSK_AVAILABLE:
-            logger.info("Auto mode with Google disabled, using Vosk for transcription")
-            vosk_fallback_used = True
-            try:
-                start_time = time.time()
-                transcription = transcribe_with_vosk(concatenated_audio, RATE)
-                processing_time = time.time() - start_time
-                logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
-            except Exception as e:
-                logger.error(f"Error with Vosk: {str(e)}")
+            else:
+                logger.info(f"Google transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+        except Exception as e:
+            logger.error(f"Error with Google Speech API: {str(e)}")
+            google_api_error = str(e)
+            
+            # If we're in auto mode, try Vosk as fallback
+            if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
+                logger.info("Falling back to Vosk for transcription due to Google API exception")
+                vosk_fallback_used = True
+                try:
+                    start_time = time.time()
+                    transcription = transcribe_with_vosk(concatenated_audio, RATE)
+                    processing_time = time.time() - start_time
+                    logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
+                except Exception as e:
+                    logger.error(f"Vosk fallback also failed: {str(e)}")
+                    # Emit error notification to client
+                    socketio.emit('error', {'message': 'Speech recognition failed with all available engines'})
+                    return {
+                        "text": "",
+                        "sentiment": {
+                            "category": "Neutral",
+                            "original_emotion": "neutral",
+                            "confidence": 0.5,
+                            "emoji": "😐"
+                        },
+                        "error": "All speech recognition engines failed"
+                    }
+            else:
+                # No fallback available or not in auto mode
+                logger.error("Google Speech API failed and no fallback available")
+                # Emit error notification to client
+                socketio.emit('error', {'message': 'Google Speech API failed and no fallback available'})
                 return {
                     "text": "",
                     "sentiment": {
@@ -1223,80 +1106,8 @@ def process_speech_with_sentiment(audio_data):
                         "confidence": 0.5,
                         "emoji": "😐"
                     },
-                    "error": str(e)
+                    "google_api_error": google_api_error
                 }
-        else:
-            logger.error("No speech recognition system available")
-            return {
-                "text": "",
-                "sentiment": {
-                    "category": "Neutral",
-                    "original_emotion": "neutral",
-                    "confidence": 0.5,
-                    "emoji": "😐"
-                },
-                "error": "No speech recognition system available"
-            }
-    
-    # Check for valid transcription with sufficient content
-    if not transcription:
-        logger.info("No valid transcription found")
-        return {
-            "text": "",
-            "sentiment": {
-                "category": "Neutral",
-                "original_emotion": "neutral",
-                "confidence": 0.5,
-                "emoji": "😐"
-            },
-            "transcription_engine": "vosk" if vosk_fallback_used else "google",
-            "google_api_error": google_api_error
-        }
-    
-    # Filter out short or meaningless transcriptions
-    common_words = ["the", "a", "an", "and", "but", "or", "if", "then", "so", "to", "of", "for", "in", "on", "at"]
-    meaningful_words = [word for word in transcription.lower().split() if word not in common_words]
-    
-    if len(meaningful_words) < MIN_WORD_COUNT:
-        logger.info(f"Transcription has too few meaningful words: '{transcription}'")
-        return {
-            "text": transcription,
-            "sentiment": {
-                "category": "Neutral",
-                "original_emotion": "neutral",
-                "confidence": 0.5,
-                "emoji": "😐"
-            },
-            "transcription_engine": "vosk" if vosk_fallback_used else "google",
-            "google_api_error": google_api_error
-        }
-    
-    logger.info(f"Valid transcription found: '{transcription}'")
-    
-    # Analyze sentiment
-    sentiment = analyze_sentiment(transcription)
-    
-    if sentiment:
-        result = {
-            "text": transcription,
-            "sentiment": sentiment,
-            "transcription_engine": "vosk" if vosk_fallback_used else "google",
-            "google_api_error": google_api_error
-        }
-        logger.info(f"Sentiment analysis result: Speech {sentiment['category']} with emoji {sentiment['emoji']} (using {result['transcription_engine']})")
-        return result
-    
-    return {
-        "text": transcription,
-        "sentiment": {
-            "category": "Neutral",
-            "original_emotion": "neutral",
-            "confidence": 0.5,
-            "emoji": "😐"
-        },
-        "transcription_engine": "vosk" if vosk_fallback_used else "google",
-        "google_api_error": google_api_error
-    }
 
 def background_thread():
     """Example of how to send server generated events to clients."""
