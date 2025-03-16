@@ -88,7 +88,7 @@ SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_AUTO  # Default to automatic mode
 
 # Import our sentiment analysis modules
 from sentiment_analyzer import analyze_sentiment
-from google_speech import transcribe_with_google, GoogleSpeechToText
+        from google_speech import transcribe_with_google, GoogleSpeechToText
 
 # Memory optimization settings
 import os
@@ -217,25 +217,20 @@ SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
 SPEECH_PREDICTION_THRES = 0.65  # Lowered from 0.7 to 0.65 for better speech detection
 SPEECH_DETECTION_THRES = 0.55  # Lowered from 0.6 to 0.55 for secondary speech detection
-SPEECH_BIAS_CORRECTION = 0.35  # Increased from 0.25 to 0.35 to reduce false positives
-KNOCK_LOWER_THRESHOLD = 0.15  # Increased from 0.05 to 0.15 to reduce false positives
+SPEECH_BIAS_CORRECTION = 0.25  # Reduced from 0.3 to 0.25 to avoid excessive correction
+KNOCK_LOWER_THRESHOLD = 0.05  # Lower threshold for knock detection
 
 # Define critical sounds that get priority treatment
 CRITICAL_SOUNDS = {
-    'hazard-alarm': 0.25,     # Fire/Smoke alarm
-    'knock': 0.30,            # Knock - adjusted from 0.35 to 0.30 to improve detection
-    'doorbell': 0.25,         # Doorbell
-    'baby-cry': 0.30,         # Baby crying
-    'water-running': 0.30,    # Water running
-    'phone-ring': 0.30,       # Phone ringing
-    'alarm-clock': 0.30,      # Alarm clock
-    'cooking': 0.40           # Utensils and Cutlery
+    'hazard-alarm': 0.25,     # Fire/Smoke alarm - increased from 0.05
+    'knock': 0.25,            # Knock - increased from 0.05
+    'doorbell': 0.25,         # Doorbell - increased from 0.07
+    'baby-cry': 0.30,         # Baby crying - increased from 0.1
+    'water-running': 0.30,    # Water running - increased from 0.1
+    'phone-ring': 0.30,       # Phone ringing - increased from 0.1
+    'alarm-clock': 0.30,      # Alarm clock - increased from 0.1
+    'cooking': 0.40           # Added - Utensils and Cutlery
 }
-
-# Store recent detections for pattern recognition
-RECENT_KNOCK_DETECTIONS = []
-KNOCK_DETECTION_WINDOW = 5  # Number of recent frames to consider for knock patterns
-KNOCK_PATTERN_THRESHOLD = 0.20  # Threshold for considering a knock as part of a pattern
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -791,65 +786,22 @@ def handle_source(json_data):
                         trigger_confidence = threshold * 0.9  # Lower threshold for audible water
                     
                     if confidence > trigger_confidence:
-                        # Second-stage verification for critical sounds
-                        # For knock, check if there's a pattern of repeating sounds
-                        if sound == 'knock':
-                            # Require at least 2 consecutive knock detections for more confidence
-                            if getattr(handle_source, 'last_sound', None) == 'knock':
-                                print(f"Verified critical sound '{human_sound_label}' with second-stage check")
-                                emit_sound_notification(human_sound_label, str(confidence), combined_db, time_data, record_time)
-                                handle_source.last_sound = sound
-                                return
-                            else:
-                                # Store current detection for next time
-                                handle_source.last_sound = sound
-                                return
-                        else:
-                            # For other critical sounds, proceed with regular notification
-                            print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {combined_db} dB")
-                            emit_sound_notification(human_sound_label, str(confidence), combined_db, time_data, record_time)
-                            handle_source.last_sound = sound
-                            return
-                    else:
-                        # If below trigger confidence but above lower threshold, store for verification
-                        if confidence > threshold * 0.7:
-                            handle_source.last_sound = sound
+                        print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {combined_db} dB")
+                        emit_sound_notification(human_sound_label, str(confidence), combined_db, time_data, record_time)
+                        return
         
         # Check for knock specifically (with lower threshold) before main processing
         knock_idx = homesounds.labels.get('knock', 11)
-        if knock_idx < len(predictions[0]):
-            knock_confidence = predictions[0][knock_idx]
-            print(f"Found potential knock with confidence: {knock_confidence:.4f}")
+        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
+            print(f"Found potential knock with confidence: {predictions[0][knock_idx]:.4f}")
             
-            # Track knock detections for pattern recognition
-            current_time = time.time()
-            RECENT_KNOCK_DETECTIONS.append((current_time, knock_confidence))
-            
-            # Clean up old detections (older than 3 seconds)
-            RECENT_KNOCK_DETECTIONS[:] = [det for det in RECENT_KNOCK_DETECTIONS 
-                                         if current_time - det[0] < 3.0]
-            
-            # Check for knock pattern - multiple detections in short time window
-            significant_knocks = [det for det in RECENT_KNOCK_DETECTIONS 
-                                 if det[1] > KNOCK_PATTERN_THRESHOLD]
-            
-            # Primary detection logic - higher confidence
-            if knock_confidence > 0.30 or (knock_confidence > 0.20 and combined_db > 65):
-                print(f"Knock detection triggered with {knock_confidence:.4f} confidence at {combined_db} dB")
-                emit_sound_notification('Knocking', str(knock_confidence), combined_db, time_data, record_time)
-                return
-                
-            # Pattern detection - multiple moderate confidence knocks in sequence
-            elif len(significant_knocks) >= 2 and knock_confidence > KNOCK_LOWER_THRESHOLD:
-                avg_confidence = sum(det[1] for det in significant_knocks) / len(significant_knocks)
-                print(f"Knock pattern detected with {len(significant_knocks)} knocks, avg confidence: {avg_confidence:.4f}")
-                emit_sound_notification('Knocking', str(avg_confidence), combined_db, time_data, record_time)
-                return
-            
-            # Special case for distinctive knocks
-            elif knock_confidence > KNOCK_LOWER_THRESHOLD and combined_db > 70:
-                print(f"Loud knock detected with {knock_confidence:.4f} confidence at {combined_db} dB")
-                emit_sound_notification('Knocking', str(knock_confidence), combined_db, time_data, record_time)
+            # If knock confidence is significant or higher than other predictions except speech
+            # or if we have a moderate knock confidence with loud audio, emit knock notification
+            if (predictions[0][knock_idx] > 0.2 or 
+                (predictions[0][knock_idx] > 0.1 and combined_db > 60) or
+                (predictions[0][knock_idx] == context_prediction[m] and predicted_label == 'knock')):
+                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {combined_db} dB")
+                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
                 return
         
         # Print prediction information
@@ -878,8 +830,8 @@ def handle_source(json_data):
                     try:
                         # Use the same audio data that was used for detection
                         sentiment_result = process_speech_with_sentiment(combined_audio)
-                        
-                        if sentiment_result and 'sentiment' in sentiment_result:
+                    
+                    if sentiment_result and 'sentiment' in sentiment_result:
                             # Extract and log the speech engine used
                             engine_used = sentiment_result.get('transcription_engine', 'unknown')
                             transcription = sentiment_result.get('text', '')
@@ -928,21 +880,9 @@ def handle_source(json_data):
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
             print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
             
-            # Check for knock pattern as fallback
-            if len(RECENT_KNOCK_DETECTIONS) >= 3:
-                # If we have 3+ recent detections with reasonable confidence, consider it a knock
-                recent_knocks = [det for det in RECENT_KNOCK_DETECTIONS 
-                               if det[1] > 0.10 and time.time() - det[0] < 2.0]
-                
-                if len(recent_knocks) >= 3:
-                    avg_confidence = sum(det[1] for det in recent_knocks) / len(recent_knocks)
-                    print(f"Fallback: Knock pattern detected based on {len(recent_knocks)} recent detections!")
-                    emit_sound_notification('Knocking', str(avg_confidence), combined_db, time_data, record_time)
-                    return
-            
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and combined_db > 60:
+            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and combined_db > DBLEVEL_THRES:
                 print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence as fallback!")
                 emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
                 return
@@ -1073,12 +1013,12 @@ def is_likely_real_speech(audio_data, sample_rate=16000):
         
         # Decision thresholds based on audio level
         if rms > 0.05:  # Loud audio
-            confidence_threshold = 0.60  # Higher threshold for loud audio
+            confidence_threshold = 0.45  # Lower threshold for loud audio
         else:
-            confidence_threshold = 0.70  # Higher threshold for quiet audio
+            confidence_threshold = 0.55  # Higher threshold for quiet audio
         
         # Make final decision
-        is_speech = speech_confidence > confidence_threshold and rms > 0.01
+        is_speech = speech_confidence > confidence_threshold and rms > 0.008
         
         # Include decision factors in features
         features["speech_confidence"] = float(speech_confidence)
@@ -1235,7 +1175,7 @@ def process_speech_with_sentiment(audio_data):
                 processing_time = time.time() - start_time
                 logger.info(f"Vosk transcription completed in {processing_time:.2f}s, result: '{transcription}'")
                 vosk_fallback_used = True
-            except Exception as e:
+        except Exception as e:
                 logger.error(f"Error with Vosk speech recognition: {str(e)}")
                 return {
                     "text": "",
@@ -1248,7 +1188,7 @@ def process_speech_with_sentiment(audio_data):
                     "transcription_engine": "vosk",
                     "error": str(e)
                 }
-        else:
+    else:
             logger.error("Vosk is configured but not available. Please install it with: pip install vosk")
             return {
                 "text": "",
@@ -1828,7 +1768,7 @@ def should_send_notification(sound_label):
     # If we're sending the same sound again, require longer cooldown
     elif sound_label == last_notification_sound:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS * 1.5
-    else:
+            else:
         required_cooldown = NOTIFICATION_COOLDOWN_SECONDS
     
     # If enough time has passed, allow the notification
@@ -1871,11 +1811,11 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Prepare notification data
         notification_data = {
-            'label': label,
+                'label': label,
             'accuracy': str(accuracy),
-            'db': str(db),
-            'time': str(time_data),
-            'record_time': str(record_time) if record_time else ''
+                'db': str(db),
+                'time': str(time_data),
+                'record_time': str(record_time) if record_time else ''
         }
         
         # Add sentiment data if available
@@ -1903,7 +1843,7 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
         
         # Emit the notification
         socketio.emit('audio_label', notification_data)
-    else:
+        else:
         logger.debug(f"Notification for '{label}' suppressed due to cooldown")
 
 if __name__ == '__main__':

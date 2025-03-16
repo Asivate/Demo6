@@ -12,7 +12,7 @@ import threading
 import logging
 import numpy as np
 try:
-    from google.cloud import speech
+from google.cloud import speech
     GOOGLE_SPEECH_AVAILABLE = True
 except ImportError:
     GOOGLE_SPEECH_AVAILABLE = False
@@ -227,17 +227,9 @@ class GoogleSpeechToText:
                 
             # Apply a low-pass filter to remove high-frequency noise above speech range
             try:
-                # Properly calculate the normalized frequency (must be between 0 and 1)
-                cutoff_hz = 8000  # Speech typically is below 8kHz
-                nyquist = sample_rate / 2
-                normalized_freq = cutoff_hz / nyquist
-                
-                # Ensure we stay within valid range (0 < Wn < 1)
-                normalized_freq = min(0.99, max(0.01, normalized_freq))
-                
-                b, a = signal.butter(3, normalized_freq, 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
+                b, a = signal.butter(3, 8000/(sample_rate/2), 'lowpass')  # Keep frequencies up to 8000Hz (speech range)
                 filtered_audio = signal.filtfilt(b, a, processed_audio)
-                logger.info(f"Applied low-pass filter ({cutoff_hz}Hz) to focus on speech frequencies")
+                logger.info("Applied low-pass filter (8000Hz) to focus on speech frequencies")
                 processed_audio = filtered_audio
             except Exception as e:
                 logger.warning(f"Error applying low-pass filter: {str(e)}")
