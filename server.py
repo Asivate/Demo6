@@ -223,7 +223,7 @@ KNOCK_LOWER_THRESHOLD = 0.15  # Increased from 0.05 to 0.15 to reduce false posi
 # Define critical sounds that get priority treatment
 CRITICAL_SOUNDS = {
     'hazard-alarm': 0.25,     # Fire/Smoke alarm
-    'knock': 0.35,            # Knock - increased from 0.25 to reduce false positives
+    'knock': 0.30,            # Knock - adjusted from 0.35 to 0.30 to improve detection
     'doorbell': 0.25,         # Doorbell
     'baby-cry': 0.30,         # Baby crying
     'water-running': 0.30,    # Water running
@@ -231,6 +231,11 @@ CRITICAL_SOUNDS = {
     'alarm-clock': 0.30,      # Alarm clock
     'cooking': 0.40           # Utensils and Cutlery
 }
+
+# Store recent detections for pattern recognition
+RECENT_KNOCK_DETECTIONS = []
+KNOCK_DETECTION_WINDOW = 5  # Number of recent frames to consider for knock patterns
+KNOCK_PATTERN_THRESHOLD = 0.20  # Threshold for considering a knock as part of a pattern
 
 # Apply stronger speech bias correction since the model is heavily biased towards speech
 APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
@@ -812,16 +817,39 @@ def handle_source(json_data):
         
         # Check for knock specifically (with lower threshold) before main processing
         knock_idx = homesounds.labels.get('knock', 11)
-        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
-            print(f"Found potential knock with confidence: {predictions[0][knock_idx]:.4f}")
+        if knock_idx < len(predictions[0]):
+            knock_confidence = predictions[0][knock_idx]
+            print(f"Found potential knock with confidence: {knock_confidence:.4f}")
             
-            # If knock confidence is significant or higher than other predictions except speech
-            # or if we have a moderate knock confidence with loud audio, emit knock notification
-            if (predictions[0][knock_idx] > 0.3 or 
-                (predictions[0][knock_idx] > 0.2 and combined_db > 65) or
-                (predictions[0][knock_idx] == context_prediction[m] and predicted_label == 'knock' and context_prediction[m] > 0.25)):
-                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {combined_db} dB")
-                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
+            # Track knock detections for pattern recognition
+            current_time = time.time()
+            RECENT_KNOCK_DETECTIONS.append((current_time, knock_confidence))
+            
+            # Clean up old detections (older than 3 seconds)
+            RECENT_KNOCK_DETECTIONS[:] = [det for det in RECENT_KNOCK_DETECTIONS 
+                                         if current_time - det[0] < 3.0]
+            
+            # Check for knock pattern - multiple detections in short time window
+            significant_knocks = [det for det in RECENT_KNOCK_DETECTIONS 
+                                 if det[1] > KNOCK_PATTERN_THRESHOLD]
+            
+            # Primary detection logic - higher confidence
+            if knock_confidence > 0.30 or (knock_confidence > 0.20 and combined_db > 65):
+                print(f"Knock detection triggered with {knock_confidence:.4f} confidence at {combined_db} dB")
+                emit_sound_notification('Knocking', str(knock_confidence), combined_db, time_data, record_time)
+                return
+                
+            # Pattern detection - multiple moderate confidence knocks in sequence
+            elif len(significant_knocks) >= 2 and knock_confidence > KNOCK_LOWER_THRESHOLD:
+                avg_confidence = sum(det[1] for det in significant_knocks) / len(significant_knocks)
+                print(f"Knock pattern detected with {len(significant_knocks)} knocks, avg confidence: {avg_confidence:.4f}")
+                emit_sound_notification('Knocking', str(avg_confidence), combined_db, time_data, record_time)
+                return
+            
+            # Special case for distinctive knocks
+            elif knock_confidence > KNOCK_LOWER_THRESHOLD and combined_db > 70:
+                print(f"Loud knock detected with {knock_confidence:.4f} confidence at {combined_db} dB")
+                emit_sound_notification('Knocking', str(knock_confidence), combined_db, time_data, record_time)
                 return
         
         # Print prediction information
@@ -899,6 +927,18 @@ def handle_source(json_data):
             # Sound didn't meet thresholds
             reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
             print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
+            
+            # Check for knock pattern as fallback
+            if len(RECENT_KNOCK_DETECTIONS) >= 3:
+                # If we have 3+ recent detections with reasonable confidence, consider it a knock
+                recent_knocks = [det for det in RECENT_KNOCK_DETECTIONS 
+                               if det[1] > 0.10 and time.time() - det[0] < 2.0]
+                
+                if len(recent_knocks) >= 3:
+                    avg_confidence = sum(det[1] for det in recent_knocks) / len(recent_knocks)
+                    print(f"Fallback: Knock pattern detected based on {len(recent_knocks)} recent detections!")
+                    emit_sound_notification('Knocking', str(avg_confidence), combined_db, time_data, record_time)
+                    return
             
             # Check for knock with lower threshold as a fallback
             knock_idx = homesounds.labels.get('knock', 11)
