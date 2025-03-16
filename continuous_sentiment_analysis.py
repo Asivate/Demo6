@@ -16,6 +16,7 @@ import json
 from datetime import datetime
 from threading import Lock
 from collections import deque
+from transformers import pipeline
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -38,6 +39,10 @@ except ImportError:
 
 # Import sentiment analysis
 from sentiment_analyzer import analyze_sentiment
+
+# Global sentiment analyzer
+_sentiment_analyzer = None
+_sentiment_lock = threading.RLock()
 
 class ContinuousSentimentAnalyzer:
     """
@@ -263,6 +268,103 @@ class ContinuousSentimentAnalyzer:
                 return history[:limit]
             return history
 
+def initialize_sentiment_analyzer():
+    """
+    Initialize the sentiment analyzer.
+    
+    Returns:
+        bool: True if initialization was successful, False otherwise
+    """
+    global _sentiment_analyzer
+    
+    try:
+        with _sentiment_lock:
+            if _sentiment_analyzer is None:
+                logger.info("Initializing sentiment analyzer...")
+                # Use distilbert for faster inference
+                _sentiment_analyzer = pipeline(
+                    "sentiment-analysis",
+                    model="distilbert-base-uncased-finetuned-sst-2-english",
+                    device=-1  # Use CPU
+                )
+                logger.info("Sentiment analyzer initialized successfully")
+                return True
+            else:
+                logger.info("Sentiment analyzer already initialized")
+                return True
+    except Exception as e:
+        logger.error(f"Error initializing sentiment analyzer: {str(e)}")
+        return False
+
+def get_sentiment_analyzer():
+    """
+    Get the sentiment analyzer.
+    
+    Returns:
+        pipeline: The sentiment analyzer pipeline or None if not initialized
+    """
+    global _sentiment_analyzer
+    
+    with _sentiment_lock:
+        return _sentiment_analyzer
+
+def analyze_text_sentiment(text):
+    """
+    Analyze the sentiment of a text.
+    
+    Args:
+        text: The text to analyze
+        
+    Returns:
+        dict: Sentiment analysis result with 'label' and 'score' keys,
+              or None if analysis failed
+    """
+    global _sentiment_analyzer
+    
+    if not text or len(text.strip()) == 0:
+        logger.warning("Empty text provided for sentiment analysis")
+        return None
+    
+    try:
+        with _sentiment_lock:
+            if _sentiment_analyzer is None:
+                if not initialize_sentiment_analyzer():
+                    logger.error("Failed to initialize sentiment analyzer")
+                    return None
+            
+            # Analyze sentiment
+            start_time = time.time()
+            result = _sentiment_analyzer(text)[0]
+            end_time = time.time()
+            
+            logger.debug(f"Sentiment analysis completed in {(end_time - start_time)*1000:.2f} ms")
+            
+            # Map sentiment to positive/negative/neutral
+            sentiment = result['label'].lower()
+            confidence = result['score']
+            
+            # Map POSITIVE/NEGATIVE to positive/negative
+            if sentiment == 'positive' or sentiment == 'POSITIVE':
+                sentiment = 'positive'
+            elif sentiment == 'negative' or sentiment == 'NEGATIVE':
+                sentiment = 'negative'
+            else:
+                sentiment = 'neutral'
+            
+            # Add emoji based on sentiment
+            emoji = "😊" if sentiment == 'positive' else "😐" if sentiment == 'neutral' else "😟"
+            
+            return {
+                'sentiment': sentiment,
+                'confidence': confidence,
+                'emoji': emoji,
+                'original_emotion': result['label']
+            }
+    
+    except Exception as e:
+        logger.error(f"Error analyzing sentiment: {str(e)}")
+        return None
+
 # Global instance to be used by server
 sentiment_analyzer = None
 
@@ -282,8 +384,4 @@ def initialize_sentiment_analyzer(socketio, sample_rate=16000):
     if sentiment_analyzer is None:
         sentiment_analyzer = ContinuousSentimentAnalyzer(socketio, sample_rate)
     
-    return sentiment_analyzer
-
-def get_sentiment_analyzer():
-    """Get the global sentiment analyzer instance."""
     return sentiment_analyzer 

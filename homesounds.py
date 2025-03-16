@@ -1,3 +1,8 @@
+"""
+Homesounds module for SoundWatch server.
+Contains labels and mappings for sound classification.
+"""
+
 # HomeSounds Label Definition
 labels = {
     'dog-bark':0,
@@ -79,51 +84,86 @@ context_mapping = {
     'everything': everything
 }
 
+# Sound class labels (index to label mapping)
 to_human_labels = {
-    'dog-bark': "Dog Barking",
-    'drill': "Drill In-Use",
-    'hazard-alarm': "Fire/Smoke Alarm",
-    'phone-ring': "Phone Ringing",
-    'speech': "Speech",
-    'vacuum': "Vacuum In-Use",
-    'baby-cry': "Baby Crying",
-    'chopping': "Chopping",
-    'cough': "Coughing",
-    'door': "Door In-Use",
-    'water-running': "Water Running",
-    'knock': "Knocking",
-    'microwave': "Microwave",
-    'shaver': "Shaver In-Use",
-    'toothbrush': "Toothbrushing",
-    'blender': "Blender In-Use",
-    'dishwasher': "Dishwasher",
-    'doorbell': "Doorbell In-Use",
-    'flush': "Toilet Flushing",
-    'hair-dryer': "Hair Dryer In-Use",
-    'laugh': "Laughing",
-    'snore': "Snoring",
-    'typing': "Typing",
-    'hammer': "Hammering",
-    'car-horn': "Car Honking",
-    'engine': "Vehicle Running",
-    'saw': "Saw In-Use",
-    'cat-meow': "Cat Meowing",
-    'alarm-clock': "Alarm Clock",
-    'cooking': "Utensils and Cutlery",
-    # New sound labels
-    'finger-snap': "Finger Snap",
-    'hand-clap': "Hand Clap",
-    'hand-sounds': "Hand Sounds",
-    'applause': "Applause",
-    'silence': "Silence",
-    'background': "Background Sounds",
-    'music': "Music",
-    'sound-effect': "Sound Effect",
-    'electronic-sound': "Electronic Sound",
-    'notification': "Notification Sound",
-    'male-conversation': "Male Speech",
-    'female-conversation': "Female Speech",
-    'conversation': "Conversation",
+    0: "Alarm",
+    1: "Baby crying",
+    2: "Car horn",
+    3: "Cat meowing",
+    4: "Dishes",
+    5: "Dog barking",
+    6: "Door knock",
+    7: "Doorbell",
+    8: "Footsteps",
+    9: "Glass breaking",
+    10: "Keyboard typing",
+    11: "Microwave",
+    12: "Phone ringing",
+    13: "Shower",
+    14: "Sink water running",
+    15: "Snoring",
+    16: "Speech",
+    17: "Toilet flush",
+    18: "Vacuum cleaner",
+    19: "Water boiling"
+}
+
+# Label to index mapping
+labels = {
+    "alarm": 0,
+    "baby_crying": 1,
+    "car_horn": 2,
+    "cat_meowing": 3,
+    "dishes": 4,
+    "dog_barking": 5,
+    "door_knock": 6,
+    "doorbell": 7,
+    "footsteps": 8,
+    "glass_breaking": 9,
+    "keyboard_typing": 10,
+    "microwave": 11,
+    "phone_ringing": 12,
+    "shower": 13,
+    "sink_water_running": 14,
+    "snoring": 15,
+    "speech": 16,
+    "toilet_flush": 17,
+    "vacuum_cleaner": 18,
+    "water_boiling": 19
+}
+
+# Group sounds by category
+sound_categories = {
+    "Alerts": ["Alarm", "Doorbell", "Phone ringing", "Door knock", "Car horn"],
+    "Human": ["Speech", "Baby crying", "Footsteps", "Snoring", "Keyboard typing"],
+    "Animal": ["Dog barking", "Cat meowing"],
+    "Water": ["Sink water running", "Shower", "Toilet flush", "Water boiling"],
+    "Appliance": ["Microwave", "Vacuum cleaner"],
+    "Household": ["Dishes", "Glass breaking"]
+}
+
+# Priority levels for sounds (higher number = higher priority)
+sound_priorities = {
+    "Alarm": 10,
+    "Baby crying": 9,
+    "Door knock": 8,
+    "Doorbell": 8,
+    "Glass breaking": 8,
+    "Phone ringing": 7,
+    "Car horn": 7,
+    "Dog barking": 6,
+    "Cat meowing": 5,
+    "Speech": 5,
+    "Footsteps": 4,
+    "Toilet flush": 3,
+    "Shower": 3,
+    "Sink water running": 3,
+    "Water boiling": 3,
+    "Microwave": 2,
+    "Vacuum cleaner": 2,
+    "Dishes": 2,
+    "Keyboard typing": 1,
+    "Snoring": 1
 }
 
 # Enhanced threshold configuration with temporal smoothing

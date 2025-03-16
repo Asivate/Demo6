@@ -19,9 +19,10 @@ import time
 try:
     from vosk import Model, KaldiRecognizer, SetLogLevel
     VOSK_AVAILABLE = True
+    logger.info("Vosk speech recognition is available")
 except ImportError:
     VOSK_AVAILABLE = False
-    print("WARNING: Vosk not available. Install with: pip install vosk")
+    logger.warning("Vosk speech recognition is not available")
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -39,6 +40,98 @@ VOSK_MODEL_URLS = {
 
 # Define model download lock to prevent multiple simultaneous downloads
 model_download_lock = Lock()
+
+# Global Vosk model and recognizer
+_vosk_model = None
+_vosk_recognizer = None
+
+def initialize_vosk(sample_rate=16000):
+    """
+    Initialize Vosk speech recognition.
+    
+    Args:
+        sample_rate: Audio sample rate in Hz
+        
+    Returns:
+        bool: True if initialization was successful, False otherwise
+    """
+    global _vosk_model, _vosk_recognizer, VOSK_AVAILABLE
+    
+    if not VOSK_AVAILABLE:
+        logger.warning("Vosk is not available, cannot initialize")
+        return False
+    
+    try:
+        if _vosk_model is None:
+            logger.info("Initializing Vosk model...")
+            # Use small model for faster inference
+            _vosk_model = Model("models/vosk-model-small-en-us-0.15")
+            logger.info("Vosk model initialized successfully")
+        
+        if _vosk_recognizer is None:
+            logger.info(f"Initializing Vosk recognizer with sample rate {sample_rate} Hz...")
+            _vosk_recognizer = KaldiRecognizer(_vosk_model, sample_rate)
+            _vosk_recognizer.SetWords(True)
+            logger.info("Vosk recognizer initialized successfully")
+        
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error initializing Vosk: {str(e)}")
+        VOSK_AVAILABLE = False
+        return False
+
+def transcribe_with_vosk(audio_data, sample_rate=16000):
+    """
+    Transcribe audio data using Vosk speech recognition.
+    
+    Args:
+        audio_data: Numpy array of audio samples
+        sample_rate: Audio sample rate in Hz
+        
+    Returns:
+        dict: Transcription result with 'text' key,
+              or None if transcription failed
+    """
+    global _vosk_model, _vosk_recognizer, VOSK_AVAILABLE
+    
+    if not VOSK_AVAILABLE:
+        logger.warning("Vosk is not available, cannot transcribe")
+        return None
+    
+    try:
+        # Initialize Vosk if not already initialized
+        if _vosk_model is None or _vosk_recognizer is None:
+            if not initialize_vosk(sample_rate):
+                logger.error("Failed to initialize Vosk")
+                return None
+        
+        # Convert audio data to bytes
+        if isinstance(audio_data, np.ndarray):
+            # Convert to int16 and then to bytes
+            audio_bytes = (audio_data * 32767).astype(np.int16).tobytes()
+        else:
+            audio_bytes = audio_data
+        
+        # Process audio data
+        if _vosk_recognizer.AcceptWaveform(audio_bytes):
+            result = json.loads(_vosk_recognizer.Result())
+            text = result.get('text', '')
+            
+            if text:
+                logger.info(f"Vosk transcription: {text}")
+                return {'text': text, 'engine': 'vosk'}
+            else:
+                logger.debug("Vosk returned empty transcription")
+                return None
+        else:
+            # No speech detected
+            logger.debug("Vosk did not detect speech")
+            return None
+    
+    except Exception as e:
+        logger.error(f"Error transcribing with Vosk: {str(e)}")
+        return None
 
 # Define filter_hallucinations function similar to the one in speech_to_text.py
 def filter_hallucinations(text):
@@ -370,19 +463,4 @@ def get_vosk_transcriber():
     Returns:
         VoskSpeechToText: The singleton instance
     """
-    return VoskSpeechToText()
-
-# Simple function for direct transcription
-def transcribe_with_vosk(audio_data, sample_rate=16000):
-    """
-    Transcribe audio data to text using Vosk.
-    
-    Args:
-        audio_data (numpy.ndarray): The audio data as a numpy array
-        sample_rate (int): The sample rate of the audio (default: 16000)
-        
-    Returns:
-        str: The transcribed text
-    """
-    transcriber = get_vosk_transcriber()
-    return transcriber.transcribe(audio_data, sample_rate) 
+    return VoskSpeechToText() 

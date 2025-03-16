@@ -25,6 +25,10 @@ import threading
 import queue
 from transformers import pipeline
 import logging
+from functools import wraps
+import gc
+import sys
+import json
 
 # Import Vosk speech recognition
 try:
@@ -35,6 +39,11 @@ except ImportError:
 
 # Import continuous sentiment analyzer
 from continuous_sentiment_analysis import initialize_sentiment_analyzer, get_sentiment_analyzer
+
+# Thread-safe model access
+model_lock = threading.RLock()
+models = {}  # Dictionary to store loaded models
+prediction_count = 0  # Counter for predictions
 
 # Configure logging with more detailed format
 logging.basicConfig(
@@ -74,22 +83,25 @@ def timing_decorator(func):
     return wrapper
 
 # Import our AST model implementation
-import ast_model
+# import ast_model
 
-# Global flags for speech recognition - defined BEFORE they're referenced
-USE_GOOGLE_SPEECH_API = True  # Set to True to use Google Cloud Speech API (default)
+# Global flags for speech recognition
+USE_GOOGLE_SPEECH_API = True  # Set to False to disable Google Speech API
+SPEECH_ENGINE_AUTO = 0  # Automatically select the best engine
+SPEECH_ENGINE_GOOGLE = 1  # Force Google Speech API
+SPEECH_ENGINE_VOSK = 2  # Force Vosk (offline)
+CURRENT_SPEECH_ENGINE = SPEECH_ENGINE_AUTO  # Default to auto selection
 
-# Define speech recognition engine options
-SPEECH_ENGINE_AUTO = "auto"      # Use Google with Vosk fallback (default)
-SPEECH_ENGINE_GOOGLE = "google"  # Use Google only (no fallback)
-SPEECH_ENGINE_VOSK = "vosk"      # Use Vosk only (offline mode)
+# Global variables for conversation history
+MAX_CONVERSATION_HISTORY = 1000  # Maximum number of entries to keep
+conversation_history = []  # List to store conversation history
 
-# Current speech recognition engine setting
-SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_AUTO  # Default to automatic mode
-
-# Import our sentiment analysis modules
-from sentiment_analyzer import analyze_sentiment
-from google_speech import transcribe_with_google, GoogleSpeechToText
+# Global variables for sentiment analysis
+ENABLE_SENTIMENT_ANALYSIS = True  # Set to False to disable sentiment analysis
+SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
+APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
+PREDICTION_THRES = 0.5  # Threshold for sound prediction confidence
+DBLEVEL_THRES = 45  # Threshold for dB level to consider sound significant
 
 # Memory optimization settings
 MEMORY_OPTIMIZATION_LEVEL = os.environ.get('MEMORY_OPTIMIZATION', '1')  # 0=None, 1=Moderate, 2=Aggressive
@@ -129,7 +141,6 @@ def cleanup_memory():
             torch.cuda.empty_cache()
         else:
             # For CPU, trigger Python garbage collection
-            import gc
             gc.collect()
         logger.info(f"Memory cleanup performed (cycle {prediction_counter})")
 
@@ -206,16 +217,12 @@ last_notification_sound = None
 NOTIFICATION_COOLDOWN_SECONDS = 2.0  # Minimum seconds between notifications
 
 # Thresholds
-PREDICTION_THRES = 0.15  # Lower from 0.25/0.30 to 0.15
 FINGER_SNAP_THRES = 0.4  # Threshold for finger snap detection
-DBLEVEL_THRES = -60  # Minimum decibel level for sound detection
 SILENCE_THRES = -60  # Threshold for silence detection (increased from -75 to be more practical)
 SPEECH_SENTIMENT_THRES = 0.8  # Threshold for speech sentiment analysis
 CHOPPING_THRES = 0.7  # Threshold for chopping sound detection
 SPEECH_PREDICTION_THRES = 0.65  # Lowered from 0.7 to 0.65 for better speech detection
 SPEECH_DETECTION_THRES = 0.55  # Lowered from 0.6 to 0.55 for secondary speech detection
-SPEECH_BIAS_CORRECTION = 0.25  # Reduced from 0.3 to 0.25 to avoid excessive correction
-KNOCK_LOWER_THRESHOLD = 0.05  # Lower threshold for knock detection
 
 # Define critical sounds that get priority treatment
 CRITICAL_SOUNDS = {
@@ -228,9 +235,6 @@ CRITICAL_SOUNDS = {
     'alarm-clock': 0.30,      # Alarm clock - increased from 0.1
     'cooking': 0.40           # Added - Utensils and Cutlery
 }
-
-# Apply stronger speech bias correction since the model is heavily biased towards speech
-APPLY_SPEECH_BIAS_CORRECTION = True  # Flag to enable/disable bias correction
 
 # Define model-specific contexts based on SoundWatch research (20 high-priority sound classes)
 core_sounds = [
@@ -305,147 +309,76 @@ EMOTION_GROUPS = {
     "Unpleasant": ["sadness", "fear", "anger", "disgust", "disappointment", "embarrassment", "grief", "remorse", "annoyance", "disapproval"]
 }
 
-# Dictionary to store our models
-models = {
-    "tensorflow": None,
-    "ast": None,
-    "feature_extractor": None
-}
-
 # Keep track of active clients
 active_clients = set()
 
 # Initialize speech recognition systems
 google_speech_processor = None  # Will be lazy-loaded when needed
 
-# Load models
+# Determine if we should attempt to load the AST model
+USE_AST_MODEL = False  # Disable AST model completely
+
+# Define model paths
+MODEL_URL = "https://www.dropbox.com/s/cq1d7uqg0l28211/example_model.hdf5?dl=1"
+MODEL_PATH = "models/example_model.hdf5"
+
+# Create or load the models
 def load_models():
-    """Load all required models for sound recognition and speech processing."""
-    global models, USE_AST_MODEL, USE_GOOGLE_SPEECH_API
+    """Load or create the models."""
+    global USE_AST_MODEL, models, prediction_function, aggregator
     
-    # Initialize models dictionary
-    models = {
-        "tensorflow": None,
-        "ast": None,
-        "feature_extractor": None,
-        "sentiment_analyzer": None
-    }
+    models = {}
     
-    # Flag to determine which model to use
-    USE_AST_MODEL = os.environ.get('USE_AST_MODEL', '1') == '1'  # Default to enabled
-    print(f"AST model {'enabled' if USE_AST_MODEL else 'disabled'} based on environment settings")
+    # Skip AST model loading completely - we don't want to use it anymore
+    print("AST model disabled based on configuration")
     
-    # TensorFlow model settings
-    MODEL_URL = "https://www.dropbox.com/s/cq1d7uqg0l28211/example_model.hdf5?dl=1"
-    MODEL_PATH = "models/example_model.hdf5"
-    
-    # Load AST model first
-    try:
-        print("Loading AST model...")
-        with ast_lock:
-            # AST model loading settings
-            ast_kwargs = {
-                "torch_dtype": torch.float32  # Always use float32 for maximum compatibility
-            }
-            
-            # Use SDPA if available for better performance
-            if torch.__version__ >= '2.1.1':
-                ast_kwargs["attn_implementation"] = "sdpa"
-                print("Using Scaled Dot Product Attention (SDPA) for faster inference")
-            
-            print("Using standard precision (float32) for maximum compatibility")
-            
-            # Load model with explicit float32 precision
-            model_name = "MIT/ast-finetuned-audioset-10-10-0.4593"
-            models["ast"], models["feature_extractor"] = ast_model.load_ast_model(
-                model_name=model_name,
-                **ast_kwargs
-            )
-            
-            # Initialize class labels for aggregation
-            ast_model.initialize_class_labels(models["ast"])
-            print("AST model loaded successfully")
-    except Exception as e:
-        print(f"Error loading AST model: {e}")
-        traceback.print_exc()
-        USE_AST_MODEL = False  # Fall back to TensorFlow model if AST fails to load
-
-    # Optionally load TensorFlow model (as fallback or if USE_AST_MODEL is False)
+    # Load TensorFlow model
     model_filename = os.path.abspath(MODEL_PATH)
-    if not USE_AST_MODEL or True:  # We'll load it anyway as backup
-        print("Loading TensorFlow model as backup...")
-        os.makedirs(os.path.dirname(model_filename), exist_ok=True)
-        
-        homesounds_model = Path(model_filename)
-        if not homesounds_model.is_file():
-            print("Downloading example_model.hdf5 [867MB]: ")
-            wget.download(MODEL_URL, MODEL_PATH)
-        
-        print("Using TensorFlow model: %s" % (model_filename))
-        
-        try:
-            with tf_graph.as_default():
-                with tf_session.as_default():
-                    # Load model using a more explicit approach
-                    models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                    
-                    # Create function that uses the session directly
-                    model = models["tensorflow"]
-                    
-                    # Create a custom predict function that uses the session directly
-                    def custom_predict(x):
-                        # Get input and output tensors
-                        input_tensor = model.inputs[0]
-                        output_tensor = model.outputs[0]
-                        # Run prediction in the session
-                        return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                    
-                    # Replace the model's predict function with our custom one
-                    models["tensorflow"].predict = custom_predict
-                    model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                    
-                    # Test it
-                    dummy_input = np.zeros((1, 96, 64, 1))
-                    _ = models["tensorflow"].predict(dummy_input)
-                    print("Custom prediction function initialized successfully")
-            print("TensorFlow model loaded with compile=False option")
-        except Exception as e2:
-            print(f"Error with fallback method: {e2}")
-            traceback.print_exc()
-            try:
-                print("Trying third fallback method with explicit tensor names...")
-                with tf_graph.as_default():
-                    with tf_session.as_default():
-                        # Load model using a more explicit approach
-                        models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
-                        
-                        # Create function that uses the session directly
-                        model = models["tensorflow"]
-                        
-                        # Create a custom predict function that uses the session directly
-                        def custom_predict(x):
-                            # Get input and output tensors
-                            input_tensor = model.inputs[0]
-                            output_tensor = model.outputs[0]
-                            # Run prediction in the session
-                            return tf_session.run(output_tensor, feed_dict={input_tensor: x})
-                        
-                        # Replace the model's predict function with our custom one
-                        models["tensorflow"].predict = custom_predict
-                        model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
-                        
-                        # Test it
-                        dummy_input = np.zeros((1, 96, 64, 1))
-                        _ = models["tensorflow"].predict(dummy_input)
-                        print("Custom prediction function initialized successfully")
-                print("Third fallback method succeeded")
-            except Exception as e3:
-                print(f"Error with third fallback method: {e3}")
-                traceback.print_exc()
-                if not USE_AST_MODEL:
-                    raise Exception("Could not load TensorFlow model with any method, and AST model is not enabled")
+    print("Loading TensorFlow model...")
+    os.makedirs(os.path.dirname(model_filename), exist_ok=True)
+    
+    homesounds_model = Path(model_filename)
+    if not homesounds_model.is_file():
+        print("Downloading example_model.hdf5 [867MB]: ")
+        wget.download(MODEL_URL, MODEL_PATH)
+    
+    print("Using TensorFlow model: %s" % (model_filename))
+    
+    try:
+        with tf_graph.as_default():
+            with tf_session.as_default():
+                # Load model using a more explicit approach
+                models["tensorflow"] = tf.keras.models.load_model(model_filename, compile=False)
+                
+                # Create function that uses the session directly
+                model = models["tensorflow"]
+                
+                # Create a custom predict function that uses the session directly
+                def custom_predict(x):
+                    # Get input and output tensors
+                    input_tensor = model.inputs[0]
+                    output_tensor = model.outputs[0]
+                    # Run prediction in the session
+                    return tf_session.run(output_tensor, feed_dict={input_tensor: x})
+                
+                # Replace the model's predict function with our custom one
+                models["tensorflow"].predict = custom_predict
+                model_info["input_name"] = "custom_input"  # Not actually used with our custom predict
+                
+                # Test it
+                dummy_input = np.zeros((1, 96, 64, 1))
+                _ = custom_predict(dummy_input)
+                
+                # Set this as the default prediction function
+                prediction_function = custom_predict
+                print("Custom prediction function initialized successfully")
+        print("TensorFlow model loaded with compile=False option")
+    except Exception as e:
+        print(f"Error loading TensorFlow model: {e}")
+        traceback.print_exc()
+        raise Exception("Could not load TensorFlow model. Server cannot continue.")
 
-    print(f"Using {'AST' if USE_AST_MODEL else 'TensorFlow'} model as primary model")
+    print("Using TensorFlow model as primary model")
 
     # Load the sentiment analysis model
     try:
@@ -624,13 +557,15 @@ def handle_source(json_data):
     
     session['receive_count'] = session.get('receive_count', 0) + 1
     
-    if 'audio_data' not in json_data:
-        logger.warning("Received data without audio_data field")
+    # Check for the data field instead of audio_data
+    if 'data' not in json_data:
+        logger.warning("Received data without data field")
         return
 
-    # Decode audio data
+    # Convert the JSON array to a numpy array directly
     try:
-        audio_data = np.frombuffer(base64.b64decode(json_data['audio_data']), dtype=np.float32)
+        # Convert the array from JSON directly to numpy
+        audio_data = np.array(json_data['data'], dtype=np.float32)
         
         # Forward audio to continuous sentiment analyzer if available
         sentiment_analyzer = get_sentiment_analyzer()
@@ -817,7 +752,7 @@ def process_speech_with_sentiment(audio_data):
     vosk_fallback_used = False
     
     # Try Google Speech API first if enabled
-    if USE_GOOGLE_SPEECH_API and SPEECH_RECOGNITION_ENGINE != SPEECH_ENGINE_VOSK:
+    if USE_GOOGLE_SPEECH_API and CURRENT_SPEECH_ENGINE != SPEECH_ENGINE_VOSK:
         logger.info("Using Google Speech API for transcription")
         try:
             start_time = time.time()
@@ -836,7 +771,7 @@ def process_speech_with_sentiment(audio_data):
                 socketio.emit('error', {'message': f'Speech recognition issue: {google_api_error}'})
                 
                 # If we're in auto mode, try Vosk as fallback
-                if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
+                if CURRENT_SPEECH_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
                     logger.info("Falling back to Vosk for transcription")
                     vosk_fallback_used = True
                     try:
@@ -880,7 +815,7 @@ def process_speech_with_sentiment(audio_data):
             google_api_error = str(e)
             
             # If we're in auto mode, try Vosk as fallback
-            if SPEECH_RECOGNITION_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
+            if CURRENT_SPEECH_ENGINE == SPEECH_ENGINE_AUTO and VOSK_AVAILABLE:
                 logger.info("Falling back to Vosk for transcription due to Google API exception")
                 vosk_fallback_used = True
                 try:
@@ -941,24 +876,19 @@ def health_check():
     """API health check endpoint"""
     return jsonify({"status": "healthy", "timestamp": time.time()})
 
-@app.route('/status')
-def status():
-    """Return the status of the server, including model loading status."""
-    # Get the list of available IP addresses
-    ip_addresses = get_ip_addresses()
-    
-    # Return the status information
+@app.route('/api/status')
+def server_status():
+    """Return the current status of the server."""
     return jsonify({
         'status': 'running',
-        'tensorflow_model_loaded': models["tensorflow"] is not None,
-        'ast_model_loaded': models["ast"] is not None,
-        'using_ast_model': USE_AST_MODEL,
-        'speech_recognition': SPEECH_RECOGNITION_ENGINE,
-        'speech_google_available': USE_GOOGLE_SPEECH_API,
-        'speech_vosk_available': VOSK_AVAILABLE,
-        'sentiment_analysis_enabled': True,
-        'ip_addresses': ip_addresses,
-        'uptime': time.time() - start_time,
+        'uptime': format_time(time.time() - start_time),
+        'tensorflow_model_loaded': models.get("tensorflow") is not None,
+        'sentiment_analyzer_running': get_sentiment_analyzer() is not None,
+        'speech_recognition_engine': CURRENT_SPEECH_ENGINE,
+        'using_google_speech': USE_GOOGLE_SPEECH_API,
+        'model_info': model_info,
+        'memory_optimization': MEMORY_OPTIMIZATION_LEVEL,
+        'connected_clients': len(active_clients),
         'version': '1.2.0',
         'active_clients': len(active_clients)
     })
@@ -966,7 +896,7 @@ def status():
 @app.route('/api/toggle-speech-recognition', methods=['POST'])
 def toggle_speech_recognition():
     """Toggle Google Cloud Speech-to-Text on or off"""
-    global USE_GOOGLE_SPEECH_API, SPEECH_RECOGNITION_ENGINE
+    global USE_GOOGLE_SPEECH_API, CURRENT_SPEECH_ENGINE
     data = request.get_json()
     
     if data and 'use_google_speech' in data:
@@ -980,13 +910,13 @@ def toggle_speech_recognition():
     elif data and 'speech_engine' in data:
         engine = data['speech_engine']
         if engine in [SPEECH_ENGINE_AUTO, SPEECH_ENGINE_GOOGLE, SPEECH_ENGINE_VOSK]:
-            SPEECH_RECOGNITION_ENGINE = engine
+            CURRENT_SPEECH_ENGINE = engine
             USE_GOOGLE_SPEECH_API = (engine != SPEECH_ENGINE_VOSK)
-            logger.info(f"Speech recognition engine set to: {SPEECH_RECOGNITION_ENGINE}")
+            logger.info(f"Speech recognition engine set to: {CURRENT_SPEECH_ENGINE}")
             return jsonify({
                 "success": True,
-                "message": f"Speech recognition engine set to: {SPEECH_RECOGNITION_ENGINE}",
-                "speech_engine": SPEECH_RECOGNITION_ENGINE,
+                "message": f"Speech recognition engine set to: {CURRENT_SPEECH_ENGINE}",
+                "speech_engine": CURRENT_SPEECH_ENGINE,
                 "use_google_speech": USE_GOOGLE_SPEECH_API
             })
         else:
@@ -997,12 +927,12 @@ def toggle_speech_recognition():
             }), 400
     else:
         USE_GOOGLE_SPEECH_API = not USE_GOOGLE_SPEECH_API
-        SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_GOOGLE if USE_GOOGLE_SPEECH_API else SPEECH_ENGINE_VOSK
-        logger.info(f"Speech recognition toggled to: {SPEECH_RECOGNITION_ENGINE}")
+        CURRENT_SPEECH_ENGINE = SPEECH_ENGINE_GOOGLE if USE_GOOGLE_SPEECH_API else SPEECH_ENGINE_VOSK
+        logger.info(f"Speech recognition toggled to: {CURRENT_SPEECH_ENGINE}")
         return jsonify({
             "success": True,
-            "message": f"Speech recognition toggled to: {SPEECH_RECOGNITION_ENGINE}",
-            "speech_engine": SPEECH_RECOGNITION_ENGINE,
+            "message": f"Speech recognition toggled to: {CURRENT_SPEECH_ENGINE}",
+            "speech_engine": CURRENT_SPEECH_ENGINE,
             "use_google_speech": USE_GOOGLE_SPEECH_API
         })
 
@@ -1111,56 +1041,62 @@ def aggregate_predictions(new_prediction, label_list, is_speech=False):
         return aggregated
 
 @socketio.on('audio_feature_data')
-@debug_log
-@timing_decorator
-def handle_source(json_data):
-    """Handle pre-processed audio feature data sent from client."""
-    global last_prediction_time
+@performance_timer
+def handle_audio_feature_data(json_data):
+    """Handle audio feature data from clients."""
+    global prediction_count
     
     try:
-        current_time = time.time()
-        time_since_last = current_time - last_prediction_time
-        
-        if time_since_last < MIN_TIME_BETWEEN_PREDICTIONS:
-            logger.debug(f"Skipping audio feature processing due to rate limit ({time_since_last:.2f}s < {MIN_TIME_BETWEEN_PREDICTIONS:.2f}s)")
+        # Check if data field exists
+        if 'data' not in json_data:
+            logger.warning("Received audio feature data without 'data' field")
             return
-            
-        last_prediction_time = current_time
         
-        data = json_data.get('data', [])
-        db = json_data.get('db', 0)
-        time_data = json_data.get('time', 0)
-        record_time = json_data.get('record_time', None)
-        
-        logger.debug(f"Received audio data: db={db}, time={time_data}, record_time={record_time}")
-        logger.debug(f"Data shape: {len(data)} elements")
-        
-        if db < SILENCE_THRES:
-            logger.debug(f"Audio is silent: {db} dB < {SILENCE_THRES} dB threshold")
-            emit_sound_notification('Silent', '1.0', db, time_data, record_time)
-            return
-            
+        # Convert data to numpy array
         try:
-            x = np.array(data, dtype=np.float32)
-            logger.debug("Successfully converted data to numpy array directly")
-        except (ValueError, TypeError):
-            if isinstance(data, str):
-                data = data.strip("[]")
-                x = np.fromstring(data, dtype=np.float32, sep=',')
-                logger.debug("Successfully converted string data to numpy array")
-            else:
-                logger.error("Could not convert feature data to numpy array")
-                raise ValueError("Could not convert feature data to numpy array")
-                
-        x = x.reshape(1, 96, 64, 1)
-        logger.debug(f"Successfully reshaped audio features: {x.shape}")
+            audio_features = np.array(json_data['data'])
+            
+            # Reshape if needed (expected shape: (1, 96, 64, 1))
+            if audio_features.shape != (1, 96, 64, 1):
+                logger.warning(f"Unexpected audio feature shape: {audio_features.shape}, reshaping...")
+                if len(audio_features.shape) == 3:
+                    # Add batch dimension if missing
+                    audio_features = np.expand_dims(audio_features, axis=0)
+                if len(audio_features.shape) == 4 and audio_features.shape[3] != 1:
+                    # Add channel dimension if missing
+                    audio_features = np.expand_dims(audio_features, axis=3)
+        except Exception as e:
+            logger.error(f"Error converting audio feature data: {str(e)}")
+            return
         
-        logger.debug("Making prediction with TensorFlow model...")
-        pred = tensorflow_predict(x, db)
-        logger.debug(f"Raw prediction shape: {pred[0].shape}")
+        # Get dB level if available
+        db_level = None
+        try:
+            if 'db_level' in json_data:
+                db_level = float(json_data['db_level'])
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Error parsing dB level: {str(e)}")
         
+        # Process audio features with TensorFlow model
+        if audio_features is not None and audio_features.shape[0] > 0:
+            # Use model lock to ensure thread safety
+            with model_lock:
+                # Get TensorFlow model
+                tf_model = models.get("tensorflow")
+                if tf_model is not None:
+                    # Make prediction
+                    predictions = tf_model.predict(audio_features)
+                    
+                    # Process predictions
+                    process_predictions(predictions, db_level, json_data)
+                    
+                    # Increment prediction count
+                    prediction_count += 1
+                else:
+                    logger.warning("TensorFlow model not loaded, cannot process audio features")
+    
     except Exception as e:
-        logger.error(f"Error in audio_feature_data handler: {str(e)}", exc_info=True)
+        logger.error(f"Error handling audio feature data: {str(e)}")
         traceback.print_exc()
 
 # Adjust the notification cooldown settings
@@ -1214,56 +1150,47 @@ def should_send_notification(sound_label):
     return False
 
 # Function to emit sound notifications with cooldown management
-def emit_sound_notification(label, accuracy, db, time_data="", record_time="", sentiment_data=None):
-    """Emit sound notification with cooldown management."""
-    if label == 'Unrecognized Sound':
-        try:
-            db_level = float(db)
-            if db_level < UNRECOGNIZED_SOUND_MIN_DB:
-                logger.debug(f"Suppressing Unrecognized Sound notification due to low volume: {db_level} dB < {UNRECOGNIZED_SOUND_MIN_DB} dB threshold")
-                return
-        except (ValueError, TypeError):
-            pass
-            
-    if should_send_notification(label):
-        logger.debug(f"Emitting notification: {label} ({accuracy})")
-        
+def emit_sound_notification(sound_label, confidence, db_level, current_time, record_time):
+    """Emit sound notification to all connected clients."""
+    try:
+        # Create notification data
         notification_data = {
-            'label': label,
-            'accuracy': str(accuracy),
-            'db': str(db),
-            'time': str(time_data),
-            'record_time': str(record_time) if record_time else ''
+            'sound': sound_label,
+            'confidence': confidence,
+            'db_level': db_level,
+            'time': current_time,
+            'record_time': record_time
         }
         
-        if sentiment_data and isinstance(sentiment_data, dict):
-            if 'text' in sentiment_data:
-                notification_data['transcription'] = sentiment_data['text']
-            
-            if 'sentiment' in sentiment_data:
-                notification_data['sentiment'] = sentiment_data['sentiment']
-                if 'emoji' in sentiment_data['sentiment']:
-                    notification_data['emoji'] = sentiment_data['sentiment']['emoji']
-                
-                # Include original emotion for more detailed reporting
-                if 'original_emotion' in sentiment_data['sentiment']:
-                    notification_data['emotion'] = sentiment_data['sentiment']['original_emotion']
-            
-            if 'transcription_engine' in sentiment_data:
-                notification_data['transcription_engine'] = sentiment_data['transcription_engine']
-                logger.info(f"Speech recognized using {sentiment_data['transcription_engine']} engine")
-            
-            if 'google_api_error' in sentiment_data and sentiment_data['google_api_error']:
-                notification_data['google_api_error'] = sentiment_data['google_api_error']
-                logger.debug(f"Google API error included in notification: {sentiment_data['google_api_error']}")
-            
-            # Include timestamp if available
-            if 'timestamp' in sentiment_data:
-                notification_data['timestamp'] = sentiment_data['timestamp']
+        # Add to conversation history
+        add_to_conversation_history(notification_data)
         
-        socketio.emit('audio_label', notification_data)
-    else:
-        logger.debug(f"Notification for '{label}' suppressed due to cooldown")
+        # Emit to all clients
+        socketio.emit('sound_notification', notification_data)
+        logger.info(f"Emitted sound notification: {notification_data}")
+        
+        # Check if sentiment analysis is enabled
+        if ENABLE_SENTIMENT_ANALYSIS and sound_label.lower() == 'speech':
+            # Trigger sentiment analysis if speech is detected
+            analyze_sentiment(notification_data)
+    
+    except Exception as e:
+        logger.error(f"Error emitting sound notification: {str(e)}")
+        traceback.print_exc()
+
+def cleanup_memory():
+    """Perform memory cleanup to prevent memory leaks."""
+    try:
+        # Force garbage collection
+        gc.collect()
+        
+        # Clear any temporary variables
+        if 'tensorflow' in sys.modules:
+            import tensorflow as tf
+            tf.keras.backend.clear_session()
+            
+    except Exception as e:
+        logger.error(f"Error during memory cleanup: {str(e)}")
 
 @app.route('/api/conversation-history')
 def get_conversation_history():
@@ -1297,6 +1224,122 @@ def conversation_history_page():
     """Display conversation history with sentiment analysis in a web interface."""
     return send_from_directory(app.static_folder, 'conversation-history.html')
 
+def process_predictions(predictions, db_level, json_data):
+    """Process predictions from the model and emit notifications to clients."""
+    try:
+        # Apply speech bias correction if needed
+        if APPLY_SPEECH_BIAS_CORRECTION:
+            for i in range(len(predictions)):
+                speech_idx = homesounds.labels.get('speech', 4)  # Default to 4 if not found
+                
+                if speech_idx < len(predictions[i]):
+                    # Get original speech confidence
+                    original_confidence = predictions[i][speech_idx]
+                    
+                    # Apply appropriate correction based on audio level
+                    if db_level is not None and db_level > 70 and original_confidence > 0.8:
+                        correction = SPEECH_BIAS_CORRECTION * 0.5  # 50% of normal correction
+                    elif db_level is not None and db_level < DBLEVEL_THRES:
+                        correction = SPEECH_BIAS_CORRECTION * 1.5  # Higher correction for silence
+                    else:
+                        correction = SPEECH_BIAS_CORRECTION
+                    
+                    # Apply the correction
+                    predictions[i][speech_idx] -= correction
+                    predictions[i][speech_idx] = max(0.0, predictions[i][speech_idx])
+        
+        # Get record time if available
+        record_time = json_data.get('record_time', str(time.time()))
+        current_time = json_data.get('time', str(time.time()))
+        
+        # Aggregate predictions for better accuracy
+        for i, pred in enumerate(predictions):
+            # Find the most likely sound and its confidence
+            best_idx = np.argmax(pred)
+            confidence = pred[best_idx]
+            sound_label = homesounds.to_human_labels.get(best_idx, "Unknown")
+            
+            # Check if confidence exceeds threshold
+            if confidence > PREDICTION_THRES and (db_level is None or db_level > DBLEVEL_THRES):
+                logger.info(f"Sound detected: {sound_label} with confidence {confidence:.4f}")
+                
+                # Emit sound notification to clients
+                emit_sound_notification(sound_label, str(confidence), 
+                                     str(db_level) if db_level is not None else "0", 
+                                     current_time, record_time)
+                
+                # Perform memory cleanup
+                cleanup_memory()
+                
+    except Exception as e:
+        logger.error(f"Error processing predictions: {str(e)}")
+        traceback.print_exc()
+
+def add_to_conversation_history(notification_data):
+    """Add notification to conversation history."""
+    try:
+        # Create a copy of the notification data with additional fields
+        history_entry = notification_data.copy()
+        history_entry['timestamp'] = time.time()
+        
+        # Add to conversation history list (limit size to prevent memory issues)
+        conversation_history.append(history_entry)
+        if len(conversation_history) > MAX_CONVERSATION_HISTORY:
+            conversation_history.pop(0)  # Remove oldest entry
+            
+        # Save to file periodically
+        if len(conversation_history) % 10 == 0:
+            save_conversation_history()
+            
+    except Exception as e:
+        logger.error(f"Error adding to conversation history: {str(e)}")
+
+def save_conversation_history():
+    """Save conversation history to a file."""
+    try:
+        with open('conversation_history.json', 'w') as f:
+            json.dump(conversation_history, f)
+        logger.info(f"Saved conversation history with {len(conversation_history)} entries")
+    except Exception as e:
+        logger.error(f"Error saving conversation history: {str(e)}")
+
+def analyze_sentiment(notification_data):
+    """Analyze sentiment of speech and emit sentiment notification."""
+    try:
+        # For now, just generate a random sentiment as a placeholder
+        # In a real implementation, this would use a sentiment analysis model
+        import random
+        sentiments = ['positive', 'neutral', 'negative']
+        sentiment = random.choice(sentiments)
+        confidence = random.uniform(0.7, 0.95)
+        
+        # Create sentiment notification data
+        sentiment_data = {
+            'sentiment': sentiment,
+            'confidence': str(confidence),
+            'original_notification': notification_data
+        }
+        
+        # Emit sentiment notification
+        socketio.emit('sentiment_notification', sentiment_data)
+        logger.info(f"Emitted sentiment notification: {sentiment_data}")
+        
+    except Exception as e:
+        logger.error(f"Error analyzing sentiment: {str(e)}")
+        traceback.print_exc()
+
+# Performance timer decorator
+def performance_timer(func):
+    """Decorator to log execution time for functions."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        logger.debug(f"{func.__name__} executed in {(end_time - start_time)*1000:.2f} ms")
+        return result
+    return wrapper
+
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
     parser = argparse.ArgumentParser(description='Sonarity Audio Analysis Server')
@@ -1316,12 +1359,12 @@ if __name__ == '__main__':
     
     # Update speech recognition setting based on command line arguments
     if args.speech_engine:
-        SPEECH_RECOGNITION_ENGINE = args.speech_engine
-        USE_GOOGLE_SPEECH_API = (SPEECH_RECOGNITION_ENGINE != SPEECH_ENGINE_VOSK)
-        logger.info(f"Using speech recognition engine: {SPEECH_RECOGNITION_ENGINE}")
+        CURRENT_SPEECH_ENGINE = args.speech_engine
+        USE_GOOGLE_SPEECH_API = (CURRENT_SPEECH_ENGINE != SPEECH_ENGINE_VOSK)
+        logger.info(f"Using speech recognition engine: {CURRENT_SPEECH_ENGINE}")
     elif not args.use_google_speech:
         USE_GOOGLE_SPEECH_API = False
-        SPEECH_RECOGNITION_ENGINE = SPEECH_ENGINE_VOSK
+        CURRENT_SPEECH_ENGINE = SPEECH_ENGINE_VOSK
         logger.info("Using Vosk for speech recognition (Google Speech API disabled)")
     else:
         USE_GOOGLE_SPEECH_API = True
