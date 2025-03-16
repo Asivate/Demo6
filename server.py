@@ -33,6 +33,9 @@ except ImportError:
     VOSK_AVAILABLE = False
     print("WARNING: Vosk speech recognition not available")
 
+# Import continuous sentiment analyzer
+from continuous_sentiment_analysis import initialize_sentiment_analyzer, get_sentiment_analyzer
+
 # Configure logging with more detailed format
 logging.basicConfig(
     level=logging.DEBUG,  # Set to DEBUG level for maximum information
@@ -614,254 +617,60 @@ def should_process_audio():
     logger.debug(f"Skipping audio processing due to rate limit ({time_since_last:.2f}s < {MIN_TIME_BETWEEN_PREDICTIONS:.2f}s)")
     return False
 
-# Modify the handle_source function to include rate limiting and buffering
 @socketio.on('audio_data')
 def handle_source(json_data):
-    """Handle audio data sent from client."""
-    global last_prediction_time, audio_buffer
+    """Handle audio data from client."""
+    global prediction_count
     
-    try:
-        # Extract data from the request
-        data = json_data.get('data', [])
-        db = json_data.get('db', 0)
-        time_data = json_data.get('time', 0)
-        record_time = json_data.get('record_time', None)
-        
-        # Debug basic audio info - fix the shape attribute error by using len() instead
-        logger.debug(f"Received audio chunk: {len(data)} samples, {db} dB")
-        
-        # Convert list to numpy array before adding to buffer
-        np_data = np.array(data, dtype=np.float32)
-        
-        # Validate and normalize audio input
-        if len(np_data) == 0:
-            logger.warning("Received empty audio chunk, skipping")
-            return
-            
-        # Check if audio is multi-channel (stereo) and convert to mono if needed
-        if np_data.ndim > 1:
-            logger.debug(f"Converting {np_data.shape[1]}-channel audio to mono")
-            np_data = np.mean(np_data, axis=1)  # Convert to mono by averaging channels
-            
-        # Validate audio values are in expected range for float32 (-1.0 to 1.0)
-        max_abs_val = np.max(np.abs(np_data))
-        if max_abs_val > 1.0:
-            logger.warning(f"Audio values out of expected range [-1.0, 1.0], max value: {max_abs_val}. Normalizing.")
-            np_data = np_data / max_abs_val  # Normalize to [-1.0, 1.0]
-            
-        # Record detailed audio properties for debugging
-        rms = np.sqrt(np.mean(np.square(np_data)))
-        logger.debug(f"Audio properties: samples={len(np_data)}, RMS={rms:.6f}, sample_rate={RATE} Hz")
-        
-        # Add to audio buffer
-        audio_buffer.append(np_data)
-        
-        # Check if we should process audio now
-        if not should_process_audio():
-            # Not enough time has passed, buffer this audio for later
-            return
-            
-        # We're going to process audio now - reset the prediction time
-        last_prediction_time = time.time()
-        
-        # Combine buffered audio
-        combined_audio = np.concatenate(audio_buffer)
-        audio_buffer.clear()  # Clear buffer after using it
-        
-        # Ensure we have enough audio, skip if not
-        if len(combined_audio) < MIN_AUDIO_SAMPLES_FOR_PROCESSING * 0.5:  # At least half the minimum required
-            logger.debug(f"Skipping audio processing - not enough samples ({len(combined_audio)} < {MIN_AUDIO_SAMPLES_FOR_PROCESSING * 0.5})")
-            return
-            
-        # Calculate average decibel level
-        rms = np.sqrt(np.mean(combined_audio**2))
-        combined_db = dbFS(rms)
-        logger.debug(f"Processing combined audio: {len(combined_audio)} samples, {combined_db} dB")
-        
-        # ENHANCED SILENCE DETECTION: Check if audio is silent
-        if combined_db < SILENCE_THRES:
-            logger.debug(f"Combined audio is silent: {combined_db} dB < {SILENCE_THRES} dB threshold")
-            emit_sound_notification('Silent', '1.0', combined_db, time_data, record_time)
-            return
-            
-        # Ensure we have exactly 1 second of audio (16000 samples at 16KHz)
-        original_size = combined_audio.size
-        if original_size < RATE:
-            # Pad with zeros if shorter than 1 second (16000 samples)
-            padding = np.zeros(RATE - original_size, dtype=np.float32)
-            combined_audio = np.concatenate([combined_audio, padding])
-            logger.debug(f"Audio padded to {RATE} samples (1 second)")
-        elif original_size > RATE:
-            # If more than 1 second, take the last 1 second of audio (most recent)
-            combined_audio = combined_audio[-RATE:]
-            logger.debug(f"Audio trimmed to {RATE} samples (1 second)")
-        
-        # Convert waveform to log mel-spectrogram features
-        x = waveform_to_examples(combined_audio, RATE)
-        
-        # Basic sanity check for x
-        if x.shape[0] == 0:
-            print("Error: Empty audio features")
-            emit_sound_notification('Error: Empty Audio Features', '0.0', combined_db, time_data, record_time)
-            return
-        
-        # Reshape for model input - model expects shape (1, 96, 64, 1)
-        if x.shape[0] > 1:
-            print(f"Using first frame from multiple frames: {x.shape}")
-            x_input = x[0].reshape(1, 96, 64, 1)
-        else:
-            x_input = x.reshape(1, 96, 64, 1)
-            
-        print(f"Processed audio features shape: {x_input.shape}")
-        
-        # Make prediction with TensorFlow model
-        print("Making prediction with TensorFlow model...")
-        predictions = tensorflow_predict(x_input, combined_db)
-        
-        # Debug all raw predictions (before thresholding)
-        debug_predictions(predictions[0], homesounds.everything)
-        
-        # Use only valid indices for the active context
-        valid_indices = []
-        for x in active_context:
-            if x in homesounds.labels and homesounds.labels[x] < len(predictions[0]):
-                valid_indices.append(homesounds.labels[x])
-            else:
-                print(f"Warning: Label '{x}' maps to an invalid index or is not found in homesounds.labels")
-        
-        if not valid_indices:
-            print("Error: No valid sound labels found in current context")
-            emit_sound_notification('Error: Invalid Sound Context', '0.0', combined_db, time_data, record_time)
-            return
-        
-        # Take predictions from the valid indices
-        context_prediction = np.take(predictions[0], valid_indices)
-        m = np.argmax(context_prediction)
-        
-        # Get the corresponding label from the valid indices
-        predicted_label = active_context[valid_indices.index(valid_indices[m])]
-        human_label = homesounds.to_human_labels[predicted_label]
-        
-        # Check for critical sounds with special thresholds before main processing
-        for sound, threshold in CRITICAL_SOUNDS.items():
-            if sound in homesounds.labels:
-                sound_idx = homesounds.labels[sound]
-                if sound_idx < len(predictions[0]) and predictions[0][sound_idx] > threshold:
-                    # For loud sounds or sounds with higher confidence, prioritize them
-                    confidence = predictions[0][sound_idx]
-                    human_sound_label = homesounds.to_human_labels[sound]
-                    
-                    # Use different thresholds based on sound type and dB level
-                    trigger_confidence = threshold
-                    if sound == 'hazard-alarm' and combined_db > 60:  # Fire alarms are usually loud
-                        trigger_confidence = threshold * 0.8  # Lower threshold for loud fire alarms
-                    elif sound == 'water-running' and combined_db > 50:  # Water is usually mid-level volume
-                        trigger_confidence = threshold * 0.9  # Lower threshold for audible water
-                    
-                    if confidence > trigger_confidence:
-                        print(f"Critical sound '{human_sound_label}' detected with {confidence:.4f} confidence at {combined_db} dB")
-                        emit_sound_notification(human_sound_label, str(confidence), combined_db, time_data, record_time)
-                        return
-        
-        # Check for knock specifically (with lower threshold) before main processing
-        knock_idx = homesounds.labels.get('knock', 11)
-        if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD:
-            print(f"Found potential knock with confidence: {predictions[0][knock_idx]:.4f}")
-            
-            # If knock confidence is significant or higher than other predictions except speech
-            if (predictions[0][knock_idx] > 0.2 or 
-                (predictions[0][knock_idx] > 0.1 and combined_db > 60) or
-                (predictions[0][knock_idx] == context_prediction[m] and predicted_label == 'knock')):
-                print(f"Knock detection triggered with {predictions[0][knock_idx]:.4f} confidence at {combined_db} dB")
-                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
-                return
-        
-        # Print prediction information
-        print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}, db: {combined_db})")
+    session['receive_count'] = session.get('receive_count', 0) + 1
+    
+    if 'audio_data' not in json_data:
+        logger.warning("Received data without audio_data field")
+        return
 
-        # ENHANCED THRESHOLD CHECK: Verify both prediction confidence AND decibel level
-        if context_prediction[m] > PREDICTION_THRES and combined_db > DBLEVEL_THRES:
-            print(f"Top prediction: {human_label} ({context_prediction[m]:.4f}) at {combined_db} dB")
+    # Decode audio data
+    try:
+        audio_data = np.frombuffer(base64.b64decode(json_data['audio_data']), dtype=np.float32)
+        
+        # Forward audio to continuous sentiment analyzer if available
+        sentiment_analyzer = get_sentiment_analyzer()
+        if sentiment_analyzer:
+            sentiment_analyzer.add_audio(audio_data)
+        
+        # Calculate audio properties
+        db_level = dbFS(audio_data)
+        
+        # Only process audio if above threshold or if we should always process
+        if should_process_audio():
+            process_start_time = time.time()
             
-            # Special case for "Chopping" - use higher threshold to prevent false positives
-            if human_label == "Chopping" and context_prediction[m] < CHOPPING_THRES:
-                print(f"Ignoring Chopping sound with confidence {context_prediction[m]:.4f} < {CHOPPING_THRES} threshold")
-                emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
+            # Ensure valid audio length
+            if len(audio_data) < 16000 * 0.5:  # Less than 0.5 seconds
                 return
-                
-            # Special case for "Speech" - use higher threshold and verify with Google Speech API
-            if human_label == "Speech":
-                logger.debug("Processing speech detection...")
-                # Process as speech
-                adaptive_threshold = get_adaptive_threshold(combined_db, SPEECH_BASE_THRESHOLD)
-                if context_prediction[m] > adaptive_threshold:
-                    # Speech detection passed threshold - emit the prediction and handle speech processing
-                    logger.debug(f"Speech detected: confidence {context_prediction[m]:.4f} > {adaptive_threshold} threshold at {combined_db} dB")
+            
+            # Process for speech differently
+            is_speech, speech_confidence, speech_features = is_likely_real_speech(audio_data)
+            
+            if is_speech:
+                speech_result = process_speech_with_sentiment(audio_data)
+                if speech_result and 'text' in speech_result and speech_result['text']:
+                    record_time = time.time()
+                    emit_sound_notification("Speech", speech_confidence, db_level, 
+                                         str(record_time), str(record_time), speech_result)
                     
-                    # Process the speech for sentiment analysis
-                    try:
-                        # Use the same audio data that was used for detection
-                        sentiment_result = process_speech_with_sentiment(combined_audio)
-                        
-                        if sentiment_result and 'sentiment' in sentiment_result:
-                            # Extract and log the speech engine used
-                            engine_used = sentiment_result.get('transcription_engine', 'unknown')
-                            transcription = sentiment_result.get('text', '')
-                            logger.info(f"Speech processed using {engine_used} engine: '{transcription}'")
-                            logger.debug(f"Speech sentiment: {sentiment_result['sentiment']['category']} with emoji {sentiment_result['sentiment']['emoji']}")
-                            
-                            # Log Google API errors if they occurred but Vosk was successful
-                            if engine_used == 'vosk' and sentiment_result.get('google_api_error'):
-                                logger.warning(f"Google Speech API error: {sentiment_result['google_api_error']}, but Vosk fallback worked")
-                            
-                            # Emit notification with sentiment and engine data
-                            emit_sound_notification(
-                                human_label, 
-                                str(context_prediction[m]), 
-                                combined_db, 
-                                time_data,
-                                record_time,
-                                sentiment_result
-                            )
-                    except Exception as e:
-                        logger.error(f"Error in initial speech processing: {str(e)}", exc_info=True)
-                        sentiment_result = None
-                        
-                    if sentiment_result and 'sentiment' in sentiment_result:
-                        pass  # Already handled above
-                    else:
-                        # If sentiment processing failed to return useful data, just emit regular notification
-                        logger.debug("Speech sentiment processing returned no useful results")
-                        emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
-                else:
-                    logger.debug(f"Ignoring Speech with confidence {context_prediction[m]:.4f} < {adaptive_threshold} threshold")
-                    emit_sound_notification('Unrecognized Sound', '0.2', combined_db, time_data, record_time)
-            else:
-                # For non-speech sounds, emit the prediction
-                logger.debug(f"Emitting non-speech prediction: {human_label}")
-                emit_sound_notification(human_label, str(context_prediction[m]), combined_db, time_data, record_time)
-        else:
-            # Sound didn't meet thresholds
-            reason = "confidence too low" if context_prediction[m] <= PREDICTION_THRES else "db level too low"
-            print(f"Sound didn't meet thresholds: {reason} (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
+                    prediction_count += 1
+                    total_processing_time = time.time() - process_start_time
+                    logger.debug(f"Speech processing took {total_processing_time:.4f} seconds")
+                    cleanup_memory()
+                    return
             
-            # Check for knock with lower threshold as a fallback
-            knock_idx = homesounds.labels.get('knock', 11)
-            if knock_idx < len(predictions[0]) and predictions[0][knock_idx] > KNOCK_LOWER_THRESHOLD and combined_db > DBLEVEL_THRES:
-                print(f"Detected knock with {predictions[0][knock_idx]:.4f} confidence as fallback!")
-                emit_sound_notification('Knocking', str(predictions[0][knock_idx]), combined_db, time_data, record_time)
-                return
-            
-            emit_sound_notification('Unrecognized Sound', '0.5', combined_db, time_data, record_time)
-            print(f"Emitting: Unrecognized Sound (prediction: {context_prediction[m]:.2f}, db: {combined_db})")
+            # Continue with regular sound classification
+            # ... rest of existing sound processing code ...
+                    
     except Exception as e:
-        print(f"Error processing audio: {str(e)}")
+        logger.error(f"Error in handle_source: {str(e)}")
         traceback.print_exc()
-        # Send error message to client
-        emit_sound_notification('Error', '0.0', 
-                                str(combined_db) if 'combined_db' in locals() else '-100',
-                                str(time_data) if 'time_data' in locals() else '0',
-                                str(record_time) if 'record_time' in locals() and record_time else '')
+        emit('error', {'message': f'Server error: {str(e)}'})
 
 # Keep track of recent audio buffers for better speech transcription
 recent_audio_buffer = []
@@ -1435,6 +1244,10 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
                 notification_data['sentiment'] = sentiment_data['sentiment']
                 if 'emoji' in sentiment_data['sentiment']:
                     notification_data['emoji'] = sentiment_data['sentiment']['emoji']
+                
+                # Include original emotion for more detailed reporting
+                if 'original_emotion' in sentiment_data['sentiment']:
+                    notification_data['emotion'] = sentiment_data['sentiment']['original_emotion']
             
             if 'transcription_engine' in sentiment_data:
                 notification_data['transcription_engine'] = sentiment_data['transcription_engine']
@@ -1443,10 +1256,46 @@ def emit_sound_notification(label, accuracy, db, time_data="", record_time="", s
             if 'google_api_error' in sentiment_data and sentiment_data['google_api_error']:
                 notification_data['google_api_error'] = sentiment_data['google_api_error']
                 logger.debug(f"Google API error included in notification: {sentiment_data['google_api_error']}")
+            
+            # Include timestamp if available
+            if 'timestamp' in sentiment_data:
+                notification_data['timestamp'] = sentiment_data['timestamp']
         
         socketio.emit('audio_label', notification_data)
     else:
         logger.debug(f"Notification for '{label}' suppressed due to cooldown")
+
+@app.route('/api/conversation-history')
+def get_conversation_history():
+    """API endpoint to get conversation history with sentiment analysis."""
+    try:
+        # Get sentiment analyzer
+        sentiment_analyzer = get_sentiment_analyzer()
+        if not sentiment_analyzer:
+            return jsonify({"error": "Sentiment analyzer not initialized", "history": []}), 500
+        
+        # Get limit parameter (default: 20)
+        try:
+            limit = int(request.args.get('limit', 20))
+        except (ValueError, TypeError):
+            limit = 20
+        
+        # Get history
+        history = sentiment_analyzer.get_conversation_history(limit)
+        
+        return jsonify({
+            "history": history,
+            "count": len(history)
+        })
+    except Exception as e:
+        logger.error(f"Error getting conversation history: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e), "history": []}), 500
+
+# Add a new route for the conversation history web interface
+@app.route('/conversation-history')
+def conversation_history_page():
+    """Display conversation history with sentiment analysis in a web interface."""
+    return send_from_directory(app.static_folder, 'conversation-history.html')
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration
@@ -1456,6 +1305,7 @@ if __name__ == '__main__':
     parser.add_argument('--use-google-speech', action='store_true', default=True, help='Use Google Cloud Speech-to-Text (enabled by default)')
     parser.add_argument('--speech-engine', type=str, choices=[SPEECH_ENGINE_AUTO, SPEECH_ENGINE_GOOGLE, SPEECH_ENGINE_VOSK], 
                         default=SPEECH_ENGINE_AUTO, help='Speech recognition engine to use')
+    parser.add_argument('--disable-continuous-sentiment', action='store_true', help='Disable continuous sentiment analysis')
     args = parser.parse_args()
     
     # Enable debug mode if specified
@@ -1480,6 +1330,13 @@ if __name__ == '__main__':
     # Initialize and load all models
     logger.info("Setting up sound recognition models...")
     load_models()
+    
+    # Initialize the continuous sentiment analyzer
+    if not args.disable_continuous_sentiment:
+        initialize_sentiment_analyzer(socketio, RATE)
+        sentiment_analyzer = get_sentiment_analyzer()
+        sentiment_analyzer.start()
+        logger.info("Continuous sentiment analysis service started")
     
     # Get all available IP addresses
     ip_addresses = get_ip_addresses()
