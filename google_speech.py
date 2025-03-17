@@ -517,19 +517,19 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         # Perform the transcription
         logger.info("Sending audio to Google Cloud Speech API...")
         try:
-            response = client.recognize(config=config, audio=audio)
-            
-            # Process the response
-            if not response.results:
+        response = client.recognize(config=config, audio=audio)
+        
+        # Process the response
+        if not response.results:
                 logger.warning("No transcription results returned from Google Speech API")
                 return ""
-            
-            # Get the most likely transcription
-            transcription = response.results[0].alternatives[0].transcript
+        
+        # Get the most likely transcription
+        transcription = response.results[0].alternatives[0].transcript
             confidence = response.results[0].alternatives[0].confidence
             logger.info(f"Google Speech API transcription result: '{transcription}' (confidence: {confidence:.2f})")
-            
-            # Return the transcription
+        
+        # Return the transcription
             return transcription
         except Exception as e:
             logger.error(f"Error in Google Speech API recognize call: {e}")
@@ -538,7 +538,7 @@ def transcribe_with_google(audio_data, sample_rate=16000):
                 logger.error("You need to give your service account the 'Speech API user' role")
                 logger.error("Go to the Google Cloud Console -> IAM -> Edit service account -> Add 'Speech API user' role")
             return ""
-            
+        
     except Exception as e:
         # Format detailed error information for easier debugging
         error_message = f"Google Cloud Speech API error: {str(e)}"
