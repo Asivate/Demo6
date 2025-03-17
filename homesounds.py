@@ -163,6 +163,10 @@ GLASS_BREAKING_IDX = 9  # Current index for Glass breaking in to_human_labels
 # Define percussive sounds that need special handling
 percussive_sounds = ['Door knock', 'Glass breaking', 'Dishes']
 
+# Add missing threshold constants
+PREDICTION_THRES = 0.3  # Default prediction threshold for sound detection
+DBLEVEL_THRES = -30  # Threshold for dB level to consider sound significant
+
 # Define sound-specific thresholds
 sound_specific_thresholds = {
     'Door knock': 0.15,   # Lower threshold for knock detection (from 0.3 to 0.15)
