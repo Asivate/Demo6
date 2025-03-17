@@ -84,8 +84,8 @@ transcript_history = []  # List to store transcription history
 ENABLE_SENTIMENT_ANALYSIS = True  # Set to False to disable sentiment analysis
 SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
 APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
-PREDICTION_THRES = 0.05  # Threshold for sound prediction confidence (lowered from 0.5 to 0.05)
-DBLEVEL_THRES = 35  # Threshold for dB level to consider sound significant (lowered from 45)
+PREDICTION_THRES = 0.5  # Threshold for sound prediction confidence (restored from original implementation)
+DBLEVEL_THRES = -30  # Threshold for dB level to consider sound significant (restored from original implementation)
 TARGET_SR = 16000  # Target sample rate for audio processing
 
 # Audio buffers for continuous processing
@@ -853,14 +853,15 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                     dishes_idx = 4  # Based on to_human_labels mapping
                     
                     # Boost these indices if they have even minimal activation
-                    if prediction[knock_idx] > 0.001:  # Very low threshold
-                        prediction[knock_idx] *= 2.0  # Double the confidence
+                    if prediction[knock_idx] > 0.1:  # Reasonable threshold
+                        # Boost the confidence by a reasonable amount
+                        prediction[knock_idx] *= 1.3  # 30% boost
                         logger.info(f"Boosted Door knock confidence due to percussive event: {prediction[knock_idx]:.4f}")
                     
-                    # If dishes is high but knock has any activation, it might be a knock misclassified as dishes
-                    if prediction[dishes_idx] > 0.02 and prediction[knock_idx] > 0.001:
+                    # If dishes is high but knock has reasonable activation, it might be a knock misclassified as dishes
+                    if prediction[dishes_idx] > 0.3 and prediction[knock_idx] > 0.1:
                         # Transfer some confidence from dishes to knock
-                        transfer = prediction[dishes_idx] * 0.3  # Transfer 30% of dishes confidence
+                        transfer = prediction[dishes_idx] * 0.2  # Transfer 20% of dishes confidence
                         prediction[dishes_idx] -= transfer
                         prediction[knock_idx] += transfer
                         logger.info(f"Transferred confidence from Dishes to Door knock: {transfer:.4f}")
@@ -904,14 +905,15 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                     best_class = sound_class
             
             # Special case: if we detected a percussive event but no class is above threshold
-            # and "Door knock" has any confidence at all, boost it
+            # and "Door knock" has reasonable confidence, consider it a knock
             if is_percussive and (best_class is None or best_confidence < PREDICTION_THRES):
                 knock_confidence = homesounds.detection_history.get_smoothed_confidence("Door knock")
-                if knock_confidence > 0.001:  # Very minimal threshold
-                    # Force a door knock detection
+                knock_threshold = homesounds.sound_specific_thresholds.get("Door knock", PREDICTION_THRES)
+                if knock_confidence > knock_threshold * 0.7:  # At least 70% of threshold
+                    # Set door knock as best class with boosted confidence
                     best_class = "Door knock"
-                    best_confidence = max(knock_confidence * 3, 0.03) # Ensure it passes the threshold
-                    logger.info(f"Forcing Door knock detection due to percussive event: {knock_confidence:.4f} → {best_confidence:.4f}")
+                    best_confidence = knock_confidence * 1.3  # 30% boost
+                    logger.info(f"Detected Door knock with boosted confidence: {knock_confidence:.4f} → {best_confidence:.4f}")
             
             if best_class is None:
                 logger.info("No sound class met the confidence threshold, skipping notification")
@@ -1023,6 +1025,11 @@ def handle_audio_feature_data(data):
             except (ValueError, TypeError):
                 logger.warning(f"Invalid dB level format: {data.get('db')}")
                 db_level = -100  # Default low value
+                
+        # Skip if audio level is too low
+        if db_level is not None and db_level < DBLEVEL_THRES:
+            logger.info(f"Audio level too low: {db_level} dB < threshold {DBLEVEL_THRES} dB")
+            return
                 
         # Process prediction with thread-safe model access
         with model_lock:

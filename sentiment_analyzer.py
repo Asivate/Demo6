@@ -47,8 +47,7 @@ def _get_sentiment_model():
         try:
             _sentiment_model = pipeline(
                 "text-classification", 
-                model="j-hartmann/emotion-english-distilroberta-base", 
-                top_k=None
+                model="j-hartmann/emotion-english-distilroberta-base"
             )
             logger.info("Sentiment analysis model loaded successfully")
         except Exception as e:
