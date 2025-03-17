@@ -61,7 +61,14 @@ except ImportError:
     logger.warning("Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
 
 # Import continuous sentiment analyzer
-from continuous_sentiment_analysis import initialize_sentiment_analyzer, get_sentiment_analyzer, analyze_text_sentiment
+from continuous_sentiment_analysis import initialize_sentiment_analyzer, get_sentiment_analyzer
+try:
+    from sentiment_analyzer import analyze_sentiment
+    SENTIMENT_ANALYZER_AVAILABLE = True
+    logger.info("Sentiment analyzer module is available")
+except ImportError:
+    SENTIMENT_ANALYZER_AVAILABLE = False
+    logger.warning("Sentiment analyzer module not available. Some functionality may be limited.")
 
 # Thread-safe model access
 model_lock = threading.RLock()
@@ -124,11 +131,16 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 logger.info("Sentiment analysis pipeline initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize sentiment analysis pipeline: {e}")
+                logger.error(traceback.format_exc())
                 self.sentiment_pipeline = None
     
     def add_audio_data(self, audio_data, sample_rate):
         """Add audio data to the processing queue"""
-        self.audio_queue.put((audio_data, sample_rate))
+        if self.running and audio_data is not None and len(audio_data) > 0:
+            logger.debug(f"Adding audio data to queue, length: {len(audio_data)}")
+            self.audio_queue.put((audio_data, sample_rate))
+        else:
+            logger.warning(f"Not adding audio data to queue: running={self.running}, audio_data_length={len(audio_data) if audio_data is not None else 'None'}")
     
     def run(self):
         """Main thread loop for continuous speech analysis"""
@@ -139,6 +151,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 # Process audio data from the queue if available
                 try:
                     audio_data, sample_rate = self.audio_queue.get(timeout=0.5)
+                    logger.debug(f"Got audio data from queue, length: {len(audio_data)}")
                     self.process_audio(audio_data, sample_rate)
                 except queue.Empty:
                     # No data in queue, continue to next iteration
@@ -147,6 +160,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 # Check if it's time to analyze sentiment
                 current_time = time.time()
                 if current_time - self.last_sentiment_time >= self.sentiment_interval and self.transcript:
+                    logger.info(f"Time to analyze sentiment, transcript length: {len(self.transcript)}")
                     self.analyze_sentiment()
                     self.last_sentiment_time = current_time
                     
@@ -160,13 +174,16 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
     def process_audio(self, audio_data, sample_rate):
         """Process audio data for transcription"""
         if not GOOGLE_SPEECH_AVAILABLE:
+            logger.warning("Google Speech API not available, skipping transcription")
             return
             
         try:
             # Transcribe the audio using Google Speech API
+            logger.info(f"Transcribing audio data of length {len(audio_data)} with Google Speech API")
             transcript = transcribe_with_google(audio_data, sample_rate)
             
-            if transcript:
+            if transcript and isinstance(transcript, str) and len(transcript.strip()) > 0:
+                logger.info(f"Transcription result: '{transcript}'")
                 # Update the current transcript
                 self.transcript += " " + transcript
                 
@@ -184,48 +201,66 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                     transcript_history.pop(0)
                 
                 # Emit transcript update to clients
+                logger.info(f"Emitting transcript_update to clients: {transcript}")
                 self.socketio.emit('transcript_update', {
                     'transcript': transcript,
                     'timestamp': timestamp
                 })
                 
                 logger.info(f"Transcribed: {transcript}")
+            else:
+                logger.info("No valid transcription result returned (empty or not a string)")
                 
         except Exception as e:
             logger.error(f"Error transcribing audio: {e}")
+            logger.error(traceback.format_exc())
     
     def analyze_sentiment(self):
         """Analyze sentiment of the current transcript"""
-        if not self.transcript or not self.sentiment_pipeline:
+        if not self.transcript:
+            logger.warning("No transcript to analyze for sentiment")
+            return
+            
+        if not self.sentiment_pipeline:
+            logger.warning("Sentiment pipeline not initialized, skipping sentiment analysis")
             return
             
         try:
             # Use the dedicated sentiment analysis function
+            logger.info(f"Analyzing sentiment for transcript: '{self.transcript}'")
             sentiment_result = analyze_text_sentiment(self.transcript)
             
-            # Update the most recent transcript entry with sentiment
-            if transcript_history and sentiment_result:
-                transcript_history[-1]["sentiment"] = sentiment_result
-            
-            # Emit sentiment notification to clients
-            sentiment_notification = {
-                'text': self.transcript,
-                'sentiment': sentiment_result,
-                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
-            }
-            
-            self.socketio.emit('sentiment_notification', sentiment_notification)
-            
-            # Clear transcript after analysis for fresh start
-            self.transcript = ""
-            
-            logger.info(f"Sentiment analysis result: {sentiment_result}")
+            if sentiment_result:
+                logger.info(f"Sentiment analysis result: {sentiment_result}")
+                
+                # Update the most recent transcript entry with sentiment
+                if transcript_history and sentiment_result:
+                    transcript_history[-1]["sentiment"] = sentiment_result
+                    logger.info(f"Updated transcript history with sentiment: {sentiment_result}")
+                
+                # Emit sentiment notification to clients
+                sentiment_notification = {
+                    'text': self.transcript,
+                    'sentiment': sentiment_result,
+                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                logger.info(f"Emitting sentiment_notification to clients: {sentiment_notification}")
+                self.socketio.emit('sentiment_notification', sentiment_notification)
+                
+                # Clear transcript after analysis for fresh start
+                self.transcript = ""
+                logger.info("Cleared transcript after sentiment analysis")
+            else:
+                logger.warning("No sentiment result returned from analysis")
             
         except Exception as e:
             logger.error(f"Error analyzing sentiment: {e}")
+            logger.error(traceback.format_exc())
     
     def stop(self):
         """Stop the continuous analysis thread"""
+        logger.info("Stopping continuous speech analysis thread")
         self.running = False
 
 # Global instance of the continuous speech analysis thread
@@ -439,9 +474,18 @@ def handle_audio_data(data):
             try:
                 audio_bytes = base64.b64decode(data['audio_data'])
                 audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
-                logger.info(f"Decoded audio data, shape: {audio_data.shape}, dtype: {audio_data.dtype}")
+                logger.info(f"Decoded audio data, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
+                
+                # Check if audio data is empty or contains only zeros
+                if len(audio_data) == 0:
+                    logger.warning("Decoded audio data is empty")
+                    return
+                if np.all(audio_data == 0):
+                    logger.warning("Decoded audio data contains only zeros")
+                    return
             except Exception as e:
                 logger.error(f"Error decoding audio data: {e}")
+                logger.error(traceback.format_exc())
                 return
             
             # Get sample rate from data or use default
@@ -458,8 +502,12 @@ def handle_audio_data(data):
                     logger.warning(f"Invalid dB level format: {data.get('db_level')}")
             else:
                 # Calculate dB level if not provided
-                db_level = dbFS(audio_data)
-                logger.info(f"Calculated dB level: {db_level}")
+                if len(audio_data) > 0:
+                    db_level = dbFS(audio_data)
+                    logger.info(f"Calculated dB level: {db_level}")
+                else:
+                    logger.warning("Cannot calculate dB level for empty audio data")
+                    return
             
             # Check if audio is too quiet
             if db_level is not None and db_level < DBLEVEL_THRES:
@@ -468,8 +516,10 @@ def handle_audio_data(data):
             
             # Add audio data to continuous speech analysis thread
             if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
-                logger.info("Adding audio data to speech analysis thread")
+                logger.info(f"Adding audio data to speech analysis thread (length: {len(audio_data)})")
                 add_audio_for_analysis(audio_data, sample_rate)
+            else:
+                logger.warning("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
             
             # Process audio for sound classification (in parallel)
             if len(audio_data) >= 16000:  # Ensure enough audio data for classification
@@ -490,15 +540,18 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
         # Calculate dB level if not provided
         if db_level is None:
             db_level = dbFS(audio_data)
+            logger.info(f"Calculated dB level for sound classification: {db_level}")
         
         # Skip processing if audio is too quiet
         if db_level < DBLEVEL_THRES:
+            logger.info(f"Audio too quiet for sound classification (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
             return
         
         # Perform sound classification with thread-safe model access
         with model_lock:
             # Ensure model is loaded
             if 'sound_model' not in models:
+                logger.info("Sound model not loaded yet, loading models...")
                 load_models()
                 
             sound_model = models.get('sound_model')
@@ -507,23 +560,46 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 return
             
             # Prepare audio for model input (assuming 1-second window)
-            audio_features = homesounds.compute_features(audio_data, sample_rate)
+            logger.info(f"Computing features from audio data of length {len(audio_data)}")
+            try:
+                audio_features = homesounds.compute_features(audio_data, sample_rate)
+                logger.info(f"Computed audio features with shape: {audio_features.shape}")
+            except Exception as e:
+                logger.error(f"Error computing audio features: {e}")
+                logger.error(traceback.format_exc())
+                return
             
             # Ensure correct shape for model input
             if audio_features.shape != (1, 96, 64, 1):
-                logger.warning(f"Unexpected audio feature shape: {audio_features.shape}, reshaping...")
-                audio_features = np.reshape(audio_features, (1, 96, 64, 1))
+                logger.warning(f"Reshaping audio features from {audio_features.shape} to (1, 96, 64, 1)")
+                try:
+                    audio_features = np.reshape(audio_features, (1, 96, 64, 1))
+                except Exception as e:
+                    logger.error(f"Error reshaping audio features: {e}")
+                    logger.error(traceback.format_exc())
+                    return
             
             # Make prediction
-            prediction = sound_model.predict(audio_features, verbose=0)[0]
+            logger.info("Making prediction with sound model...")
+            try:
+                prediction = sound_model.predict(audio_features, verbose=0)[0]
+                logger.info(f"Prediction shape: {prediction.shape}, sum: {np.sum(prediction):.4f}")
+            except Exception as e:
+                logger.error(f"Error making prediction: {e}")
+                logger.error(traceback.format_exc())
+                return
+                
             prediction_count += 1
             
             # Get class with highest probability
             max_idx = np.argmax(prediction)
             max_prob = prediction[max_idx]
             
+            logger.info(f"Prediction result: max_idx={max_idx}, max_prob={max_prob:.4f}")
+            
             # Skip if confidence is too low
             if max_prob < PREDICTION_THRES:
+                logger.info(f"Prediction confidence {max_prob:.4f} below threshold {PREDICTION_THRES}, skipping notification")
                 return
                 
             # Get corresponding class name
@@ -548,6 +624,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             logger.info(f"Sound prediction {prediction_count}: {sound_class} ({max_prob:.2f}), dB: {db_level:.2f}")
             
             # Emit notification to clients
+            logger.info(f"Emitting sound_notification to clients: {predicted_sound}")
             socketio.emit('sound_notification', predicted_sound)
             
             # Add to conversation history
@@ -734,6 +811,100 @@ def health_check():
         'google_speech_available': GOOGLE_SPEECH_AVAILABLE,
         'sentiment_analysis_enabled': ENABLE_SENTIMENT_ANALYSIS
     })
+
+def analyze_text_sentiment(text):
+    """
+    Analyze the sentiment of a text.
+    
+    Args:
+        text: The text to analyze
+        
+    Returns:
+        dict: Sentiment analysis result with sentiment information,
+              or None if analysis failed
+    """
+    if not text or len(text.strip()) == 0:
+        logger.warning("Empty text provided for sentiment analysis")
+        return None
+    
+    try:
+        # First try to use the dedicated sentiment_analyzer module if available
+        if SENTIMENT_ANALYZER_AVAILABLE:
+            logger.info(f"Using sentiment_analyzer module to analyze: '{text}'")
+            try:
+                result = analyze_sentiment(text)
+                if result:
+                    logger.info(f"Sentiment analysis result from sentiment_analyzer: {result}")
+                    return result
+                logger.warning("sentiment_analyzer returned None, falling back to pipeline")
+            except Exception as e:
+                logger.error(f"Error using sentiment_analyzer: {e}")
+                logger.error(traceback.format_exc())
+                # Fall back to pipeline approach
+        
+        # Fall back to the pipeline approach
+        logger.info(f"Using pipeline to analyze sentiment for: '{text}'")
+        # Get or initialize the sentiment pipeline
+        with model_lock:
+            sentiment_pipeline = None
+            try:
+                # See if we already have one in a thread
+                if continuous_speech_thread and hasattr(continuous_speech_thread, 'sentiment_pipeline'):
+                    sentiment_pipeline = continuous_speech_thread.sentiment_pipeline
+                    
+                # If not, try to initialize one
+                if sentiment_pipeline is None:
+                    sentiment_pipeline = pipeline("sentiment-analysis")
+                    logger.info("Initialized a new sentiment pipeline")
+                    
+                # Analyze sentiment
+                if sentiment_pipeline:
+                    start_time = time.time()
+                    pipeline_result = sentiment_pipeline(text)[0]
+                    end_time = time.time()
+                    
+                    logger.info(f"Sentiment analysis completed in {(end_time - start_time)*1000:.2f} ms")
+                    
+                    # Map sentiment to positive/negative/neutral
+                    sentiment = pipeline_result['label'].lower()
+                    confidence = pipeline_result['score']
+                    
+                    # Map POSITIVE/NEGATIVE to positive/negative
+                    if sentiment == 'positive' or sentiment == 'POSITIVE':
+                        category = 'Happy'
+                        sentiment = 'positive'
+                    elif sentiment == 'negative' or sentiment == 'NEGATIVE':
+                        category = 'Unpleasant'
+                        sentiment = 'negative'
+                    else:
+                        category = 'Neutral'
+                        sentiment = 'neutral'
+                    
+                    # Add emoji based on sentiment
+                    emoji = "😊" if sentiment == 'positive' else "😐" if sentiment == 'neutral' else "😟"
+                    
+                    result = {
+                        'sentiment': sentiment,
+                        'confidence': confidence,
+                        'emoji': emoji,
+                        'category': category,
+                        'original_emotion': pipeline_result['label']
+                    }
+                    
+                    logger.info(f"Pipeline sentiment analysis result: {result}")
+                    return result
+                else:
+                    logger.error("No sentiment pipeline available")
+                    return None
+            except Exception as e:
+                logger.error(f"Error in pipeline sentiment analysis: {e}")
+                logger.error(traceback.format_exc())
+                return None
+    
+    except Exception as e:
+        logger.error(f"Error analyzing sentiment: {e}")
+        logger.error(traceback.format_exc())
+        return None
 
 if __name__ == '__main__':
     # Parse command-line arguments for port configuration

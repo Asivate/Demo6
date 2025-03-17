@@ -363,13 +363,21 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         Transcription text or empty string if transcription failed
     """
     try:
+        # Log audio data info
+        logger.info(f"transcribe_with_google: audio_data shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data)}, max: {np.max(audio_data)}")
+        
         # Initialize the Google Speech client
         client = GoogleSpeechToText.get_client()
         if not client:
-            return "", {"error": "Failed to initialize Google Speech client. Check credentials."}
+            logger.error("Failed to initialize Google Speech client. Check credentials.")
+            return ""
         
         # Convert audio to the correct format for Google Speech API
-        audio_bytes = audio_data.tobytes()
+        # Convert to int16 format that Google Speech API expects
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        audio_bytes = audio_int16.tobytes()
+        
+        logger.info(f"Converted audio to int16, length in bytes: {len(audio_bytes)}")
         
         # Create RecognitionAudio object
         audio = speech.RecognitionAudio(content=audio_bytes)
@@ -406,17 +414,20 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         )
         
         # Perform the transcription
+        logger.info("Sending audio to Google Cloud Speech API...")
         response = client.recognize(config=config, audio=audio)
         
         # Process the response
         if not response.results:
-            return "", {"error": "No transcription results returned"}
+            logger.warning("No transcription results returned from Google Speech API")
+            return ""
         
         # Get the most likely transcription
         transcription = response.results[0].alternatives[0].transcript
+        logger.info(f"Google Speech API transcription result: '{transcription}'")
         
         # Return the transcription
-        return transcription, None
+        return transcription
         
     except Exception as e:
         # Format detailed error information for easier debugging
@@ -427,8 +438,8 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         logger.error(error_message)
         logger.error(error_details)
         
-        # Return failure with error information
-        return None, {"google_api_error": error_message}
+        # Return empty string on error
+        return ""
 
 class GoogleSpeechToText:
     """
