@@ -147,11 +147,11 @@ def handle_source(json_data):
     predictions.append(pred)
 
     with graph.as_default():
-    if x.shape[0] != 0:
-        x = x.reshape(len(x), 96, 64, 1)
-        print('Successfully reshape x', x)
-        # pred = model.predict(x)
-        # predictions.append(pred)
+        if x.shape[0] != 0:
+            x = x.reshape(len(x), 96, 64, 1)
+            print('Successfully reshape x', x)
+            # pred = model.predict(x)
+            # predictions.append(pred)
 
     for prediction in predictions:
         context_prediction = np.take(
@@ -223,4 +223,4 @@ def test_disconnect():
 
 
 if __name__ == '__main__':
-    socketio.run(app, debug=True)
+    socketio.run(app, host='0.0.0.0', port=8080, debug=True)

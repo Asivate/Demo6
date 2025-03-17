@@ -207,4 +207,4 @@ def handle_source(json_data):
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='10.0.0.27', port='8788', debug=True)
+    socketio.run(app, host='0.0.0.0', port=8080, debug=True)
