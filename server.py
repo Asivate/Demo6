@@ -85,7 +85,7 @@ ENABLE_SENTIMENT_ANALYSIS = True  # Set to False to disable sentiment analysis
 SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
 APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
 PREDICTION_THRES = 0.5  # Threshold for sound prediction confidence
-DBLEVEL_THRES = 45  # Threshold for dB level to consider sound significant
+DBLEVEL_THRES = 35  # Threshold for dB level to consider sound significant (lowered from 45)
 
 # Audio buffers for continuous processing
 AUDIO_BUFFER_SIZE = 5  # Buffer size in seconds
@@ -156,6 +156,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
             if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
                 # Start streaming thread if not running
                 if not self.streaming_active:
+                    logger.info("Starting streaming transcription thread as it's not active")
                     self.start_streaming_transcription()
                 
                 # Add audio data to streaming transcription
@@ -609,7 +610,11 @@ def handle_audio_data(data):
             
             # Check if audio is too quiet
             if db_level is not None and db_level < DBLEVEL_THRES:
-                logger.info(f"Audio too quiet (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
+                logger.info(f"Audio somewhat quiet (dB {db_level} < threshold {DBLEVEL_THRES}), but still processing for speech")
+                # Still process for speech recognition even when quiet
+                if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
+                    logger.info(f"Adding quiet audio data to speech analysis thread (length: {len(audio_data)})")
+                    add_audio_for_analysis(audio_data, sample_rate)
                 return
         
             # PARALLEL PROCESSING:
