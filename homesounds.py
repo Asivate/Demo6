@@ -175,6 +175,25 @@ sound_specific_thresholds = {
     # Default threshold of 0.5 will be used for any sound not specified here
 }
 
+# Define function to get class names before it's used
+def get_class_names():
+    """
+    Returns the list of class names used by the model output, properly mapped
+    to human-readable labels.
+    
+    The model outputs a vector, and we need to know which
+    index corresponds to which sound class.
+    """
+    # Create an array of class names in the order the model expects
+    class_names = []
+    for i in range(20):  # The model actually outputs 20 classes, not all of labels
+        if i in to_human_labels:
+            class_names.append(to_human_labels[i])
+        else:
+            class_names.append(f"Unknown-{i}")
+    
+    return class_names
+
 # Map model index to actual sound class for specialized detection
 class_names = get_class_names()
 model_index_to_sound_class = {
@@ -569,21 +588,3 @@ def compute_features(audio_data, sample_rate=16000):
         logger.error(traceback.format_exc())
         # Return empty features with expected shape
         return np.zeros((1, 96, 64, 1))
-
-def get_class_names():
-    """
-    Returns the list of class names used by the model output, properly mapped
-    to human-readable labels.
-    
-    The model outputs a vector, and we need to know which
-    index corresponds to which sound class.
-    """
-    # Create an array of class names in the order the model expects
-    class_names = []
-    for i in range(20):  # The model actually outputs 20 classes, not all of labels
-        if i in to_human_labels:
-            class_names.append(to_human_labels[i])
-        else:
-            class_names.append(f"Unknown-{i}")
-    
-    return class_names
