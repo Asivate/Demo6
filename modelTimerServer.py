@@ -61,11 +61,6 @@ print("Using deep learning model: %s" % (model_filename))
 model = load_model(model_filename)
 graph = tf.get_default_graph()
 
-# Apply NumPy patch for TensorFlow compatibility
-if not hasattr(np, 'object'):
-    np.object = object
-    print("NumPy patch applied: Added np.object compatibility for TensorFlow")
-
 # ##############################
 # # Setup Audio Callback
 # ##############################

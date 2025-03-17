@@ -1,11 +1,7 @@
-import numpy as np
-# Apply NumPy patch for TensorFlow compatibility
-if not hasattr(np, 'object'):
-    np.object = object
-    print("NumPy patch applied: Added np.object compatibility for TensorFlow")
 
+from keras.models import load_model
 import tensorflow as tf
-from tensorflow import keras
+import numpy as np
 from vggish_input import waveform_to_examples
 import homesounds
 import pyaudio
@@ -14,10 +10,6 @@ import time
 import argparse
 import wget
 from helpers import dbFS
-import os
-
-# Configure TensorFlow to use compatibility mode with TF 1.x code
-tf.compat.v1.disable_eager_execution()
 
 # contexts
 context = homesounds.everything
@@ -36,7 +28,7 @@ MICROPHONES_DESCRIPTION = []
 FPS = 60.0
 
 ###########################
-# Check Microphone
+# Checl Microphone
 ###########################
 print("=====")
 print("1 / 2: Checking Microphones... ")
@@ -84,10 +76,6 @@ print("=====")
 print("2 / 2: Checking model... ")
 print("=====")
 model_filename = "models/example_model.hdf5"
-
-# Create models directory if it doesn't exist
-os.makedirs(os.path.dirname(model_filename), exist_ok=True)
-
 homesounds_model = Path(model_filename)
 if (not homesounds_model.is_file()):
     print("Downloading example_model.hdf5 [867MB]: ")
@@ -97,27 +85,15 @@ if (not homesounds_model.is_file()):
 # Load Deep Learning Model
 ##############################
 print("Using deep learning model: %s" % (model_filename))
-model = None
-
-try:
-    # Try to load the model with the new API
-    model = keras.models.load_model(model_filename)
-    print("Model loaded successfully with TensorFlow 2.x")
-except Exception as e:
-    print(f"Error loading model with standard method: {e}")
-    # Fallback for older model formats
-    try:
-        model = tf.keras.models.load_model(model_filename, compile=False)
-        print("Model loaded with compile=False option")
-    except Exception as e2:
-        print(f"Error with fallback method: {e2}")
-        raise Exception("Could not load model with any method")
+model = load_model(model_filename)
+graph = tf.get_default_graph()
 
 ##############################
 # Setup Audio Callback
 ##############################
 def audio_samples(in_data, frame_count, time_info, status_flags):
-    np_wav = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) / 32768.0 # Convert to [-1.0, +1.0]
+    global graph
+    np_wav = np.fromstring(in_data, dtype=np.int16) / 32768.0 # Convert to [-1.0, +1.0]
     # Compute RMS and convert to dB
     rms = np.sqrt(np.mean(np_wav**2))
     db = dbFS(rms)
@@ -125,18 +101,18 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
     # Make predictions
     x = waveform_to_examples(np_wav, RATE)
     predictions = []
-    
-    if x.shape[0] != 0:
-        x = x.reshape(len(x), 96, 64, 1)
-        pred = model.predict(x)
-        predictions.append(pred)
+    with graph.as_default():
+        if x.shape[0] != 0:
+            x = x.reshape(len(x), 96, 64, 1)
+            pred = model.predict(x)
+            predictions.append(pred)
 
-    for prediction in predictions:
-        context_prediction = np.take(prediction[0], [homesounds.labels[x] for x in active_context])
-        m = np.argmax(context_prediction)
-        if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
-            print("Prediction: %s (%0.2f)" % (homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-        
+        for prediction in predictions:
+            context_prediction = np.take(prediction[0], [homesounds.labels[x] for x in active_context])
+            m = np.argmax(context_prediction)
+            if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                print("Prediction: %s (%0.2f)" % (homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+            
     return (in_data, pyaudio.paContinue)
 
 ##############################

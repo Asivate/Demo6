@@ -6,10 +6,6 @@ from flask_socketio import SocketIO, emit, join_room, leave_room, \
 from keras.models import load_model
 import tensorflow as tf
 import numpy as np
-# Apply NumPy patch for TensorFlow compatibility
-if not hasattr(np, 'object'):
-    np.object = object
-    print("NumPy patch applied: Added np.object compatibility for TensorFlow")
 from vggish_input import waveform_to_examples
 import homesounds
 from pathlib import Path

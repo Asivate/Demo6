@@ -1,158 +1,88 @@
-# SoundWatch Server
 
-This directory contains the server components for the SoundWatch application, which is responsible for processing audio data and classifying sounds in real-time.
+Introduction
+------------
+This repo contains the Python socket server to process the audio recognition process. Clients (phones and watches) sends raw audio or audio features to servers in an event-based architecture and server will send the audio label back to clients.
 
-## Components
+This server can serve requests with either raw audio or audio features:
+- Using raw audio requests can boost the performance since the server is much more performant in preprocessing the raw audio compared to performing it in edge devices. 
+- Using audio features can protect user's privacy by not exposing raw audio to middle men attackers.
 
-- `server.py`: The main server application that handles WebSocket connections and processes audio data
-- `ast_model.py`: Audio Spectrogram Transformer model for sound classification
-- `homesounds.py`: Definitions of home sound categories
-- `test_speech_bias.py`: Script to test the speech bias correction functionality
-- `test_client.py`: Test client to connect to the server and verify it's working
-- `test_model.py`: Script to test the sound classification model directly
-- `download_model.py`: Script to download the model file if it doesn't exist
-- `start_server.ps1`: PowerShell script to start the server on Windows
-- `start_server.bat`: Batch script to start the server on Windows
-- `static/index.html`: Web client for visualizing sound predictions
+Pre-requisites
+--------------
+- Python 3.6
+- Get the sound classification Tensorflow lite model and the label files that are open sourced [here](https://www.dropbox.com/sh/wngu1kuufwdk8nr/AAC1rm5QR-amL_HBzTOgsZnca?dl=0)
 
-## Setup and Installation
+Getting Started
+---------------
+- `main.py`: CLI to run and test the model with computer microphone (for testing purposes)
 
-### Prerequisites
+*Usage*:
+``` python main.py ```
 
-- Python 3.8 or higher
-- Required Python packages (see `requirements.txt`)
+- `server.py`: Socket server to serve audio predictions from clients devices such as phone and watch
 
-### Installation
+*Usage*: ```python server.py```
 
-1. Create a virtual environment (optional but recommended):
-   ```
-   python -m venv venv
-   ```
+- Watch and Phone application *MUST* let `ARCHITECTURE` variable in `MainActivity.java` to `WATCH_SERVER_ARCHITECTURE` or `PHONE_WATCH_SERVER_ARCHITECTURE` to establish connection to server.
 
-2. Activate the virtual environment:
-   - On Windows:
-     ```
-     venv\Scripts\activate
-     ```
-   - On macOS/Linux:
-     ```
-     source venv/bin/activate
-     ```
+- Change `SERVER_URL` to the path that is running the socket server. For example, if running locally, it should be something like 
+```java
+SERVER_URL = "http://128.123.456.41:8787";
+```
 
-3. Install the required packages:
-   ```
-   pip install -r requirements.txt
-   ```
+*Debug instructions* 
+- Make sure that the socket server is working properly, navigate to the server in the browser (i.e: `http://localhost:8787`) and checks that the browser render the [index.html](templates/index.html) file properly. 
+- Type a message to the text area and click `Send` to make sure that the message is properly sent to the server. Upon receiving the message, the socket server will reply back the exact message to the browser and render a `<div>` text. Make sure that the text appear and the message is the same with what you type in.
 
-4. Download the model file:
-   ```
-   python download_model.py
-   ```
 
-## Running the Server
+![server html](../images/server.png?raw=true "Title")
 
-### Using the Batch File (Windows)
+Testing 
+-----
 
-1. Simply double-click on `start_server.bat` or run it from the command line:
-   ```
-   start_server.bat
-   ```
+- `e2eServer.py`: server application that measures the end to end runtime of the sound prediction 
 
-### Using the PowerShell Script (Windows)
+*Warning*: This requires the watch and the phone to set `TEST_E2E_LATENCY` to be `true` in the corresponding files.
 
-1. Open PowerShell and navigate to the server directory:
-   ```
-   cd path\to\SoundWatch\server
-   ```
+*Usage*:
+``` python server.py ```
 
-2. Run the PowerShell script:
-   ```
-   .\start_server.ps1
-   ```
+- `melFeatures.py`, `easing.py`, `helpers.py`: preprocessing files that convert the raw audio to MFCC features to feed to the ML model.
 
-### Manual Execution
-
-1. Set the necessary environment variables:
-   - On Windows:
-     ```
-     set APPLY_SPEECH_BIAS_CORRECTION=True
-     set SPEECH_BIAS_CORRECTION=0.3
-     ```
-   - On macOS/Linux:
-     ```
-     export APPLY_SPEECH_BIAS_CORRECTION=True
-     export SPEECH_BIAS_CORRECTION=0.3
-     ```
-
-2. Start the server:
-   ```
-   python server.py --port 8080
-   ```
-
-## Testing
-
-### Testing the Server
-
-1. Start the server using one of the methods above.
-
-2. Run the test client:
-   ```
-   python test_client.py --server http://localhost:8080 --send-audio
-   ```
-
-### Testing the Model Directly
-
-1. Run the model test script:
-   ```
-   python test_model.py
-   ```
-
-### Testing Speech Bias Correction
-
-1. Run the speech bias test script:
-   ```
-   python test_speech_bias.py
-   ```
-
-### Using the Web Client
-
-1. Start the server using one of the methods above.
-
-2. Open a web browser and navigate to:
-   ```
-   http://localhost:8080
-   ```
-
-## Configuration
-
-The server behavior can be configured by adjusting the following parameters in `server.py`:
-
-- `PREDICTION_THRES`: Minimum confidence threshold for sound predictions
-- `DBLEVEL_THRES`: Minimum decibel level threshold for sound detection
-- `SPEECH_PREDICTION_THRES`: Threshold for speech detection
-- `SPEECH_SENTIMENT_THRES`: Threshold for speech sentiment analysis
-- `SPEECH_BIAS_CORRECTION`: Correction factor for speech bias
-- `APPLY_SPEECH_BIAS_CORRECTION`: Whether to apply speech bias correction
-
-## Troubleshooting
-
-- If the server fails to start, check that all required packages are installed.
-- If the model file is missing, run `python download_model.py` to download it.
-- If speech detection is not working correctly, try adjusting the thresholds in `server.py`.
-- If you encounter connection issues with the client, check that the server is running and accessible.
-
-## API Reference
-
-### WebSocket Events
-
-- `connect`: Client connects to the server
-- `disconnect`: Client disconnects from the server
-- `audio_data`: Client sends audio data to the server
-- `audio_feature_data`: Client sends pre-processed audio feature data to the server
-- `sound_prediction`: Server sends sound prediction to the client
-
-### HTTP Endpoints
-
-- `GET /`: Serves the web client
-- `GET /api/health`: Health check endpoint
-- `GET /<path:path>`: Serves static files
+Socket Events
+---------------
+Example Usage of SocketIO Client:
+```python
+    socket.emit('audio_data',
+                {
+                    "data": [1.0,2.0, 3.0]
+                })
+```
+- `audio_feature_data`: Serve predictions from audio MFCC features
+*Request*:
+```json
+{
+    "data": [1.0,2.0,3.0],
+    "db": "1.0"
+}
+```
+*Response*:
+```json
+{
+    "label": "Knocking",
+    "accuracy": "0.96"
+}
+```
+- `audio_data`: Serve predictions from raw audio
+```json
+{
+    "data": [1.0,2.0,3.0]
+}
+```
+*Response*:
+```json
+{
+    "label": "Knocking",
+    "accuracy": "0.96"
+}
+```

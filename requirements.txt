@@ -1,52 +1,17 @@
-# Core server dependencies
-Flask==2.0.1
-Werkzeug==2.0.3
-Flask-SocketIO==5.1.1
-python-socketio==5.4.0
-python-engineio==4.2.1
-eventlet==0.30.2
-dnspython==1.16.0
-gunicorn==20.1.0
-
-# Audio processing
-numpy>=1.19.2
-scipy>=1.7.0
-soundfile==0.12.1
-librosa>=0.8.1
-sounddevice==0.4.6
-PyAudio==0.2.13
-
-# Deep learning frameworks
-tensorflow>=2.4.0
-torch>=1.9.0
-transformers==4.18.0
-torchaudio==0.13.0
-huggingface-hub==0.16.4
-
-# Added for sentiment analysis and speech recognition
-accelerate==0.20.3
-sentencepiece==0.1.99
-pyctcdecode==0.5.0
-openai-whisper==20240930
-emoji==2.8.0
-vosk==0.3.50
-
-# Utility packages
-wget==3.2
-matplotlib>=3.4.3
-pandas>=1.3.2
-Pillow==9.5.0
-
-# For compatibility and logging
-protobuf==3.20.3
-six==1.16.0
-PyYAML==6.0
-
-# Added dependencies for better compatibility
-setuptools>=65.5.1
-wheel>=0.38.0
-typing-extensions==4.5.0
-google-cloud-speech>=2.0.0
-
-# Added dependencies for sentiment analysis
-scikit-learn>=0.24.2 
+Flask==1.0.2
+Flask-Login==0.4.1
+Flask-Session==0.3.1
+Flask_SocketIO
+itsdangerous==1.1.0
+Jinja2==2.10
+MarkupSafe==1.1.0
+python-engineio
+python-socketio
+six==1.11.0
+Werkzeug==0.14.1
+gunicorn
+eventlet
+numpy==1.14.1 
+tensorflow==1.5.0 
+keras==2.1.6 
+wget
