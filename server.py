@@ -227,10 +227,10 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                             # No audio data available, continue waiting
                             logger.debug("No audio data in queue, continuing to wait...")
                             continue
-                except Exception as e:
-                    logger.error(f"Error in audio generator: {e}")
-                    logger.error(traceback.format_exc())
-                    
+                        except Exception as e:
+                            logger.error(f"Error in audio generator: {e}")
+                            logger.error(traceback.format_exc())
+                            
                 # Initialize the Google Speech client
                 try:
                     from google.cloud import speech
