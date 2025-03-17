@@ -144,7 +144,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
         if self.running and audio_data is not None and len(audio_data) > 0:
             logger.debug(f"Adding audio data to queue, length: {len(audio_data)}")
             self.audio_queue.put((audio_data, sample_rate))
-else:
+        else:
             logger.warning(f"Not adding audio data to queue: running={self.running}, audio_data_length={len(audio_data) if audio_data is not None else 'None'}")
     
     def run(self):
@@ -168,8 +168,7 @@ else:
                     logger.info(f"Time to analyze sentiment, transcript length: {len(self.transcript)}")
                     self.analyze_sentiment()
                     self.last_sentiment_time = current_time
-                    
-    except Exception as e:
+            except Exception as e:
                 logger.error(f"Error in continuous speech analysis thread: {e}")
                 logger.error(traceback.format_exc())
                 time.sleep(1)  # Avoid tight loop on errors
@@ -215,7 +214,6 @@ else:
                 logger.info(f"Transcribed: {transcript}")
             else:
                 logger.info("No valid transcription result returned (empty or not a string)")
-                
         except Exception as e:
             logger.error(f"Error transcribing audio: {e}")
             logger.error(traceback.format_exc())
@@ -258,8 +256,7 @@ else:
                 logger.info("Cleared transcript after sentiment analysis")
             else:
                 logger.warning("No sentiment result returned from analysis")
-            
-except Exception as e:
+        except Exception as e:
             logger.error(f"Error analyzing sentiment: {e}")
             logger.error(traceback.format_exc())
     
@@ -369,7 +366,7 @@ def load_sound_classification_model():
             logger.info("Downloading sound classification model...")
             try:
                 download_sound_classification_model(model_path)
-    except Exception as e:
+            except Exception as e:
                 logger.error(f"Failed to download model: {e}")
                 return False
         
@@ -453,18 +450,14 @@ def download_sound_classification_model(model_path):
             # Save the model
             model.save(str(model_path))
             logger.info(f"Created and saved test model to {model_path}")
-        return True
+            return True
         except Exception as e:
             logger.error(f"Failed to create test model: {e}")
-                
-        # If we reach here, all attempts failed
-        logger.error("All attempts to obtain a model failed")
-        return False
-        
+            return False
     except Exception as e:
         logger.error(f"Error downloading sound classification model: {e}")
         logger.error(traceback.format_exc())
-    return False
+        return False
 
 # Handle audio data
 @socketio.on('audio_data')
@@ -500,12 +493,12 @@ def handle_audio_data(data):
                     return
             else:
                 logger.error(f"Unsupported data type: {type(data['data'])}")
-            return
+                return
             
             # Check if audio data was successfully extracted
             if audio_data is None:
                 logger.warning("Failed to extract audio data")
-            return
+                return
             
             logger.info(f"Audio data extracted, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
             
@@ -515,7 +508,7 @@ def handle_audio_data(data):
                 return
             if np.all(audio_data == 0):
                 logger.warning("Audio data contains only zeros")
-            return
+                return
             
             # Get sample rate from data or use default
             sample_rate = data.get('sample_rate', 16000)
@@ -536,18 +529,18 @@ def handle_audio_data(data):
                     logger.debug(f"Calculated dB level: {db_level}")
                 else:
                     logger.warning("Cannot calculate dB level for empty audio data")
-            return
+                    return
             
             # Check if audio is too quiet for sentiment analysis
             if db_level is not None and db_level < DBLEVEL_THRES:
                 logger.info(f"Audio too quiet (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
-            return
+                return
         
             # Add audio data to continuous speech analysis thread (always process for sentiment analysis)
             if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
                 logger.info(f"Adding audio data to speech analysis thread (length: {len(audio_data)})")
                 add_audio_for_analysis(audio_data, sample_rate)
-        else:
+            else:
                 logger.debug("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
             
             # Process audio for sound classification (buffer until we have enough)
@@ -570,7 +563,7 @@ def handle_audio_data(data):
                     # Clear the buffer (we could optionally keep some overlap)
                     classification_buffer.clear()
                     logger.info("Cleared classification buffer after processing")
-            else:
+        else:
             logger.warning("No 'data' field in received audio data message")
                 
     except Exception as e:
@@ -590,7 +583,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
         # Skip processing if audio is too quiet
         if db_level < DBLEVEL_THRES:
             logger.info(f"Audio too quiet for sound classification (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
-                        return
+            return
         
         # Perform sound classification with thread-safe model access
         with model_lock:
@@ -625,8 +618,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                     logger.info(f"Saved debug features to {debug_file}")
                 except Exception as viz_error:
                     logger.warning(f"Could not save debug features: {viz_error}")
-                
-                    except Exception as e:
+            except Exception as e:
                 logger.error(f"Error computing audio features: {e}")
                 logger.error(traceback.format_exc())
                 return
@@ -636,7 +628,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 logger.warning(f"Reshaping audio features from {audio_features.shape} to (1, 96, 64, 1)")
                 try:
                     audio_features = np.reshape(audio_features, (1, 96, 64, 1))
-    except Exception as e:
+                except Exception as e:
                     logger.error(f"Error reshaping audio features: {e}")
                     logger.error(traceback.format_exc())
                     return
@@ -649,7 +641,6 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 
                 # Debug: print full prediction array
                 logger.debug(f"Full prediction array: {prediction}")
-                
             except Exception as e:
                 logger.error(f"Error making prediction: {e}")
                 logger.error(traceback.format_exc())
@@ -672,7 +663,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             class_names = homesounds.get_class_names()
             if max_idx < len(class_names):
                 sound_class = class_names[max_idx]
-        else:
+            else:
                 logger.error(f"Invalid class index: {max_idx}, max index: {len(class_names)-1}")
                 return
                 
@@ -748,12 +739,12 @@ def handle_audio_feature_data(data):
                 if len(feature_data.shape) == 1:
                     if feature_data.size == 96*64:
                         feature_data = feature_data.reshape(1, 96, 64, 1)
-                else:
+                    else:
                         logger.warning(f"Unexpected feature data size: {feature_data.size}, expected {96*64}")
                         return
-            else:
+                else:
                     feature_data = np.reshape(feature_data, (1, 96, 64, 1))
-        except Exception as e:
+            except Exception as e:
                 logger.error(f"Error reshaping feature data: {e}")
                 logger.error(traceback.format_exc())
                 return
@@ -815,7 +806,7 @@ def handle_audio_feature_data(data):
             class_names = homesounds.get_class_names()
             if max_idx < len(class_names):
                 sound_class = class_names[max_idx]
-        else:
+            else:
                 logger.error(f"Invalid class index: {max_idx}, max index: {len(class_names)-1}")
                 return
                 
@@ -927,7 +918,7 @@ def analyze_text_sentiment(text):
                     logger.info(f"Sentiment analysis result from sentiment_analyzer: {result}")
                     return result
                 logger.warning("sentiment_analyzer returned None, falling back to pipeline")
-    except Exception as e:
+            except Exception as e:
                 logger.error(f"Error using sentiment_analyzer: {e}")
                 logger.error(traceback.format_exc())
                 # Fall back to pipeline approach
@@ -966,7 +957,7 @@ def analyze_text_sentiment(text):
                     elif sentiment == 'negative' or sentiment == 'NEGATIVE':
                         category = 'Unpleasant'
                         sentiment = 'negative'
-    else:
+                    else:
                         category = 'Neutral'
                         sentiment = 'neutral'
                     
@@ -983,7 +974,7 @@ def analyze_text_sentiment(text):
                     
                     logger.info(f"Pipeline sentiment analysis result: {result}")
                     return result
-    else:
+                else:
                     logger.error("No sentiment pipeline available")
                     return None
             except Exception as e:
