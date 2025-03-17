@@ -107,7 +107,7 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
         print('Prediction succeeded')
         for prediction in predictions:
             context_prediction = np.take(
-                prediction[0], [homesounds.labels[x] for x in active_context])
+                prediction[0], [homesounds.labels[label] for label in active_context])
             m = np.argmax(context_prediction)
             if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
                 print("Prediction: %s (%0.2f)" % (
@@ -128,7 +128,7 @@ def handle_source(json_data):
 
     for prediction in predictions:
         context_prediction = np.take(
-            prediction[0], [homesounds.labels[x] for x in active_context])
+            prediction[0], [homesounds.labels[label] for label in active_context])
         m = np.argmax(context_prediction)
         print('Max prediction', str(
             homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
@@ -159,6 +159,17 @@ def handle_source(json_data):
     print('Db...', db)
     # Make predictions
     print('Making prediction...')
+    
+    # Calculate the minimum required length for feature extraction
+    # Based on vggish_params, we need at least EXAMPLE_WINDOW_SECONDS of audio
+    min_samples = int(vggish_params.EXAMPLE_WINDOW_SECONDS * RATE)
+    
+    # If the audio is too short, pad it with zeros to meet the minimum length
+    if len(np_wav) < min_samples:
+        print(f"Audio too short ({len(np_wav)} samples), padding to {min_samples} samples")
+        padding = np.zeros(min_samples - len(np_wav))
+        np_wav = np.concatenate((np_wav, padding))
+    
     x = waveform_to_examples(np_wav, RATE)
     predictions = []
     
@@ -171,7 +182,7 @@ def handle_source(json_data):
             
             for prediction in predictions:
                 context_prediction = np.take(
-                    prediction[0], [homesounds.labels[x] for x in active_context])
+                    prediction[0], [homesounds.labels[label] for label in active_context])
                 m = np.argmax(context_prediction)
                 print('Max prediction', str(
                     homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
@@ -181,6 +192,13 @@ def handle_source(json_data):
                                 'accuracy': str(context_prediction[m])})
                     print("Prediction: %s (%0.2f)" % (
                         homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+                else:
+                    socketio.emit('audio_label',
+                                {
+                                    'label': 'Unrecognized Sound',
+                                    'accuracy': '1.0'
+                                })
+                    print("Prediction below threshold, sending Unrecognized Sound")
         else:
             print("No audio features extracted, skipping prediction")
             socketio.emit('audio_label',
