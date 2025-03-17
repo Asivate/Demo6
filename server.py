@@ -111,6 +111,12 @@ ENABLE_SENTIMENT_ANALYSIS = True  # Set to False to disable sentiment analysis
 SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
 APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
 
+# Speech-related constants
+ENABLE_SPEECH = True  # Control flag for speech processing
+SPEECH_DBLEVEL_THRES = -20  # Minimum dB level to process speech
+SPEECH_BUFFER_SIZE = TARGET_SR * 5  # 5 seconds of audio data for speech processing
+speech_buffer = []  # Buffer to store audio for speech processing
+
 # Audio buffers for continuous processing
 AUDIO_BUFFER_SIZE = 5  # Buffer size in seconds
 audio_buffer = []  # Buffer to store audio data for continuous processing
@@ -769,8 +775,18 @@ def process_sound_classification(audio_data, sample_rate, best_pred_confidence, 
     DISHES_IDX = homesounds.DISHES_IDX  # Dishes index
     GLASS_BREAKING_IDX = homesounds.GLASS_BREAKING_IDX  # Glass breaking index
     
+    # Check if indices are within the valid range for the prediction array
+    # This prevents index errors if the model output doesn't match expected dimensions
+    prediction_length = sound_preds[0].shape[0] if hasattr(sound_preds[0], 'shape') else len(sound_preds[0])
+    valid_indices = []
+    for idx in [KNOCK_IDX, DISHES_IDX, GLASS_BREAKING_IDX]:
+        if idx < prediction_length:
+            valid_indices.append(idx)
+        else:
+            logger.warning(f"Index {idx} is out of range for prediction array of length {prediction_length}")
+    
     # Adjust confidence for certain sound classes based on audio features
-    if best_pred_class is not None:
+    if best_pred_class is not None and best_pred_class < len(class_names):
         # Original confidence for logging
         original_confidence = best_pred_confidence
         original_class = best_pred_class
@@ -780,12 +796,12 @@ def process_sound_classification(audio_data, sample_rate, best_pred_confidence, 
             logger.info(f"Percussive event detected")
             
             # Door knock - boost confidence if it's already the best prediction
-            if best_pred_class == KNOCK_IDX and best_pred_confidence > 0.05:  # Lower activation threshold (was 0.1)
+            if best_pred_class == KNOCK_IDX and best_pred_confidence > 0.05 and KNOCK_IDX in valid_indices:  # Lower activation threshold (was 0.1)
                 best_pred_confidence = min(1.0, best_pred_confidence * 2.0)  # Double confidence (was *1.3)
                 logger.info(f"Boosted Door knock confidence: {original_confidence:.4f} -> {best_pred_confidence:.4f}")
             
             # Dishes is often confused with knocking 
-            elif best_pred_class == DISHES_IDX and best_pred_confidence > 0.05:
+            elif best_pred_class == DISHES_IDX and best_pred_confidence > 0.05 and KNOCK_IDX in valid_indices and DISHES_IDX in valid_indices:
                 # Check if Door knock has non-zero confidence in the prediction
                 knock_confidence = sound_preds[0][KNOCK_IDX]
                 if knock_confidence > 0.01:  # Very low threshold to capture any hint of knocking
@@ -798,11 +814,11 @@ def process_sound_classification(audio_data, sample_rate, best_pred_confidence, 
                     best_pred_class = np.argmax(sound_preds[0])
                     best_pred_confidence = sound_preds[0][best_pred_class]
                     
-                    logger.info(f"Transferred confidence from Dishes to Door knock: {original_confidence:.4f} -> {best_pred_confidence:.4f}, class: {class_names[original_class]} -> {class_names[best_pred_class]}")
+                    logger.info(f"Transferred confidence from Dishes to Door knock: {original_confidence:.4f} -> {best_pred_confidence:.4f}, class: {class_names[original_class if original_class < len(class_names) else 0]} -> {class_names[best_pred_class if best_pred_class < len(class_names) else 0]}")
                     
             # Handle case where percussive event is detected but confidence is distributed among classes
             # If Door knock has any non-trivial confidence, boost it 
-            elif sound_preds[0][KNOCK_IDX] > 0.03:  # Lower threshold for activation (was 0.05)
+            elif KNOCK_IDX in valid_indices and sound_preds[0][KNOCK_IDX] > 0.03:  # Lower threshold for activation (was 0.05)
                 original_knock_confidence = sound_preds[0][KNOCK_IDX]
                 sound_preds[0][KNOCK_IDX] = min(1.0, sound_preds[0][KNOCK_IDX] * 2.0)  # Double confidence (was 1.5)
                 
@@ -810,10 +826,10 @@ def process_sound_classification(audio_data, sample_rate, best_pred_confidence, 
                 best_pred_class = np.argmax(sound_preds[0])
                 best_pred_confidence = sound_preds[0][best_pred_class]
                 
-                logger.info(f"Boosted Door knock among distributed confidence: {original_knock_confidence:.4f} -> {sound_preds[0][KNOCK_IDX]:.4f}, new best: {class_names[best_pred_class]} ({best_pred_confidence:.4f})")
+                logger.info(f"Boosted Door knock among distributed confidence: {original_knock_confidence:.4f} -> {sound_preds[0][KNOCK_IDX]:.4f}, new best: {class_names[best_pred_class if best_pred_class < len(class_names) else 0]} ({best_pred_confidence:.4f})")
             
             # False negative check: if we detected a strong percussive event but didn't classify as knock or dishes
-            elif sound_preds[0][KNOCK_IDX] > 0.01:  # Any non-zero confidence for Door knock
+            elif KNOCK_IDX in valid_indices and sound_preds[0][KNOCK_IDX] > 0.01:  # Any non-zero confidence for Door knock
                 # A clear percussive event with even a tiny hint of Door knock suggests it might be a knock
                 sound_preds[0][KNOCK_IDX] = max(0.25, sound_preds[0][KNOCK_IDX] * 5.0)  # Significant boost for missed knocks
                 
@@ -821,21 +837,24 @@ def process_sound_classification(audio_data, sample_rate, best_pred_confidence, 
                 best_pred_class = np.argmax(sound_preds[0])
                 best_pred_confidence = sound_preds[0][best_pred_class]
                 
-                logger.info(f"Captured potential missed knock: door confidence {sound_preds[0][KNOCK_IDX]:.4f}, new best: {class_names[best_pred_class]} ({best_pred_confidence:.4f})")
+                logger.info(f"Captured potential missed knock: door confidence {sound_preds[0][KNOCK_IDX]:.4f}, new best: {class_names[best_pred_class if best_pred_class < len(class_names) else 0]} ({best_pred_confidence:.4f})")
     
     # Apply sound-specific thresholds
-    if best_pred_class is not None:
+    if best_pred_class is not None and best_pred_class < len(class_names):
         # Check if this sound has a custom threshold
-        sound_thresh = homesounds.sound_specific_thresholds.get(class_names[best_pred_class], homesounds.PREDICTION_THRES)
+        sound_name = class_names[best_pred_class]
+        sound_thresh = homesounds.sound_specific_thresholds.get(sound_name, homesounds.PREDICTION_THRES)
         
         if best_pred_confidence >= sound_thresh and dB >= homesounds.DBLEVEL_THRES:
-            logger.info(f"Sound detected above threshold: {class_names[best_pred_class]} ({best_pred_confidence:.4f} >= {sound_thresh:.2f}, {dB:.1f} dB)")
+            logger.info(f"Sound detected above threshold: {sound_name} ({best_pred_confidence:.4f} >= {sound_thresh:.2f}, {dB:.1f} dB)")
             return best_pred_class, best_pred_confidence
         else:
             if best_pred_confidence < sound_thresh:
-                logger.info(f"Sound below confidence threshold: {class_names[best_pred_class]} ({best_pred_confidence:.4f} < {sound_thresh:.2f})")
+                logger.info(f"Sound below confidence threshold: {sound_name} ({best_pred_confidence:.4f} < {sound_thresh:.2f})")
             if dB < homesounds.DBLEVEL_THRES:
                 logger.info(f"Sound below dB threshold: {dB:.1f} dB < {homesounds.DBLEVEL_THRES:.1f} dB")
+    elif best_pred_class is not None:
+        logger.warning(f"Class index {best_pred_class} is out of range for class_names list of length {len(class_names)}")
     
     return None, 0.0
 
@@ -943,21 +962,34 @@ def handle_audio_feature_data(data):
                 
                 # Debug: log top 3 predictions
                 class_names = homesounds.get_class_names()
-                top_indices = np.argsort(sound_preds[0])[-3:][::-1]
-                top_preds = [(class_names[i], sound_preds[0][i]) for i in top_indices]
-                logger.info(f"Top 3 predictions: {top_preds}")
+                try:
+                    top_indices = np.argsort(sound_preds[0])[-3:][::-1]
+                    top_preds = []
+                    for i in top_indices:
+                        if i < len(class_names):
+                            top_preds.append((class_names[i], sound_preds[0][i]))
+                        else:
+                            top_preds.append((f"Unknown-{i}", sound_preds[0][i]))
+                    logger.info(f"Top 3 predictions: {top_preds}")
+                except Exception as e:
+                    logger.error(f"Error getting top predictions: {e}")
                 
                 # Check for percussive sound - since we don't have raw audio, use a simplified check
                 # based on the prediction confidence for percussive sounds
                 is_percussive = False
-                percussive_sounds = homesounds.percussive_sounds
-                for sound_class_idx in percussive_sounds:
-                    if sound_preds[0][sound_class_idx] > 0.05:  # Low threshold to detect any hint of percussive sounds
-                        is_percussive = True
-                        logger.info(f"Detected potential percussive sound: {class_names[sound_class_idx]} ({sound_preds[0][sound_class_idx]:.4f})")
-                        break
+                try:
+                    percussive_sounds = homesounds.percussive_sounds
+                    for sound_class_idx in percussive_sounds:
+                        if sound_class_idx < len(sound_preds[0]) and sound_preds[0][sound_class_idx] > 0.05:  # Low threshold to detect any hint of percussive sounds
+                            is_percussive = True
+                            logger.info(f"Detected potential percussive sound: {class_names[sound_class_idx] if sound_class_idx < len(class_names) else f'Unknown-{sound_class_idx}'} ({sound_preds[0][sound_class_idx]:.4f})")
+                            break
+                except Exception as e:
+                    logger.error(f"Error checking for percussive sounds: {e}")
+                    # Continue with is_percussive = False
                 
                 # Process sound classification with our enhanced logic
+                # We pass None for audio_data and sample_rate since we're working with pre-computed features
                 best_class_idx, best_confidence = process_sound_classification(
                     None, None, best_pred_confidence, best_pred_class, is_percussive, db_level
                 )
@@ -967,7 +999,7 @@ def handle_audio_feature_data(data):
                     # Format prediction data
                     formatted_time = time.strftime("%Y-%m-%d %H:%M:%S")
                     predicted_sound = {
-                        'sound': class_names[best_class_idx],
+                        'sound': class_names[best_class_idx] if best_class_idx < len(class_names) else f"Unknown-{best_class_idx}",
                         'confidence': f"{best_confidence:.2f}",
                         'db_level': f"{db_level:.2f}" if db_level is not None else "N/A",
                         'time': formatted_time,
@@ -982,7 +1014,10 @@ def handle_audio_feature_data(data):
                     socketio.emit('sound_notification', predicted_sound)
                     
                     # Add to conversation history
-                    add_to_conversation_history(predicted_sound)
+                    try:
+                        add_to_conversation_history(predicted_sound)
+                    except Exception as e:
+                        logger.error(f"Error adding to conversation history: {e}")
             
             except Exception as e:
                 logger.error(f"Error in sound prediction: {e}")
@@ -1026,7 +1061,7 @@ def index():
     return render_template('index.html')
 
 @app.route('/conversation-history')
-def conversation_history():
+def conversation_history_page():
     """Serve the conversation history page"""
     return send_from_directory('static', 'conversation-history.html')
 
@@ -1233,9 +1268,34 @@ def analyze_text_sentiment(text):
         logger.error(traceback.format_exc())
         return None
 
+def process_speech():
+    """Process the speech buffer for speech recognition"""
+    global speech_buffer
+    
+    try:
+        if not ENABLE_SPEECH or not GOOGLE_SPEECH_AVAILABLE:
+            # Clear buffer and return if speech processing is disabled
+            speech_buffer = []
+            return
+            
+        logger.info(f"Processing speech buffer with {len(speech_buffer)} samples")
+        
+        # Add audio data to continuous speech analysis if available
+        if continuous_speech_thread is not None:
+            continuous_speech_thread.add_audio_data(np.array(speech_buffer))
+            
+        # Clear the buffer after processing
+        speech_buffer = []
+            
+    except Exception as e:
+        logger.error(f"Error processing speech: {e}")
+        logger.error(traceback.format_exc())
+        # Clear buffer on error to prevent buildup
+        speech_buffer = []
+
 def process_audio_data(audio_data, sample_rate=16000):
     """Process incoming audio data for sound classification and speech recognition"""
-    global is_first_audio_packet, active_transcription, sound_preds
+    global is_first_audio_packet, active_transcription, sound_preds, speech_buffer
     
     try:
         # Check if we have audio data
@@ -1289,11 +1349,19 @@ def process_audio_data(audio_data, sample_rate=16000):
                 best_pred_class = np.argmax(sound_preds[0])
                 best_pred_confidence = sound_preds[0][best_pred_class]
                 
-                # Debug: log top 3 predictions
+                # Debug: log top 3 predictions - with error handling for index errors
                 class_names = homesounds.get_class_names()
-                top_indices = np.argsort(sound_preds[0])[-3:][::-1]
-                top_preds = [(class_names[i], sound_preds[0][i]) for i in top_indices]
-                logger.info(f"Top 3 predictions: {top_preds}")
+                try:
+                    top_indices = np.argsort(sound_preds[0])[-3:][::-1]
+                    top_preds = []
+                    for i in top_indices:
+                        if i < len(class_names):
+                            top_preds.append((class_names[i], sound_preds[0][i]))
+                        else:
+                            top_preds.append((f"Unknown-{i}", sound_preds[0][i]))
+                    logger.info(f"Top 3 predictions: {top_preds}")
+                except Exception as e:
+                    logger.error(f"Error getting top predictions: {e}")
                 
                 # Process sound classification with our enhanced logic
                 best_class_idx, best_confidence = process_sound_classification(
@@ -1305,7 +1373,7 @@ def process_audio_data(audio_data, sample_rate=16000):
                     # Format prediction data
                     formatted_time = time.strftime("%Y-%m-%d %H:%M:%S")
                     predicted_sound = {
-                        'sound': class_names[best_class_idx],
+                        'sound': class_names[best_class_idx] if best_class_idx < len(class_names) else f"Unknown-{best_class_idx}",
                         'confidence': f"{best_confidence:.2f}",
                         'db_level': f"{dB:.2f}",
                         'time': formatted_time,
@@ -1319,17 +1387,20 @@ def process_audio_data(audio_data, sample_rate=16000):
                     logger.info(f"Emitting sound_notification to clients: {predicted_sound}")
                     socketio.emit('sound_notification', predicted_sound)
                     
-                    # Add to conversation history
-                    add_to_conversation_history(predicted_sound)
+                    # Add to conversation history - with error handling
+                    try:
+                        add_to_conversation_history(predicted_sound)
+                    except Exception as e:
+                        logger.error(f"Error adding to conversation history: {e}")
             
             except Exception as e:
                 logger.error(f"Error in sound prediction: {e}")
                 logger.error(traceback.format_exc())
             
         # Process for speech recognition if enabled and audio is not too quiet
-        if ENABLE_SPEECH and dB >= SPEECH_DBLEVEL_THRES:
+        if ENABLE_SPEECH and GOOGLE_SPEECH_AVAILABLE and dB >= SPEECH_DBLEVEL_THRES:
             # Add to speech buffer
-            speech_buffer.extend(audio_data)
+            speech_buffer.extend(audio_data.tolist() if isinstance(audio_data, np.ndarray) else audio_data)
             
             # Process speech in buffer if we have enough data
             if len(speech_buffer) >= SPEECH_BUFFER_SIZE:
