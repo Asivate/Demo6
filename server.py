@@ -123,11 +123,11 @@ def handle_source(json_data):
     predictions.append(pred)
 
     with graph.as_default():
-    if x.shape[0] != 0:
-        x = x.reshape(len(x), 96, 64, 1)
-        print('Successfully reshape x', x)
-        # pred = model.predict(x)
-        # predictions.append(pred)
+        if x.shape[0] != 0:
+            x = x.reshape(len(x), 96, 64, 1)
+            print('Successfully reshape x', x)
+            # pred = model.predict(x)
+            # predictions.append(pred)
 
     for prediction in predictions:
         context_prediction = np.take(
@@ -199,12 +199,4 @@ def test_disconnect():
 
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Run the SoundWatch server')
-    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--host', default='0.0.0.0', help='Server host (default: 0.0.0.0 to allow connections from anywhere)')
-    parser.add_argument('--port', type=int, default=8080, help='Server port (default: 8080)')
-    args = parser.parse_args()
-    
-    print(f"Starting server on {args.host}:{args.port}")
-    socketio.run(app, host=args.host, port=args.port, debug=args.debug)
+    socketio.run(app, debug=True)
