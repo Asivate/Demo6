@@ -121,94 +121,52 @@ to_human_labels = {
     19: "Water boiling"
 }
 
-# Label to index mapping
-labels = {
-    "alarm": 0,
-    "baby_crying": 1,
-    "car_horn": 2,
-    "cat_meowing": 3,
-    "dishes": 4,
-    "dog_barking": 5,
-    "door_knock": 6,
-    "doorbell": 7,
-    "footsteps": 8,
-    "glass_breaking": 9,
-    "keyboard_typing": 10,
-    "microwave": 11,
-    "phone_ringing": 12,
-    "shower": 13,
-    "sink_water_running": 14,
-    "snoring": 15,
-    "speech": 16,
-    "toilet_flush": 17,
-    "vacuum_cleaner": 18,
-    "water_boiling": 19
+# Original HomeSounds mapping for comparison
+original_to_human_labels = {
+    'dog-bark': "Dog Barking",
+    'drill': "Drill In-Use",
+    'hazard-alarm': "Fire/Smoke Alarm",
+    'phone-ring': "Phone Ringing",
+    'speech': "Speech",
+    'vacuum': "Vacuum In-Use",
+    'baby-cry': "Baby Crying",
+    'chopping': "Chopping",
+    'cough': "Coughing",
+    'door': "Door In-Use",
+    'water-running': "Water Running",
+    'knock': "Knocking",  # This is critical - the knock label is at index 11 in original
+    'microwave': "Microwave",
+    'shaver': "Shaver In-Use",
+    'toothbrush': "Toothbrushing",
+    'blender': "Blender In-Use",
+    'dishwasher': "Dishwasher",
+    'doorbell': "Doorbel In-Use",
+    'flush': "Toilet Flushing",
+    'hair-dryer': "Hair Dryer In-Use",
+    'laugh': "Laughing",
+    'snore': "Snoring",
+    'typing': "Typing",
+    'hammer': "Hammering",
+    'car-horn': "Car Honking",
+    'engine': "Vehicle Running",
+    'saw': "Saw In-Use",
+    'cat-meow': "Cat Meowing",
+    'alarm-clock': "Alarm Clock",
+    'cooking': "Utensils and Cutlery",  # This is likely being confused with knocking
 }
 
-# Group sounds by category
-sound_categories = {
-    "Alerts": ["Alarm", "Doorbell", "Phone ringing", "Door knock", "Car horn"],
-    "Human": ["Speech", "Baby crying", "Footsteps", "Snoring", "Keyboard typing"],
-    "Animal": ["Dog barking", "Cat meowing"],
-    "Water": ["Sink water running", "Shower", "Toilet flush", "Water boiling"],
-    "Appliance": ["Microwave", "Vacuum cleaner"],
-    "Household": ["Dishes", "Glass breaking"]
-}
+# CORRECTED model index mapping for percussive sounds
+KNOCK_IDX = 6  # Current index for Door knock in to_human_labels 
+DISHES_IDX = 4  # Current index for Dishes in to_human_labels
+GLASS_BREAKING_IDX = 9  # Current index for Glass breaking in to_human_labels
 
-# Priority levels for sounds (higher number = higher priority)
-sound_priorities = {
-    "Alarm": 10,
-    "Baby crying": 9,
-    "Door knock": 8,
-    "Doorbell": 8,
-    "Glass breaking": 8,
-    "Phone ringing": 7,
-    "Car horn": 7,
-    "Dog barking": 6,
-    "Cat meowing": 5,
-    "Speech": 5,
-    "Footsteps": 4,
-    "Toilet flush": 3,
-    "Shower": 3,
-    "Sink water running": 3,
-    "Water boiling": 3,
-    "Microwave": 2,
-    "Vacuum cleaner": 2,
-    "Dishes": 2,
-    "Keyboard typing": 1,
-    "Snoring": 1
-}
-
-# Enhanced threshold configuration with temporal smoothing
-SOUND_THRESHOLDS = {
-    # Base thresholds (db > 60)
-    'speech': {'base': 0.65, 'min': 0.4, 'priority': 1},
-    'hazard-alarm': {'base': 0.4, 'min': 0.3, 'priority': 3},
-    'door': {'base': 0.5, 'min': 0.35, 'priority': 2},
-    'water-running': {'base': 0.55, 'min': 0.4, 'priority': 2},
-    'baby-cry': {'base': 0.45, 'min': 0.3, 'priority': 3},
-    # ... other classes
-}
-
-CONTEXT_WEIGHTS = {
-    'kitchen': {
-        'weights': {'water-running': 1.5, 'hazard-alarm': 2.0},
-        'suppress': ['speech', 'music']
-    },
-    'bedroom': {
-        'weights': {'baby-cry': 2.0, 'snore': 1.8},
-        'suppress': ['drill', 'hammer']
-    },
-    # ... other contexts
-}
-
-# Stateful prediction history for temporal smoothing 
-PREDICTION_HISTORY = {}
+# Define percussive sounds that need special handling
+percussive_sounds = ['Door knock', 'Glass breaking', 'Dishes']
 
 # Define sound-specific thresholds
 sound_specific_thresholds = {
-    'Door knock': 0.3,   # Reasonable threshold for knock detection (30%)
-    'Dishes': 0.4,       # Make dishes threshold higher to avoid confusion with knocking
+    'Door knock': 0.15,   # Lower threshold for knock detection (from 0.3 to 0.15)
+    'Dishes': 0.4,       # Keep dishes threshold higher to avoid confusion with knocking
     'door-bell': 0.4,
     'dog-bark': 0.4,
     'baby-cry': 0.3,
@@ -216,9 +174,6 @@ sound_specific_thresholds = {
     'vacuum-cleaner': 0.35
     # Default threshold of 0.5 will be used for any sound not specified here
 }
-
-# Define percussive sounds that need special handling
-percussive_sounds = ['Door knock', 'Glass breaking', 'Dishes']
 
 # Map model index to actual sound class for specialized detection
 class_names = get_class_names()
@@ -295,7 +250,7 @@ class SoundDetectionHistory:
         min_confidence = 0.01  # Prevent complete decay
         return max(weighted_sum, min_confidence)
 
-    def check_for_percussive_sound(self, sound_class, current_confidence, db_level, min_time_between=1.5):
+    def check_for_percussive_sound(self, sound_class, current_confidence, db_level, min_time_between=1.0):  # Changed from 1.5s to 1.0s
         """Special handling for percussive sounds like knocking
         
         Args:
@@ -320,14 +275,14 @@ class SoundDetectionHistory:
         # 1. The sound hasn't been detected recently (avoid duplicate detections)
         # 2. The dB level is sufficiently high (indicating a sharp sound)
         # 3. There's at least some base confidence
-        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES) * 0.5  # Only need 50% of threshold for boosting
         
         # Adjust for knocking with special handling
-        if sound_class == 'Door knock' and current_confidence > min_confidence * 0.7:  # At least 70% of threshold
+        if sound_class == 'Door knock' and current_confidence > min_confidence:  # Lower activation threshold
             # Check for dB spike which is common with knocks
-            if db_level > -15 and time_since_last > min_time_between:  # Reasonable dB threshold
-                # Boost confidence for knock detection - reasonable multiplier
-                adjusted_confidence = min(current_confidence * 1.5, 0.95)  # Don't exceed 95%
+            if db_level > -20 and time_since_last > min_time_between:  # More sensitive dB threshold (was -15)
+                # Boost confidence for knock detection - higher multiplier
+                adjusted_confidence = min(current_confidence * 2.5, 0.95)  # Boost by 2.5x (was 1.5x)
                 # Record this detection time
                 self.last_detection[sound_class] = current_time
                 logger.info(f"Enhanced Door knock detection: {current_confidence:.4f} → {adjusted_confidence:.4f}")
@@ -336,14 +291,27 @@ class SoundDetectionHistory:
         # Special handling for Dishes class, which often activates during knocking
         if sound_class == 'Dishes' and current_confidence > min_confidence * 0.8:
             # If it's a sharp sound with high dB, it might be a knock misclassified as dishes
-            if db_level > -10 and time_since_last > min_time_between:
+            if db_level > -15 and time_since_last > min_time_between:
                 # Check if we have 'knock' data in history to ensure we're not creating false positives
                 if 'Door knock' in self.history and len(self.history['Door knock']) > 0:
                     knock_confidence = self.get_smoothed_confidence('Door knock')
-                    # If there's reasonable knock confidence, make a note
-                    if knock_confidence > 0.1:  # More reasonable threshold
-                        # Don't adjust dishes confidence, but make a note that it might be a knock
-                        logger.info(f"Possible knock detected as dishes: dishes={current_confidence:.4f}, knock={knock_confidence:.4f}")
+                    # If there's any knock confidence at all, transfer some confidence from dishes to knock
+                    if knock_confidence > 0.05:  # Lowered from 0.1
+                        # Transfer 40% of dishes confidence to Door knock (was just noting this relationship)
+                        knock_boost = current_confidence * 0.4
+                        logger.info(f"Transferring confidence from Dishes to Door knock: {knock_boost:.4f}")
+                        
+                        # Update Door knock confidence
+                        transfer_time = time.time()
+                        if 'Door knock' not in self.history:
+                            self.history['Door knock'] = []
+                        self.history['Door knock'].append((transfer_time, knock_boost + knock_confidence))
+                        
+                        # Record this as a Door knock detection
+                        self.last_detection['Door knock'] = current_time
+                        
+                        # Return lower confidence for dishes
+                        return current_confidence * 0.6
         
         return current_confidence
 
@@ -351,7 +319,7 @@ class SoundDetectionHistory:
 detection_history = SoundDetectionHistory(window_size=3, decay_factor=0.7)
 
 # Add a new method to detect abrupt changes in audio levels that might indicate knocking
-def detect_percussive_event(audio_data, sample_rate=16000, threshold=0.4):
+def detect_percussive_event(audio_data, sample_rate=16000, threshold=0.25):  # Lower threshold from 0.4 to 0.25
     """
     Detect percussive events like knocking in audio data
     
@@ -371,8 +339,8 @@ def detect_percussive_event(audio_data, sample_rate=16000, threshold=0.4):
             return False
             
         # Calculate short-term energy
-        frame_length = int(0.015 * sample_rate)  # 15ms frames
-        hop_length = int(0.0075 * sample_rate)   # 7.5ms hop
+        frame_length = int(0.01 * sample_rate)  # 10ms frames for better detection (was 15ms)
+        hop_length = int(0.005 * sample_rate)   # 5ms hop (was 7.5ms)
         
         # Ensure we have enough data
         if len(audio_norm) < frame_length:
@@ -398,14 +366,14 @@ def detect_percussive_event(audio_data, sample_rate=16000, threshold=0.4):
         if len(energy_diff) > 10:
             # Find peaks using peak detection
             from scipy.signal import find_peaks
-            peaks, _ = find_peaks(energy_diff, height=threshold*0.5, distance=3)
+            peaks, _ = find_peaks(energy_diff, height=threshold*0.4, distance=3)  # More sensitive peak detection
             
             # If we found more than one peak within a short time
             if len(peaks) >= 2:
                 # Check if they're spaced appropriately for a knock
                 peak_spacing = np.diff(peaks)
-                # Look for peaks between 5-20 frames apart (~ 40-150ms at 7.5ms hop)
-                if any((peak_spacing >= 5) & (peak_spacing <= 20)):
+                # Look for peaks between 4-25 frames apart (wider range to catch more variations)
+                if any((peak_spacing >= 4) & (peak_spacing <= 25)):
                     logger.info(f"Knock pattern detected: {len(peaks)} peaks, max diff={np.max(energy_diff):.4f}")
                     return True
         
@@ -517,7 +485,7 @@ def compute_features(audio_data, sample_rate=16000):
         is_percussive = detect_percussive_event(audio_data, sample_rate)
         
         # Pre-emphasis filter to enhance higher frequencies (better for percussive sounds)
-        pre_emphasis = 0.97  # Standard pre-emphasis coefficient
+        pre_emphasis = 0.95  # Moderate pre-emphasis coefficient (was 0.97)
         emphasized_audio = np.append(audio_data[0], audio_data[1:] - pre_emphasis * audio_data[:-1])
         
         # Normalize audio data to -1 to 1 range
@@ -525,20 +493,20 @@ def compute_features(audio_data, sample_rate=16000):
             emphasized_audio = emphasized_audio / np.max(np.abs(emphasized_audio))
         
         # Set spectrogram parameters
-        n_fft = 1024  # FFT window size
-        hop_length = 512  # Hop length (stride)
+        n_fft = 512  # Shorter FFT window size for better time resolution (was 1024)
+        hop_length = 256  # Shorter hop for better time resolution (was 512)
         n_mels = 64  # Number of Mel bands
         
         # For percussive sounds, we might want a slightly shorter window
         if is_percussive:
             logger.info("Using shorter window for percussive sound")
-            n_fft = 512  # Shorter window for better time resolution
-            hop_length = 256  # Shorter hop for better time resolution
+            n_fft = 256  # Even shorter window for better time resolution (was 512)
+            hop_length = 128  # Shorter hop for better time resolution (was 256)
         
         # Compute spectrogram
         # Short-time Fourier transform
         f, t, Zxx = signal.stft(emphasized_audio, fs=sample_rate, nperseg=n_fft, 
-                               noverlap=n_fft-hop_length, window='hann')
+                              noverlap=n_fft-hop_length, window='hann')
         
         # Convert to magnitude spectrogram
         spec = np.abs(Zxx)
@@ -584,7 +552,7 @@ def compute_features(audio_data, sample_rate=16000):
             time_deriv[:, 1:] = spec[:, 1:] - spec[:, :-1]
             
             # Blend with original, emphasizing transients
-            spec = spec + 0.3 * np.abs(time_deriv)  # Moderate enhancement
+            spec = spec + 0.5 * np.abs(time_deriv)  # Higher enhancement factor (was 0.3)
             
             # Re-normalize
             spec = (spec - np.min(spec)) / (np.max(spec) - np.min(spec) + epsilon)
@@ -607,12 +575,12 @@ def get_class_names():
     Returns the list of class names used by the model output, properly mapped
     to human-readable labels.
     
-    The model outputs a 42-dimensional vector, and we need to know which
+    The model outputs a vector, and we need to know which
     index corresponds to which sound class.
     """
     # Create an array of class names in the order the model expects
     class_names = []
-    for i in range(len(labels)):
+    for i in range(20):  # The model actually outputs 20 classes, not all of labels
         if i in to_human_labels:
             class_names.append(to_human_labels[i])
         else:

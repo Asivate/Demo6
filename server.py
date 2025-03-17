@@ -852,19 +852,20 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 # If percussive event was detected, boost the confidences of percussive sounds
                 if is_percussive:
                     # Get indices of Door knock and other percussive sounds in model output
-                    knock_idx = 6  # Based on to_human_labels mapping
-                    dishes_idx = 4  # Based on to_human_labels mapping
+                    knock_idx = homesounds.KNOCK_IDX  # Use the corrected index constant (6)
+                    dishes_idx = homesounds.DISHES_IDX  # Use the corrected index constant (4)
+                    glass_idx = homesounds.GLASS_BREAKING_IDX  # Use the corrected index constant (9)
                     
                     # Boost these indices if they have even minimal activation
-                    if prediction[knock_idx] > 0.1:  # Reasonable threshold
-                        # Boost the confidence by a reasonable amount
-                        prediction[knock_idx] *= 1.3  # 30% boost
+                    if prediction[knock_idx] > 0.05:  # Lower threshold (was 0.1)
+                        # Boost the confidence by a higher amount
+                        prediction[knock_idx] *= 2.0  # 100% boost (was 30%)
                         logger.info(f"Boosted Door knock confidence due to percussive event: {prediction[knock_idx]:.4f}")
                     
                     # If dishes is high but knock has reasonable activation, it might be a knock misclassified as dishes
-                    if prediction[dishes_idx] > 0.3 and prediction[knock_idx] > 0.1:
-                        # Transfer some confidence from dishes to knock
-                        transfer = prediction[dishes_idx] * 0.2  # Transfer 20% of dishes confidence
+                    if prediction[dishes_idx] > 0.2 and prediction[knock_idx] > 0.05:  # Lower thresholds
+                        # Transfer more confidence from dishes to knock
+                        transfer = prediction[dishes_idx] * 0.4  # Transfer 40% of dishes confidence (was 20%)
                         prediction[dishes_idx] -= transfer
                         prediction[knock_idx] += transfer
                         logger.info(f"Transferred confidence from Dishes to Door knock: {transfer:.4f}")
@@ -916,11 +917,21 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             if is_percussive and (best_class is None or best_confidence < sound_threshold):
                 knock_confidence = homesounds.detection_history.get_smoothed_confidence("Door knock")
                 knock_threshold = SOUND_SPECIFIC_THRESHOLDS.get("Door knock", 0.3)
-                if knock_confidence > knock_threshold * 0.7:
+                if knock_confidence > knock_threshold * 0.5:  # Lower threshold (was 0.7)
                     # Set door knock as best class with boosted confidence
                     best_class = "Door knock"
-                    best_confidence = knock_confidence * 1.3  # 30% boost
+                    best_confidence = knock_confidence * 2.0  # Higher boost (was 1.3)
                     logger.info(f"Detected Door knock with boosted confidence: {knock_confidence:.4f} → {best_confidence:.4f}")
+            
+            # Extra check for knock false-negatives
+            if best_class == "Dishes" and is_percussive:
+                # Check if there's any knock confidence at all
+                knock_confidence = homesounds.detection_history.get_smoothed_confidence("Door knock")
+                if knock_confidence > 0.05:  # Very low threshold since we already know it's percussive
+                    # This is likely a knock misidentified as dishes
+                    best_class = "Door knock"
+                    best_confidence = knock_confidence * 2.0 + best_confidence * 0.3  # Combine both confidences
+                    logger.info(f"Reclassified Dishes as Door knock with combined confidence: {best_confidence:.4f}")
             
             if best_class is None:
                 logger.info("No sound class met the confidence threshold, skipping notification")
