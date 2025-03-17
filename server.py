@@ -14,6 +14,22 @@ import argparse
 import wget
 from helpers import dbFS
 import os
+from socketio.base_manager import BaseManager
+from bidict import ValueDuplicationError
+
+# Create a custom manager to handle ValueDuplicationError
+class CustomManager(BaseManager):
+    def connect(self, eio_sid, namespace):
+        try:
+            return super().connect(eio_sid, namespace)
+        except ValueDuplicationError:
+            # If the eio_sid is already in use, reuse it instead of failing
+            print(f"Value duplication for eio_sid {eio_sid}, reusing existing session")
+            for sid, sid_eio_sid in self.rooms[namespace][None].items():
+                if sid_eio_sid == eio_sid:
+                    return sid  # Return the existing session id
+            # If we're here, something unexpected happened
+            raise
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -23,7 +39,8 @@ async_mode = None
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 # Initialize SocketIO with CORS support and ensure it works with Engine.IO v4
-socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*", logger=True, engineio_logger=True, 
+                   manage_session=False, manager=CustomManager())
 thread = None
 thread_lock = Lock()
 
@@ -121,7 +138,7 @@ def handle_source(json_data):
                            'accuracy': str(context_prediction[m])})
             print("Prediction: %s (%0.2f)" % (
                 homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-    socket.emit('audio_label',
+    socketio.emit('audio_label',
                 {
                     'label': 'Unrecognized Sound',
                     'accuracy': '1.0'
@@ -144,36 +161,33 @@ def handle_source(json_data):
     print('Making prediction...')
     x = waveform_to_examples(np_wav, RATE)
     predictions = []
-    if x.shape[0] != 0:
-        x = x.reshape(len(x), 96, 64, 1)
-    print('Successfully reshape x', x.shape)
-    pred = model.predict(x)
-    predictions.append(pred)
-
+    
     with graph.as_default():
         if x.shape[0] != 0:
             x = x.reshape(len(x), 96, 64, 1)
-            print('Successfully reshape x', x)
-            # pred = model.predict(x)
-            # predictions.append(pred)
-
-    for prediction in predictions:
-        context_prediction = np.take(
-            prediction[0], [homesounds.labels[x] for x in active_context])
-        m = np.argmax(context_prediction)
-        print('Max prediction', str(
-            homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-        if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+            print('Successfully reshape x', x.shape)
+            pred = model.predict(x)
+            predictions.append(pred)
+            
+            for prediction in predictions:
+                context_prediction = np.take(
+                    prediction[0], [homesounds.labels[x] for x in active_context])
+                m = np.argmax(context_prediction)
+                print('Max prediction', str(
+                    homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
+                if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    socketio.emit('audio_label',
+                                {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                'accuracy': str(context_prediction[m])})
+                    print("Prediction: %s (%0.2f)" % (
+                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+        else:
+            print("No audio features extracted, skipping prediction")
             socketio.emit('audio_label',
-                          {'label': str(homesounds.to_human_labels[active_context[m]]),
-                           'accuracy': str(context_prediction[m])})
-            print("Prediction: %s (%0.2f)" % (
-                homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-    socket.emit('audio_label',
-                {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '1.0'
-                })
+                        {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '1.0'
+                        })
 
 
 def background_thread():
