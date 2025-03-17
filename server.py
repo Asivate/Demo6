@@ -109,6 +109,9 @@ last_audio_data = None
 last_timestamp = None
 last_audio_lock = threading.RLock()  # Lock for thread-safe access to last audio data
 
+# At top with other constants
+SOUND_SPECIFIC_THRESHOLDS = homesounds.sound_specific_thresholds  # Centralized reference
+
 # Performance timer decorator
 def performance_timer(func):
     """Decorator to log execution time for functions."""
@@ -887,6 +890,10 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             best_confidence = 0
             
             for sound_class, raw_confidence in prediction_dict.items():
+                # Apply class-specific multipliers
+                if sound_class == 'Door knock':
+                    raw_confidence *= 5.0  # Boost knock confidence temporarily
+                
                 # Get smoothed confidence from temporal history
                 smoothed_confidence = homesounds.detection_history.get_smoothed_confidence(sound_class)
                 
@@ -895,7 +902,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                     sound_class, smoothed_confidence, db_level)
                 
                 # Get the threshold for this specific sound class
-                sound_threshold = homesounds.sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+                sound_threshold = SOUND_SPECIFIC_THRESHOLDS.get(sound_class, PREDICTION_THRES)
                 
                 logger.debug(f"Sound '{sound_class}': raw={raw_confidence:.4f}, smoothed={smoothed_confidence:.4f}, adjusted={adjusted_confidence:.4f}, threshold={sound_threshold:.4f}")
                 
@@ -906,10 +913,10 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             
             # Special case: if we detected a percussive event but no class is above threshold
             # and "Door knock" has reasonable confidence, consider it a knock
-            if is_percussive and (best_class is None or best_confidence < PREDICTION_THRES):
+            if is_percussive and (best_class is None or best_confidence < sound_threshold):
                 knock_confidence = homesounds.detection_history.get_smoothed_confidence("Door knock")
-                knock_threshold = homesounds.sound_specific_thresholds.get("Door knock", PREDICTION_THRES)
-                if knock_confidence > knock_threshold * 0.7:  # At least 70% of threshold
+                knock_threshold = SOUND_SPECIFIC_THRESHOLDS.get("Door knock", 0.3)
+                if knock_confidence > knock_threshold * 0.7:
                     # Set door knock as best class with boosted confidence
                     best_class = "Door knock"
                     best_confidence = knock_confidence * 1.3  # 30% boost
@@ -920,7 +927,7 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 return
                 
             # Get the threshold for this specific sound
-            sound_threshold = homesounds.sound_specific_thresholds.get(best_class, PREDICTION_THRES)
+            sound_threshold = SOUND_SPECIFIC_THRESHOLDS.get(best_class, PREDICTION_THRES)
             
             # Skip if confidence is too low
             if best_confidence < sound_threshold:
@@ -1071,6 +1078,10 @@ def handle_audio_feature_data(data):
             best_confidence = 0
             
             for sound_class, raw_confidence in prediction_dict.items():
+                # Apply class-specific multipliers
+                if sound_class == 'Door knock':
+                    raw_confidence *= 5.0  # Boost knock confidence temporarily
+                
                 # Get smoothed confidence from temporal history
                 smoothed_confidence = homesounds.detection_history.get_smoothed_confidence(sound_class)
                 
@@ -1079,7 +1090,7 @@ def handle_audio_feature_data(data):
                     sound_class, smoothed_confidence, db_level)
                 
                 # Get the threshold for this specific sound class
-                sound_threshold = homesounds.sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+                sound_threshold = SOUND_SPECIFIC_THRESHOLDS.get(sound_class, PREDICTION_THRES)
                 
                 logger.debug(f"Sound '{sound_class}': raw={raw_confidence:.4f}, smoothed={smoothed_confidence:.4f}, adjusted={adjusted_confidence:.4f}, threshold={sound_threshold:.4f}")
                 
@@ -1093,7 +1104,7 @@ def handle_audio_feature_data(data):
                 return
                 
             # Get the threshold for this specific sound
-            sound_threshold = homesounds.sound_specific_thresholds.get(best_class, PREDICTION_THRES)
+            sound_threshold = SOUND_SPECIFIC_THRESHOLDS.get(best_class, PREDICTION_THRES)
             
             # Skip if confidence is too low
             if best_confidence < sound_threshold:

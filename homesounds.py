@@ -221,9 +221,10 @@ sound_specific_thresholds = {
 percussive_sounds = ['Door knock', 'Glass breaking', 'Dishes']
 
 # Map model index to actual sound class for specialized detection
+class_names = get_class_names()
 model_index_to_sound_class = {
-    6: "Door knock",  # Index 6 in model outputs corresponds to Door knock
-    4: "Dishes"       # Index 4 often gets activated when knocking occurs
+    idx: name for idx, name in enumerate(class_names) 
+    if name in percussive_sounds
 }
 
 # Add temporal smoothing for sound detection
@@ -290,7 +291,9 @@ class SoundDetectionHistory:
         if total_weight == 0:
             return 0.0
             
-        return weighted_sum / total_weight
+        # Add minimum confidence decay
+        min_confidence = 0.01  # Prevent complete decay
+        return max(weighted_sum, min_confidence)
 
     def check_for_percussive_sound(self, sound_class, current_confidence, db_level, min_time_between=1.5):
         """Special handling for percussive sounds like knocking
@@ -317,7 +320,7 @@ class SoundDetectionHistory:
         # 1. The sound hasn't been detected recently (avoid duplicate detections)
         # 2. The dB level is sufficiently high (indicating a sharp sound)
         # 3. There's at least some base confidence
-        min_confidence = sound_specific_thresholds.get(sound_class, 0.3)
+        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
         
         # Adjust for knocking with special handling
         if sound_class == 'Door knock' and current_confidence > min_confidence * 0.7:  # At least 70% of threshold
