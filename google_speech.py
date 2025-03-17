@@ -21,10 +21,64 @@ from threading import Lock
 import traceback
 import re
 from scipy import signal
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Enhanced credential handling function
+def setup_google_credentials():
+    """Set up Google Cloud credentials for the Speech API"""
+    # Check if environment variable already exists
+    creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+    
+    if creds_path and os.path.exists(creds_path):
+        logger.info(f"Using Google Cloud credentials from environment variable: {creds_path}")
+        return True
+        
+    # Potential locations to check for credential files
+    possible_locations = [
+        # Home directory with exact filename
+        os.path.expanduser("~/asivate-452914-9778a9b91269.json"),
+        # Server directory
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "asivate-452914-9778a9b91269.json"),
+        # Parent directory of server
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "asivate-452914-9778a9b91269.json"),
+        # Look for any .json files in home directory that might be credential files
+        *[os.path.join(os.path.expanduser("~"), f) for f in os.listdir(os.path.expanduser("~")) 
+          if f.endswith('.json') and os.path.isfile(os.path.join(os.path.expanduser("~"), f))]
+    ]
+    
+    # Find and validate credential files
+    for path in possible_locations:
+        if os.path.exists(path):
+            logger.info(f"Found potential credentials file: {path}")
+            try:
+                # Validate that it's actually a credentials file
+                with open(path, 'r') as f:
+                    cred_data = json.load(f)
+                    if 'type' in cred_data and cred_data['type'] == 'service_account':
+                        # Set the environment variable
+                        os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = path
+                        logger.info(f"✅ Successfully set GOOGLE_APPLICATION_CREDENTIALS to {path}")
+                        
+                        # Print details about the service account being used
+                        logger.info(f"Using service account: {cred_data.get('client_email')}")
+                        logger.info(f"Project ID: {cred_data.get('project_id')}")
+                        
+                        return True
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"File {path} is not a valid credentials file: {e}")
+                continue
+    
+    logger.error("No valid Google Cloud credentials file found!")
+    logger.error("Please set GOOGLE_APPLICATION_CREDENTIALS environment variable manually")
+    logger.error("Example: export GOOGLE_APPLICATION_CREDENTIALS=~/your-credentials-file.json")
+    return False
+
+# Call the setup function at module load time
+CREDENTIALS_SETUP = setup_google_credentials()
 
 # Define filter_hallucinations function similar to the one in speech_to_text.py
 def filter_hallucinations(text):
@@ -398,13 +452,35 @@ def transcribe_with_google(audio_data, sample_rate=16000):
             logger.error("Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
             return ""
             
+        # Ensure credentials are set up
+        if not CREDENTIALS_SETUP:
+            logger.info("Attempting to set up credentials again...")
+            setup_google_credentials()
+            
         # Check if credentials are available
         if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
             logger.error("Google Cloud credentials not set. Set GOOGLE_APPLICATION_CREDENTIALS environment variable.")
             logger.error("Transcription will likely fail without valid credentials.")
+        else:
+            # Log details about the credentials file being used
+            creds_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+            logger.info(f"Using credentials file: {creds_path}")
+            if os.path.exists(creds_path):
+                logger.info(f"✅ Credentials file exists")
+                try:
+                    with open(creds_path, 'r') as f:
+                        cred_data = json.load(f)
+                        logger.info(f"Service account: {cred_data.get('client_email')}")
+                        logger.info(f"Project ID: {cred_data.get('project_id')}")
+                except Exception as e:
+                    logger.error(f"Error reading credentials file: {e}")
+            else:
+                logger.error(f"❌ Credentials file does not exist at {creds_path}")
         
+        # Attempt to create a client
         try:
             client = speech.SpeechClient()
+            logger.info("Successfully created Speech client")
         except Exception as e:
             logger.error(f"Failed to initialize Google Speech client: {e}")
             return ""
@@ -457,6 +533,10 @@ def transcribe_with_google(audio_data, sample_rate=16000):
             return transcription
         except Exception as e:
             logger.error(f"Error in Google Speech API recognize call: {e}")
+            if "403" in str(e) and "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in str(e):
+                logger.error("Permission denied: Your service account doesn't have the right permissions")
+                logger.error("You need to give your service account the 'Speech API user' role")
+                logger.error("Go to the Google Cloud Console -> IAM -> Edit service account -> Add 'Speech API user' role")
             return ""
             
     except Exception as e:

@@ -92,6 +92,11 @@ AUDIO_BUFFER_SIZE = 5  # Buffer size in seconds
 audio_buffer = []  # Buffer to store audio data for continuous processing
 audio_buffer_lock = threading.RLock()  # Lock for thread-safe access to audio buffer
 
+# Enhanced audio buffer for classification
+classification_buffer = []  # Buffer specifically for sound classification
+classification_buffer_lock = threading.RLock()
+MIN_SAMPLES_FOR_CLASSIFICATION = 16000  # Minimum samples needed for classification
+
 # Performance timer decorator
 def performance_timer(func):
     """Decorator to log execution time for functions."""
@@ -533,24 +538,38 @@ def handle_audio_data(data):
                     logger.warning("Cannot calculate dB level for empty audio data")
                     return
             
-            # Check if audio is too quiet
+            # Check if audio is too quiet for sentiment analysis
             if db_level is not None and db_level < DBLEVEL_THRES:
                 logger.info(f"Audio too quiet (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
                 return
             
-            # Add audio data to continuous speech analysis thread
+            # Add audio data to continuous speech analysis thread (always process for sentiment analysis)
             if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
                 logger.info(f"Adding audio data to speech analysis thread (length: {len(audio_data)})")
                 add_audio_for_analysis(audio_data, sample_rate)
             else:
                 logger.debug("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
             
-            # Process audio for sound classification (in parallel)
-            if len(audio_data) >= 16000:  # Ensure enough audio data for classification
-                logger.info(f"Processing audio data for sound classification (length: {len(audio_data)})")
-                process_sound_classification(audio_data, sample_rate, db_level)
-            else:
-                logger.debug(f"Audio data too short for classification, need 16000 samples, got {len(audio_data)}")
+            # Process audio for sound classification (buffer until we have enough)
+            with classification_buffer_lock:
+                # Add new audio to the buffer
+                classification_buffer.extend(audio_data)
+                buffer_length = len(classification_buffer)
+                
+                logger.info(f"Classification buffer now has {buffer_length} samples (need {MIN_SAMPLES_FOR_CLASSIFICATION})")
+                
+                # If we have enough samples, process for classification
+                if buffer_length >= MIN_SAMPLES_FOR_CLASSIFICATION:
+                    # Take the latest MIN_SAMPLES_FOR_CLASSIFICATION samples
+                    classification_data = np.array(classification_buffer[-MIN_SAMPLES_FOR_CLASSIFICATION:], dtype=np.float32)
+                    logger.info(f"Processing {MIN_SAMPLES_FOR_CLASSIFICATION} samples for sound classification")
+                    
+                    # Process the data for sound classification
+                    process_sound_classification(classification_data, sample_rate, db_level)
+                    
+                    # Clear the buffer (we could optionally keep some overlap)
+                    classification_buffer.clear()
+                    logger.info("Cleared classification buffer after processing")
         else:
             logger.warning("No 'data' field in received audio data message")
                 
