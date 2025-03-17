@@ -13,6 +13,7 @@ import time
 import argparse
 import wget
 from helpers import dbFS
+import os
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -49,6 +50,8 @@ print("=====")
 print("2 / 2: Checking model... ")
 print("=====")
 model_filename = "models/example_model.hdf5"
+# Create the models directory if it doesn't exist
+os.makedirs(os.path.dirname(model_filename), exist_ok=True)
 homesounds_model = Path(model_filename)
 if (not homesounds_model.is_file()):
     print("Downloading example_model.hdf5 [867MB]: ")
