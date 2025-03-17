@@ -84,7 +84,7 @@ transcript_history = []  # List to store transcription history
 ENABLE_SENTIMENT_ANALYSIS = True  # Set to False to disable sentiment analysis
 SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
 APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
-PREDICTION_THRES = 0.5  # Threshold for sound prediction confidence
+PREDICTION_THRES = 0.05  # Threshold for sound prediction confidence (lowered from 0.5 to 0.05)
 DBLEVEL_THRES = 35  # Threshold for dB level to consider sound significant (lowered from 45)
 TARGET_SR = 16000  # Target sample rate for audio processing
 
@@ -846,37 +846,62 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 
             prediction_count += 1
             
-            # Get class with highest probability
-            max_idx = np.argmax(prediction)
-            max_prob = prediction[max_idx]
+            # Convert prediction array to dictionary of {class_name: confidence}
+            class_names = homesounds.get_class_names()
+            prediction_dict = {}
+            for i, prob in enumerate(prediction):
+                if i < len(class_names):
+                    prediction_dict[class_names[i]] = float(prob)
             
-            logger.info(f"Prediction result: max_idx={max_idx}, max_prob={max_prob:.4f}")
+            # Add prediction to temporal history
+            homesounds.detection_history.add_prediction(prediction_dict)
             
-            # Skip if confidence is too low
-            if max_prob < PREDICTION_THRES:
-                logger.info(f"Prediction confidence {max_prob:.4f} below threshold {PREDICTION_THRES}, skipping notification")
+            # Find the class with highest smoothed confidence and apply special handling for percussive sounds
+            best_class = None
+            best_confidence = 0
+            
+            for sound_class, raw_confidence in prediction_dict.items():
+                # Get smoothed confidence from temporal history
+                smoothed_confidence = homesounds.detection_history.get_smoothed_confidence(sound_class)
+                
+                # Apply special handling for percussive sounds (like knocking)
+                adjusted_confidence = homesounds.detection_history.check_for_percussive_sound(
+                    sound_class, smoothed_confidence, db_level)
+                
+                # Get the threshold for this specific sound class
+                sound_threshold = homesounds.sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+                
+                logger.debug(f"Sound '{sound_class}': raw={raw_confidence:.4f}, smoothed={smoothed_confidence:.4f}, adjusted={adjusted_confidence:.4f}, threshold={sound_threshold:.4f}")
+                
+                # Track the best class
+                if adjusted_confidence > best_confidence:
+                    best_confidence = adjusted_confidence
+                    best_class = sound_class
+            
+            if best_class is None:
+                logger.info("No sound class met the confidence threshold, skipping notification")
                 return
                 
-            # Get corresponding class name
-            class_names = homesounds.get_class_names()
-            if max_idx < len(class_names):
-                sound_class = class_names[max_idx]
-            else:
-                logger.error(f"Invalid class index: {max_idx}, max index: {len(class_names)-1}")
+            # Get the threshold for this specific sound
+            sound_threshold = homesounds.sound_specific_thresholds.get(best_class, PREDICTION_THRES)
+            
+            # Skip if confidence is too low
+            if best_confidence < sound_threshold:
+                logger.info(f"Prediction confidence {best_confidence:.4f} below threshold {sound_threshold:.4f} for '{best_class}', skipping notification")
                 return
                 
             # Format prediction data
             formatted_time = time.strftime("%Y-%m-%d %H:%M:%S")
             predicted_sound = {
-                'sound': sound_class,
-                'confidence': f"{max_prob:.2f}",
+                'sound': best_class,
+                'confidence': f"{best_confidence:.2f}",
                 'db_level': f"{db_level:.2f}",
                 'time': formatted_time,
                 'record_time': formatted_time
             }
             
             # Log prediction
-            logger.info(f"Sound prediction {prediction_count}: {sound_class} ({max_prob:.2f}), dB: {db_level:.2f}")
+            logger.info(f"Sound prediction {prediction_count}: {best_class} ({best_confidence:.2f}), dB: {db_level:.2f}")
             
             # Emit notification to clients
             logger.info(f"Emitting sound_notification to clients: {predicted_sound}")
@@ -989,37 +1014,62 @@ def handle_audio_feature_data(data):
                 logger.error(traceback.format_exc())
                 return
             
-            # Get class with highest probability
-            max_idx = np.argmax(prediction)
-            max_prob = prediction[max_idx]
+            # Convert prediction array to dictionary of {class_name: confidence}
+            class_names = homesounds.get_class_names()
+            prediction_dict = {}
+            for i, prob in enumerate(prediction):
+                if i < len(class_names):
+                    prediction_dict[class_names[i]] = float(prob)
             
-            logger.info(f"Prediction result: max_idx={max_idx}, max_prob={max_prob:.4f}")
+            # Add prediction to temporal history
+            homesounds.detection_history.add_prediction(prediction_dict)
             
-            # Skip if confidence is too low
-            if max_prob < PREDICTION_THRES:
-                logger.info(f"Prediction confidence {max_prob:.4f} below threshold {PREDICTION_THRES}, skipping")
+            # Find the class with highest smoothed confidence and apply special handling for percussive sounds
+            best_class = None
+            best_confidence = 0
+            
+            for sound_class, raw_confidence in prediction_dict.items():
+                # Get smoothed confidence from temporal history
+                smoothed_confidence = homesounds.detection_history.get_smoothed_confidence(sound_class)
+                
+                # Apply special handling for percussive sounds (like knocking)
+                adjusted_confidence = homesounds.detection_history.check_for_percussive_sound(
+                    sound_class, smoothed_confidence, db_level)
+                
+                # Get the threshold for this specific sound class
+                sound_threshold = homesounds.sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+                
+                logger.debug(f"Sound '{sound_class}': raw={raw_confidence:.4f}, smoothed={smoothed_confidence:.4f}, adjusted={adjusted_confidence:.4f}, threshold={sound_threshold:.4f}")
+                
+                # Track the best class
+                if adjusted_confidence > best_confidence:
+                    best_confidence = adjusted_confidence
+                    best_class = sound_class
+            
+            if best_class is None:
+                logger.info("No sound class met the confidence threshold, skipping notification")
                 return
                 
-            # Get corresponding class name
-            class_names = homesounds.get_class_names()
-            if max_idx < len(class_names):
-                sound_class = class_names[max_idx]
-            else:
-                logger.error(f"Invalid class index: {max_idx}, max index: {len(class_names)-1}")
+            # Get the threshold for this specific sound
+            sound_threshold = homesounds.sound_specific_thresholds.get(best_class, PREDICTION_THRES)
+            
+            # Skip if confidence is too low
+            if best_confidence < sound_threshold:
+                logger.info(f"Prediction confidence {best_confidence:.4f} below threshold {sound_threshold:.4f} for '{best_class}', skipping")
                 return
                 
             # Format prediction data
             formatted_time = time.strftime("%Y-%m-%d %H:%M:%S")
             predicted_sound = {
-                'sound': sound_class,
-                'confidence': f"{max_prob:.2f}",
+                'sound': best_class,
+                'confidence': f"{best_confidence:.2f}",
                 'db_level': f"{db_level:.2f}" if db_level is not None else "N/A",
                 'time': formatted_time,
                 'record_time': formatted_time
             }
             
             # Log prediction
-            logger.info(f"Sound prediction {prediction_count}: {sound_class} ({max_prob:.2f}), dB: {db_level}")
+            logger.info(f"Sound prediction (from features) {prediction_count}: {best_class} ({best_confidence:.2f})")
             
             # Emit notification to clients
             logger.info(f"Emitting sound_notification to clients: {predicted_sound}")

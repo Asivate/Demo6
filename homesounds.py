@@ -3,10 +3,14 @@ Homesounds module for SoundWatch server.
 Contains labels and mappings for sound classification.
 """
 
-import numpy as np
-import scipy.signal as signal
+import os
+import json
 import logging
-import time
+import numpy as np
+from scipy import signal
+import tensorflow as tf
+from tensorflow.keras import layers
+import time  # Add time module for timestamps
 from collections import defaultdict
 
 # Configure logging
@@ -200,6 +204,128 @@ CONTEXT_WEIGHTS = {
 
 # Stateful prediction history for temporal smoothing 
 PREDICTION_HISTORY = {}
+
+# Define sound-specific thresholds
+sound_specific_thresholds = {
+    'knock': 0.03,        # Lower threshold for knock detection (3%)
+    'door-bell': 0.1,
+    'dog-bark': 0.2,
+    'baby-cry': 0.1,
+    'phone-ring': 0.15,
+    'vacuum-cleaner': 0.2
+    # Default threshold will be used for any sound not specified here
+}
+
+# Define percussive sounds that need special handling
+percussive_sounds = ['knock', 'door-slam', 'dish-clattering', 'hammer']
+
+# Add temporal smoothing for sound detection
+class SoundDetectionHistory:
+    def __init__(self, window_size=3, decay_factor=0.7):
+        """Initialize with a window size for temporal smoothing
+        
+        Args:
+            window_size: Number of recent predictions to consider
+            decay_factor: How much to weight recent predictions vs older ones
+        """
+        self.window_size = window_size
+        self.decay_factor = decay_factor
+        self.history = {}  # Format: {sound_class: [(timestamp, confidence), ...]}
+        self.last_detection = {}  # Format: {sound_class: timestamp}
+    
+    def add_prediction(self, predictions, timestamp=None):
+        """Add new prediction to history
+        
+        Args:
+            predictions: Dict mapping sound class to confidence
+            timestamp: Optional timestamp (defaults to current time)
+        """
+        if timestamp is None:
+            timestamp = time.time()
+            
+        # Update history for each predicted class
+        for sound_class, confidence in predictions.items():
+            if sound_class not in self.history:
+                self.history[sound_class] = []
+                
+            # Add new prediction
+            self.history[sound_class].append((timestamp, confidence))
+            
+            # Keep only the most recent predictions
+            if len(self.history[sound_class]) > self.window_size:
+                self.history[sound_class] = self.history[sound_class][-self.window_size:]
+    
+    def get_smoothed_confidence(self, sound_class):
+        """Get temporally smoothed confidence for a sound class
+        
+        Args:
+            sound_class: The sound class to get confidence for
+            
+        Returns:
+            Weighted average confidence over the temporal window
+        """
+        if sound_class not in self.history or not self.history[sound_class]:
+            return 0.0
+            
+        entries = self.history[sound_class]
+        total_weight = 0
+        weighted_sum = 0
+        
+        # Calculate exponentially weighted average
+        # More recent predictions have higher weight
+        for i, (_, confidence) in enumerate(entries):
+            # Position from oldest (0) to newest (n)
+            position = i
+            weight = self.decay_factor ** (len(entries) - position - 1)
+            weighted_sum += confidence * weight
+            total_weight += weight
+            
+        if total_weight == 0:
+            return 0.0
+            
+        return weighted_sum / total_weight
+
+    def check_for_percussive_sound(self, sound_class, current_confidence, db_level, min_time_between=1.5):
+        """Special handling for percussive sounds like knocking
+        
+        Args:
+            sound_class: The sound class to check
+            current_confidence: Current confidence level
+            db_level: Current audio level in dB
+            min_time_between: Minimum time between detections in seconds
+            
+        Returns:
+            Adjusted confidence level
+        """
+        if sound_class not in percussive_sounds:
+            return current_confidence
+            
+        current_time = time.time()
+        
+        # Check if we've detected this sound recently
+        last_time = self.last_detection.get(sound_class, 0)
+        time_since_last = current_time - last_time
+        
+        # For percussive sounds, we enhance confidence if:
+        # 1. The sound hasn't been detected recently (avoid duplicate detections)
+        # 2. The dB level is sufficiently high (indicating a sharp sound)
+        # 3. There's at least some base confidence
+        min_confidence = sound_specific_thresholds.get(sound_class, 0.03)
+        
+        # Adjust for knocking with special handling
+        if sound_class == 'knock' and current_confidence > min_confidence:
+            # Check for dB spike which is common with knocks
+            if db_level > 40 and time_since_last > min_time_between:
+                # Boost confidence for knock detection
+                adjusted_confidence = max(current_confidence * 1.5, min_confidence * 2)
+                # Record this detection time
+                self.last_detection[sound_class] = current_time
+                return adjusted_confidence
+        
+        return current_confidence
+
+# Create a global instance for use in the server
+detection_history = SoundDetectionHistory(window_size=3, decay_factor=0.7)
 
 def process_predictions(preds, context, db_level, history_length=5):
     """Stateful prediction processing with temporal analysis"""
