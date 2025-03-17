@@ -1372,6 +1372,13 @@ def process_audio_data(audio_data, sample_rate=16000):
             if soft_knock:
                 logger.info("Soft knock detected with lower threshold")
                 percussive_event = True
+                
+            # If still no event detected, try with an ultra-sensitive threshold for very soft knocks
+            if not percussive_event:
+                very_soft_knock = homesounds.check_for_percussive_sound(audio_data, sample_rate, threshold=0.1)
+                if very_soft_knock:
+                    logger.info("Very soft knock detected with ultra-sensitive threshold")
+                    percussive_event = True
         
         if percussive_event:
             logger.info("Percussive event detected!")

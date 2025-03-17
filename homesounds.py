@@ -171,7 +171,7 @@ DBLEVEL_THRES = -30  # Threshold for dB level to consider sound significant
 
 # Define sound-specific thresholds - adjusted based on observed confidence levels
 sound_specific_thresholds = {
-    'Door knock': 0.08,    # Lowered from 0.1 to 0.08 to better detect knocks
+    'Door knock': 0.05,    # Lowered from 0.08 to 0.05 to better detect knocks
     'Dishes': 0.2,        # Kept at 0.2
     'Glass breaking': 0.1, # Kept at 0.1
     'door-bell': 0.2,     # Kept at 0.2
@@ -316,14 +316,14 @@ class SoundDetectionHistory:
         # 1. The sound hasn't been detected recently (avoid duplicate detections)
         # 2. The dB level is sufficiently high (indicating a sharp sound)
         # 3. There's at least some base confidence
-        min_confidence = get_sound_specific_threshold(sound_class) * 0.3  # Only need 30% of threshold for boosting (was 50%)
+        min_confidence = get_sound_specific_threshold(sound_class) * 0.2  # Only need 20% of threshold for boosting (was 30%)
         
         # Adjust for knocking with special handling
         if sound_class == 'Door knock' and current_confidence > min_confidence:  # Lower activation threshold
             # Check for dB spike which is common with knocks
             if db_level > -25 and time_since_last > min_time_between:  # More sensitive dB threshold (was -20)
                 # Boost confidence for knock detection - higher multiplier
-                adjusted_confidence = min(current_confidence * 3.5, 0.95)  # Boost by 3.5x (was 2.5x)
+                adjusted_confidence = min(current_confidence * 5.0, 0.95)  # Boost by 5.0x (was 3.5x)
                 # Record this detection time
                 self.last_detection[sound_class] = current_time
                 logger.info(f"Enhanced Door knock detection: {current_confidence:.4f} → {adjusted_confidence:.4f}")
@@ -410,10 +410,19 @@ def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1,
         # A peak is defined as a frame with energy higher than threshold and higher than adjacent frames
         peaks = []
         for i in range(1, len(frame_energy) - 1):
-            if (frame_energy[i] > threshold and 
-                frame_energy[i] > frame_energy[i-1] and 
-                frame_energy[i] > frame_energy[i+1]):
-                peaks.append(i)
+            # For very low thresholds (soft knocks), we'll be more lenient on the adjacent frame comparison
+            if threshold < 0.15:
+                # For ultra-sensitive detection, only require the peak to be higher than threshold
+                # and slightly higher than at least one adjacent frame
+                if (frame_energy[i] > threshold and 
+                    (frame_energy[i] > frame_energy[i-1] * 1.1 or frame_energy[i] > frame_energy[i+1] * 1.1)):
+                    peaks.append(i)
+            else:
+                # Standard peak detection for normal thresholds
+                if (frame_energy[i] > threshold and 
+                    frame_energy[i] > frame_energy[i-1] and 
+                    frame_energy[i] > frame_energy[i+1]):
+                    peaks.append(i)
         
         if len(peaks) == 0:
             return False
@@ -462,7 +471,7 @@ def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1,
                         logger.info(f"Detected triple-peak pattern but gaps are inconsistent: {gap1_seconds:.3f}s and {gap2_seconds:.3f}s")
         
         # Check for one very strong peak (could be a single loud knock)
-        strong_peak_threshold = 0.8
+        strong_peak_threshold = 0.6  # Lower threshold for more sensitivity (was 0.8)
         if any(frame_energy > strong_peak_threshold):
             logger.info(f"Detected single strong percussive event with peak energy {np.max(frame_energy):.3f}")
             return True
@@ -471,7 +480,7 @@ def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1,
         energy_change = np.diff(frame_energy)
         
         # Check for sudden increases in energy (sharp attacks)
-        sharp_attack_threshold = 0.4  # Lower threshold for more sensitivity
+        sharp_attack_threshold = 0.3  # Lower threshold for more sensitivity (was 0.4)
         if any(energy_change > sharp_attack_threshold):
             logger.info(f"Detected sharp attack with max energy change {np.max(energy_change):.3f}")
             return True
@@ -748,7 +757,7 @@ def check_for_percussive_sound(audio_data, sample_rate, threshold=0.2):
             flux = flux / np.max(flux)
         
         # Check if there's a significant peak in the flux
-        peak_threshold = 0.6
+        peak_threshold = 0.4  # Lower threshold for more sensitivity (was 0.6)
         if np.max(flux) > peak_threshold:
             logger.info(f"Detected percussive sound via spectral flux with peak {np.max(flux):.3f}")
             return True
