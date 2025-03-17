@@ -86,6 +86,7 @@ SPEECH_BIAS_CORRECTION = 0.15  # Correction factor for speech detection
 APPLY_SPEECH_BIAS_CORRECTION = True  # Whether to apply speech bias correction
 PREDICTION_THRES = 0.5  # Threshold for sound prediction confidence
 DBLEVEL_THRES = 35  # Threshold for dB level to consider sound significant (lowered from 45)
+TARGET_SR = 16000  # Target sample rate for audio processing
 
 # Audio buffers for continuous processing
 AUDIO_BUFFER_SIZE = 5  # Buffer size in seconds
@@ -96,11 +97,17 @@ audio_buffer_lock = threading.RLock()  # Lock for thread-safe access to audio bu
 classification_buffer = []  # Buffer specifically for sound classification
 classification_buffer_lock = threading.RLock()
 MIN_SAMPLES_FOR_CLASSIFICATION = 16000  # Minimum samples needed for classification
+MAX_CLASSIFICATION_BUFFER_SIZE = 32000  # Maximum size for classification buffer
 
 # New buffer for speech transcription
 transcription_buffer = []  # Buffer specifically for speech transcription
 transcription_buffer_lock = threading.RLock()
 MIN_SAMPLES_FOR_TRANSCRIPTION = 15000  # Minimum samples needed for transcription
+
+# Last audio data for debugging
+last_audio_data = None
+last_timestamp = None
+last_audio_lock = threading.RLock()  # Lock for thread-safe access to last audio data
 
 # Performance timer decorator
 def performance_timer(func):
@@ -192,59 +199,38 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 
                 # Create a generator to yield audio chunks for streaming
                 def audio_generator():
-                    # First yield an empty request to configure streaming
-                    try:
-                        from google.cloud import speech
-                        config = speech.RecognitionConfig(
-                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                            sample_rate_hertz=16000,
-                            language_code="en-US",
-                            model="phone_call",
-                            enable_automatic_punctuation=True,
-                            use_enhanced=True,
-                        )
-                        
-                        streaming_config = speech.StreamingRecognitionConfig(
-                            config=config,
-                            interim_results=True
-                        )
-                        
-                        # First request contains only the config
-                        yield speech.StreamingRecognizeRequest(
-                            streaming_config=streaming_config
-                        )
-                        
-                        # Subsequent requests contain audio data
-                        while not audio_stream_closed:
-                            # Wait for audio data with timeout
-                            try:
-                                audio_chunk = audio_stream.get(timeout=2.0)
-                                if audio_chunk is None:
-                                    break  # End of stream
+                    # First yield empty content to configure streaming
+                    yield b''
+                    
+                    # Subsequent yields contain audio data
+                    while not audio_stream_closed:
+                        # Wait for audio data with timeout
+                        try:
+                            audio_chunk = audio_stream.get(timeout=2.0)
+                            if audio_chunk is None:
+                                break  # End of stream
+                                
+                            # Convert audio to int16 format
+                            if isinstance(audio_chunk, np.ndarray):
+                                # Normalize if needed
+                                if np.max(np.abs(audio_chunk)) > 0:
+                                    audio_chunk = audio_chunk / np.max(np.abs(audio_chunk))
                                     
-                                # Convert audio to int16 format
-                                if isinstance(audio_chunk, np.ndarray):
-                                    # Normalize if needed
-                                    if np.max(np.abs(audio_chunk)) > 0:
-                                        audio_chunk = audio_chunk / np.max(np.abs(audio_chunk))
-                                        
-                                    # Convert to int16
-                                    audio_chunk_int16 = (audio_chunk * 32767).astype(np.int16)
-                                    audio_bytes = audio_chunk_int16.tobytes()
-                                    
-                                    # Yield audio content
-                                    yield speech.StreamingRecognizeRequest(
-                                        audio_content=audio_bytes
-                                    )
-                                    logger.debug(f"Streamed audio chunk of size {len(audio_bytes)} bytes")
-                            except queue.Empty:
-                                # No audio data available, continue waiting
-                                logger.debug("No audio data in queue, continuing to wait...")
-                                continue
-                    except Exception as e:
-                        logger.error(f"Error in audio generator: {e}")
-                        logger.error(traceback.format_exc())
-                        
+                                # Convert to int16
+                                audio_chunk_int16 = (audio_chunk * 32767).astype(np.int16)
+                                audio_bytes = audio_chunk_int16.tobytes()
+                                
+                                # Yield audio content directly
+                                yield audio_bytes
+                                logger.debug(f"Streamed audio chunk of size {len(audio_bytes)} bytes")
+                        except queue.Empty:
+                            # No audio data available, continue waiting
+                            logger.debug("No audio data in queue, continuing to wait...")
+                            continue
+                except Exception as e:
+                    logger.error(f"Error in audio generator: {e}")
+                    logger.error(traceback.format_exc())
+                    
                 # Initialize the Google Speech client
                 try:
                     from google.cloud import speech
@@ -253,7 +239,21 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                     
                     # Start streaming recognition with the audio generator
                     logger.info("Starting streaming transcription...")
-                    responses = client.streaming_recognize(requests=audio_generator())
+                    # Create the streaming configuration
+                    streaming_config = speech.StreamingRecognitionConfig(
+                        config=speech.RecognitionConfig(
+                            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                            sample_rate_hertz=16000,
+                            language_code="en-US",
+                            model="phone_call",
+                            enable_automatic_punctuation=True,
+                            use_enhanced=True,
+                        ),
+                        interim_results=True
+                    )
+                    
+                    # Pass the config in the right format
+                    responses = client.streaming_recognize(streaming_config, audio_generator())
                     
                     # Process streaming responses
                     for response in responses:
