@@ -171,15 +171,15 @@ DBLEVEL_THRES = -30  # Threshold for dB level to consider sound significant
 
 # Define sound-specific thresholds - adjusted based on observed confidence levels
 sound_specific_thresholds = {
-    'Door knock': 0.1,    # Lowered from 0.15 to 0.1 to better detect knocks
-    'Dishes': 0.2,        # Lowered from 0.4 to 0.2 but still higher than knock
-    'Glass breaking': 0.1, # Lowered to better detect breaking glass
-    'door-bell': 0.2,     # Lowered from 0.4
-    'dog-bark': 0.2,      # Lowered from 0.4
-    'baby-cry': 0.15,     # Lowered from 0.3
-    'phone-ring': 0.2,    # Lowered from 0.35
-    'vacuum-cleaner': 0.2, # Lowered from 0.35
-    'Car horn': 0.1       # Added based on logs showing low confidence for car horn
+    'Door knock': 0.08,    # Lowered from 0.1 to 0.08 to better detect knocks
+    'Dishes': 0.2,        # Kept at 0.2
+    'Glass breaking': 0.1, # Kept at 0.1
+    'door-bell': 0.2,     # Kept at 0.2
+    'dog-bark': 0.2,      # Kept at 0.2
+    'baby-cry': 0.15,     # Kept at 0.15
+    'phone-ring': 0.2,    # Kept at 0.2
+    'vacuum-cleaner': 0.2, # Kept at 0.2
+    'Car horn': 0.15      # Increased from 0.1 to 0.15 to reduce false positives
     # Default threshold of 0.2 will be used for any sound not specified here
 }
 
@@ -373,8 +373,8 @@ def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1,
     try:
         logger.info(f"Checking for percussive event in audio shape={audio_data.shape}")
         
-        # Calculate frame size based on 20ms windows
-        frame_size = int(0.02 * sample_rate)  # 20ms frames
+        # Calculate frame size based on 10ms windows (was 20ms) - smaller for better temporal resolution
+        frame_size = int(0.01 * sample_rate)  # 10ms frames
         
         # Calculate energy in each frame
         num_frames = len(audio_data) // frame_size
@@ -412,23 +412,40 @@ def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1,
         min_gap_frames = int(min_gap * sample_rate / frame_size)
         max_gap_frames = int(max_gap * sample_rate / frame_size)
         
-        # Check for pairs of peaks with appropriate spacing
+        # Check for pairs of peaks with appropriate spacing - typical for knocking
+        # Common knock patterns: two knocks with ~0.2-0.5s gap
         for i in range(len(peaks) - 1):
             gap = peaks[i+1] - peaks[i]
+            gap_seconds = gap * frame_size / sample_rate
+            
+            # Check if gap is in the typical range for knocking (0.1-0.5s)
             if min_gap_frames <= gap <= max_gap_frames:
-                logger.info(f"Detected double-knock pattern with {gap * frame_size / sample_rate:.3f}s gap")
-                return True
+                # For knocking, we typically see gaps of 0.1-0.5s
+                if 0.1 <= gap_seconds <= 0.5:
+                    logger.info(f"Detected double-knock pattern with {gap_seconds:.3f}s gap")
+                    return True
+                else:
+                    logger.info(f"Detected double-peak pattern with {gap_seconds:.3f}s gap (may not be knocking)")
                 
         # Check for triple knocks (three peaks with appropriate spacing)
         if len(peaks) >= 3:
             for i in range(len(peaks) - 2):
                 gap1 = peaks[i+1] - peaks[i]
                 gap2 = peaks[i+2] - peaks[i+1]
-                # Both gaps should be within reasonable range
+                gap1_seconds = gap1 * frame_size / sample_rate
+                gap2_seconds = gap2 * frame_size / sample_rate
+                
+                # Both gaps should be within reasonable range and similar to each other (consistent knocking)
                 if (min_gap_frames <= gap1 <= max_gap_frames and 
                     min_gap_frames <= gap2 <= max_gap_frames):
-                    logger.info(f"Detected triple-knock pattern with gaps {gap1 * frame_size / sample_rate:.3f}s and {gap2 * frame_size / sample_rate:.3f}s")
-                    return True
+                    
+                    # For knocking, gaps are typically similar to each other
+                    gap_ratio = max(gap1_seconds, gap2_seconds) / min(gap1_seconds, gap2_seconds)
+                    if gap_ratio < 1.5:  # Gaps are within 50% of each other
+                        logger.info(f"Detected triple-knock pattern with gaps {gap1_seconds:.3f}s and {gap2_seconds:.3f}s")
+                        return True
+                    else:
+                        logger.info(f"Detected triple-peak pattern but gaps are inconsistent: {gap1_seconds:.3f}s and {gap2_seconds:.3f}s")
         
         # Check for one very strong peak (could be a single loud knock)
         strong_peak_threshold = 0.8
@@ -644,3 +661,86 @@ def compute_features(audio_data, sample_rate=16000):
         logger.error(traceback.format_exc())
         # Return empty features with expected shape
         return np.zeros((1, 96, 64, 1))
+
+def stft(audio_data, n_fft, hop_length):
+    """
+    Simple Short-Time Fourier Transform implementation.
+    
+    Args:
+        audio_data (numpy.ndarray): Audio samples as a numpy array
+        n_fft (int): FFT window size
+        hop_length (int): Hop length between frames
+        
+    Returns:
+        numpy.ndarray: STFT matrix
+    """
+    # Calculate number of frames
+    num_frames = 1 + (len(audio_data) - n_fft) // hop_length
+    
+    # Initialize STFT matrix
+    stft_matrix = np.zeros((n_fft // 2 + 1, num_frames), dtype=complex)
+    
+    # Apply Hann window and compute FFT for each frame
+    window = np.hanning(n_fft)
+    for i in range(num_frames):
+        start = i * hop_length
+        end = start + n_fft
+        if end <= len(audio_data):
+            frame = audio_data[start:end] * window
+            stft_matrix[:, i] = np.fft.rfft(frame)
+    
+    return stft_matrix
+
+def check_for_percussive_sound(audio_data, sample_rate, threshold=0.2):
+    """
+    Check if the audio contains a percussive sound like a knock.
+    
+    Args:
+        audio_data (numpy.ndarray): Audio samples as a numpy array
+        sample_rate (int): Sample rate of the audio in Hz
+        threshold (float): Threshold for detecting percussive events (lower = more sensitive)
+        
+    Returns:
+        bool: True if a percussive sound is detected, False otherwise
+    """
+    try:
+        # First check for percussive event patterns (knocks, etc.)
+        if detect_percussive_event(audio_data, sample_rate, threshold=threshold):
+            return True
+            
+        # If no clear pattern was found, try spectral analysis as a backup
+        # This can catch some percussive sounds that don't have clear temporal patterns
+        
+        # Calculate spectrogram
+        n_fft = int(0.025 * sample_rate)  # 25ms window
+        hop_length = int(0.010 * sample_rate)  # 10ms hop
+        
+        # Use librosa's spectrogram function if available, otherwise use our own implementation
+        try:
+            import librosa
+            S = np.abs(librosa.stft(audio_data, n_fft=n_fft, hop_length=hop_length))
+        except (ImportError, ModuleNotFoundError):
+            # Simple STFT implementation if librosa is not available
+            S = np.abs(stft(audio_data, n_fft, hop_length))
+        
+        # Percussive sounds have energy spread across frequencies at onset
+        # Calculate the spectral flux (sum of positive changes across all frequency bins)
+        diff = np.diff(S, axis=1)
+        diff = np.maximum(0, diff)  # Keep only increases in energy
+        flux = np.sum(diff, axis=0)  # Sum across frequency bins
+        
+        # Normalize flux
+        if np.max(flux) > 0:
+            flux = flux / np.max(flux)
+        
+        # Check if there's a significant peak in the flux
+        peak_threshold = 0.6
+        if np.max(flux) > peak_threshold:
+            logger.info(f"Detected percussive sound via spectral flux with peak {np.max(flux):.3f}")
+            return True
+            
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in check_for_percussive_sound: {e}")
+        return False
