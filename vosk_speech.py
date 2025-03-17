@@ -15,6 +15,10 @@ import wget
 import zipfile
 import time
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 # Import Vosk (will be installed via requirements.txt)
 try:
     from vosk import Model, KaldiRecognizer, SetLogLevel
@@ -23,10 +27,6 @@ try:
 except ImportError:
     VOSK_AVAILABLE = False
     logger.warning("Vosk speech recognition is not available")
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
 
 # Define model URLs for different languages
 VOSK_MODEL_URLS = {

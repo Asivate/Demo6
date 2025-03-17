@@ -30,13 +30,6 @@ except ImportError:
     GOOGLE_SPEECH_AVAILABLE = False
     logger.warning("Google Speech API not available. Install google-cloud-speech package.")
 
-# Try to import Vosk as fallback
-try:
-    from vosk_speech import transcribe_with_vosk, VOSK_AVAILABLE
-except ImportError:
-    VOSK_AVAILABLE = False
-    logger.warning("Vosk speech recognition not available")
-
 # Import sentiment analysis
 from sentiment_analyzer import analyze_sentiment
 
@@ -188,15 +181,6 @@ class ContinuousSentimentAnalyzer:
                 except Exception as e:
                     logger.warning(f"Google speech recognition failed: {str(e)}")
                     error_info = {"error": str(e)}
-            
-            # Try Vosk fallback if Google failed or isn't available
-            if not transcription and VOSK_AVAILABLE:
-                try:
-                    transcription = transcribe_with_vosk(audio_data, self.sample_rate)
-                    if transcription:
-                        transcription_engine = "vosk"
-                except Exception as e:
-                    logger.warning(f"Vosk speech recognition failed: {str(e)}")
             
             # If we have a transcription, analyze sentiment
             if transcription:

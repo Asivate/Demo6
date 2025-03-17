@@ -16,7 +16,7 @@ try:
     GOOGLE_SPEECH_AVAILABLE = True
 except ImportError:
     GOOGLE_SPEECH_AVAILABLE = False
-    print("WARNING: Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
+    logging.warning("WARNING: Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
 from threading import Lock
 import traceback
 import re
@@ -419,14 +419,16 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         return transcription, None
         
     except Exception as e:
-        import traceback
-        error_details = traceback.format_exc()
-        error_message = f"Google Speech API error: {str(e)}"
-        print(error_message)
-        print(error_details)
+        # Format detailed error information for easier debugging
+        error_message = f"Google Cloud Speech API error: {str(e)}"
+        error_details = f"Error details: {traceback.format_exc()}"
         
-        # Return empty string and error details
-        return "", {"error": error_message, "details": error_details}
+        # Log detailed error
+        logger.error(error_message)
+        logger.error(error_details)
+        
+        # Return failure with error information
+        return None, {"google_api_error": error_message}
 
 class GoogleSpeechToText:
     """

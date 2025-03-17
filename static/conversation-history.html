@@ -1,1 +1,460 @@
-<!DOCTYPE html><html><head><title>SoundWatch - Conversation History</title></head><body><h1>Conversation History</h1><p>Loading...</p></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoundWatch - Conversation History</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border: 1px solid transparent;
+            border-bottom: none;
+            margin-right: 5px;
+        }
+        
+        .tab.active {
+            background-color: #f8f9fa;
+            border-color: #ddd;
+            border-radius: 5px 5px 0 0;
+            font-weight: bold;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .history-container {
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .history-item {
+            border-bottom: 1px solid #ddd;
+            padding: 15px;
+            margin-bottom: 10px;
+            background-color: white;
+            border-radius: 5px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        
+        .history-item:last-child {
+            margin-bottom: 0;
+        }
+        
+        .timestamp {
+            color: #7f8c8d;
+            font-size: 0.8em;
+            margin-bottom: 5px;
+        }
+        
+        .sound-name {
+            font-weight: bold;
+            color: #2980b9;
+        }
+        
+        .confidence, .db-level {
+            font-size: 0.9em;
+            color: #7f8c8d;
+            margin-right: 10px;
+        }
+        
+        .speech-text {
+            margin-top: 10px;
+            padding: 10px;
+            background-color: #f1f8e9;
+            border-radius: 5px;
+            border-left: 3px solid #8bc34a;
+        }
+        
+        .sentiment {
+            display: inline-block;
+            margin-left: 10px;
+            padding: 3px 8px;
+            border-radius: 10px;
+            font-size: 0.8em;
+        }
+        
+        .sentiment.positive {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        
+        .sentiment.negative {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        
+        .sentiment.neutral {
+            background-color: #e3f2fd;
+            color: #1565c0;
+        }
+        
+        .emoji {
+            font-size: 1.5em;
+            margin-right: 5px;
+        }
+        
+        .refresh {
+            display: block;
+            margin: 20px auto;
+            padding: 10px 20px;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        
+        .refresh:hover {
+            background-color: #2980b9;
+        }
+        
+        #liveStatus {
+            text-align: center;
+            padding: 10px;
+            background-color: #e8f5e9;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background-color: #4caf50;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+        
+        .status-indicator.disconnected {
+            background-color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <h1>SoundWatch Conversation History</h1>
+    
+    <div id="liveStatus">
+        <span class="status-indicator disconnected"></span> 
+        Connecting to server...
+    </div>
+    
+    <div class="tabs">
+        <div class="tab active" data-tab="all">All Events</div>
+        <div class="tab" data-tab="sounds">Sounds</div>
+        <div class="tab" data-tab="speech">Speech & Sentiment</div>
+    </div>
+    
+    <div class="tab-content active" id="all-content">
+        <div class="history-container" id="all-history">
+            <p>Loading history...</p>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="sounds-content">
+        <div class="history-container" id="sounds-history">
+            <p>Loading sound events...</p>
+        </div>
+    </div>
+    
+    <div class="tab-content" id="speech-content">
+        <div class="history-container" id="speech-history">
+            <p>Loading speech transcripts...</p>
+        </div>
+    </div>
+    
+    <button class="refresh" id="refreshButton">Refresh History</button>
+    
+    <script>
+        // Connect to Socket.IO server
+        const socket = io();
+        const statusIndicator = document.querySelector('.status-indicator');
+        const statusText = document.querySelector('#liveStatus');
+        
+        // Track connection status
+        socket.on('connect', () => {
+            statusIndicator.classList.remove('disconnected');
+            statusText.innerHTML = '<span class="status-indicator"></span> Connected to server - receiving live updates';
+            loadAllHistory();
+        });
+        
+        socket.on('disconnect', () => {
+            statusIndicator.classList.add('disconnected');
+            statusText.innerHTML = '<span class="status-indicator disconnected"></span> Disconnected from server - trying to reconnect...';
+        });
+        
+        // Live updates for new events
+        socket.on('sound_notification', (data) => {
+            addNewHistoryItem(data, 'sound');
+        });
+        
+        socket.on('sentiment_notification', (data) => {
+            addNewHistoryItem(data, 'sentiment');
+        });
+        
+        socket.on('transcript_update', (data) => {
+            addNewHistoryItem(data, 'transcript');
+        });
+        
+        // Tab switching functionality
+        const tabs = document.querySelectorAll('.tab');
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                // Remove active class from all tabs
+                tabs.forEach(t => t.classList.remove('active'));
+                
+                // Add active class to clicked tab
+                tab.classList.add('active');
+                
+                // Hide all tab content
+                document.querySelectorAll('.tab-content').forEach(content => {
+                    content.classList.remove('active');
+                });
+                
+                // Show relevant tab content
+                const tabId = tab.getAttribute('data-tab');
+                document.getElementById(`${tabId}-content`).classList.add('active');
+            });
+        });
+        
+        // Function to load all history
+        function loadAllHistory() {
+            // Load conversation history
+            socket.emit('get_conversation_history', {}, (response) => {
+                if (response && response.history) {
+                    displayConversationHistory(response.history);
+                }
+            });
+            
+            // Load transcript history
+            socket.emit('get_transcript_history', {}, (response) => {
+                if (response && response.history) {
+                    displayTranscriptHistory(response.history);
+                }
+            });
+        }
+        
+        // Function to display conversation history
+        function displayConversationHistory(history) {
+            const allHistoryContainer = document.getElementById('all-history');
+            const soundsHistoryContainer = document.getElementById('sounds-history');
+            
+            if (history.length === 0) {
+                allHistoryContainer.innerHTML = '<p>No conversation history available.</p>';
+                soundsHistoryContainer.innerHTML = '<p>No sound events recorded.</p>';
+                return;
+            }
+            
+            // Clear containers
+            allHistoryContainer.innerHTML = '';
+            soundsHistoryContainer.innerHTML = '';
+            
+            // Add each history item
+            history.forEach(item => {
+                // Create history item for all events
+                const allHistoryItem = createHistoryItem(item, 'sound');
+                allHistoryContainer.appendChild(allHistoryItem);
+                
+                // Create history item for sounds tab
+                const soundHistoryItem = createHistoryItem(item, 'sound');
+                soundsHistoryContainer.appendChild(soundHistoryItem);
+            });
+        }
+        
+        // Function to display transcript history
+        function displayTranscriptHistory(history) {
+            const allHistoryContainer = document.getElementById('all-history');
+            const speechHistoryContainer = document.getElementById('speech-history');
+            
+            if (history.length === 0) {
+                speechHistoryContainer.innerHTML = '<p>No speech transcripts available.</p>';
+                return;
+            }
+            
+            // Clear speech container
+            speechHistoryContainer.innerHTML = '';
+            
+            // Add each transcript item
+            history.forEach(item => {
+                // Create history item for speech tab
+                const speechHistoryItem = createHistoryItem(item, 'transcript');
+                speechHistoryContainer.appendChild(speechHistoryItem);
+                
+                // Also add to all events tab if not already added
+                const transcriptHistoryItem = createHistoryItem(item, 'transcript');
+                // Add at appropriate position in all history based on timestamp
+                insertHistoryItemByTimestamp(allHistoryContainer, transcriptHistoryItem, item.timestamp);
+            });
+        }
+        
+        // Function to create a history item element
+        function createHistoryItem(item, type) {
+            const historyItem = document.createElement('div');
+            historyItem.className = 'history-item';
+            
+            // Add timestamp
+            const timestamp = document.createElement('div');
+            timestamp.className = 'timestamp';
+            timestamp.textContent = item.timestamp || item.time || 'Unknown time';
+            historyItem.appendChild(timestamp);
+            
+            if (type === 'sound') {
+                // Sound notification
+                const soundInfo = document.createElement('div');
+                
+                // Sound name with emoji
+                const soundName = document.createElement('span');
+                soundName.className = 'sound-name';
+                soundName.textContent = item.sound || 'Unknown sound';
+                soundInfo.appendChild(soundName);
+                
+                // Confidence
+                if (item.confidence) {
+                    const confidence = document.createElement('span');
+                    confidence.className = 'confidence';
+                    confidence.textContent = `Confidence: ${item.confidence}`;
+                    soundInfo.appendChild(confidence);
+                }
+                
+                // dB level
+                if (item.db_level) {
+                    const dbLevel = document.createElement('span');
+                    dbLevel.className = 'db-level';
+                    dbLevel.textContent = `dB: ${item.db_level}`;
+                    soundInfo.appendChild(dbLevel);
+                }
+                
+                historyItem.appendChild(soundInfo);
+            } else if (type === 'transcript' || type === 'sentiment') {
+                // Speech transcript
+                if (item.text) {
+                    const speechText = document.createElement('div');
+                    speechText.className = 'speech-text';
+                    speechText.textContent = item.text;
+                    historyItem.appendChild(speechText);
+                    
+                    // Add sentiment if available
+                    if (item.sentiment) {
+                        const sentimentInfo = document.createElement('div');
+                        
+                        // Emoji
+                        if (item.emoji) {
+                            const emoji = document.createElement('span');
+                            emoji.className = 'emoji';
+                            emoji.textContent = item.emoji;
+                            sentimentInfo.appendChild(emoji);
+                        }
+                        
+                        // Sentiment label
+                        const sentiment = document.createElement('span');
+                        sentiment.className = 'sentiment ' + (item.sentiment || 'neutral');
+                        sentiment.textContent = item.sentiment || 'neutral';
+                        sentimentInfo.appendChild(sentiment);
+                        
+                        historyItem.appendChild(sentimentInfo);
+                    }
+                }
+            }
+            
+            return historyItem;
+        }
+        
+        // Function to add a new history item
+        function addNewHistoryItem(data, type) {
+            // Create history item
+            const historyItem = createHistoryItem(data, type);
+            
+            // Add to appropriate containers
+            if (type === 'sound') {
+                // Add to all history
+                document.getElementById('all-history').prepend(historyItem);
+                
+                // Add to sounds history
+                const soundsClone = historyItem.cloneNode(true);
+                document.getElementById('sounds-history').prepend(soundsClone);
+            } else if (type === 'sentiment' || type === 'transcript') {
+                // Add to all history
+                document.getElementById('all-history').prepend(historyItem);
+                
+                // Add to speech history
+                const speechClone = historyItem.cloneNode(true);
+                document.getElementById('speech-history').prepend(speechClone);
+            }
+        }
+        
+        // Function to insert history item at correct position by timestamp
+        function insertHistoryItemByTimestamp(container, item, timestamp) {
+            const items = container.querySelectorAll('.history-item');
+            
+            // If container is empty or has "Loading..." message
+            if (items.length === 0 || (items.length === 1 && items[0].textContent.includes('Loading'))) {
+                container.innerHTML = '';
+                container.appendChild(item);
+                return;
+            }
+            
+            let inserted = false;
+            
+            // Convert timestamp to comparable format (assuming YYYY-MM-DD HH:MM:SS)
+            const itemTime = new Date(timestamp).getTime();
+            
+            // Go through existing items
+            for (let i = 0; i < items.length; i++) {
+                const existingTimestamp = items[i].querySelector('.timestamp').textContent;
+                const existingTime = new Date(existingTimestamp).getTime();
+                
+                // Insert before first item with earlier timestamp
+                if (itemTime > existingTime) {
+                    container.insertBefore(item, items[i]);
+                    inserted = true;
+                    break;
+                }
+            }
+            
+            // If not inserted, add to end
+            if (!inserted) {
+                container.appendChild(item);
+            }
+        }
+        
+        // Refresh button functionality
+        document.getElementById('refreshButton').addEventListener('click', loadAllHistory);
+        
+        // Initial load
+        if (socket.connected) {
+            loadAllHistory();
+        }
+    </script>
+</body>
+</html>

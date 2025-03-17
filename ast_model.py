@@ -8,6 +8,10 @@ import time
 import traceback
 from tensorflow.keras import layers, models
 import tensorflow as tf
+import logging
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 # Suppress transformers warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -25,7 +29,7 @@ def check_float16_support():
         # Since we're having issues with float16, return False to use float32 instead
         return False
     except Exception as e:
-        print(f"Error checking float16 support: {e}")
+        logger.error(f"Error checking float16 support: {e}")
         return False
 
 def load_ast_model(model_name="MIT/ast-finetuned-audioset-10-10-0.4593", **kwargs):
@@ -41,7 +45,7 @@ def load_ast_model(model_name="MIT/ast-finetuned-audioset-10-10-0.4593", **kwarg
     Returns:
         tuple: (model, feature_extractor)
     """
-    print(f"Loading AST model: {model_name}")
+    logger.info(f"Loading AST model: {model_name}")
     try:
         # Load feature extractor
         feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
@@ -49,37 +53,36 @@ def load_ast_model(model_name="MIT/ast-finetuned-audioset-10-10-0.4593", **kwarg
         # Check for optimization parameters
         attn_implementation = kwargs.get("attn_implementation", None)
         
-        # Use standard precision for compatibility
-        print("Using standard precision (float32) for maximum compatibility")
-        if "torch_dtype" in kwargs:
-            del kwargs["torch_dtype"]  # Remove any torch_dtype setting
+        # For stability, force float32 precision regardless of system capabilities
+        torch_dtype = torch.float32
+        logger.info("Using standard precision (float32) for maximum compatibility")
         
-        # Print optimization settings
+        # Set attention implementation if specified
         if attn_implementation:
-            print(f"Using attention implementation: {attn_implementation}")
+            logger.info(f"Using attention implementation: {attn_implementation}")
         
-        # Load model - explicitly use float32 regardless of what was passed in kwargs
-        model = AutoModelForAudioClassification.from_pretrained(model_name, torch_dtype=torch.float32, **kwargs)
+        # Load model with the appropriate parameters
+        model = AutoModelForAudioClassification.from_pretrained(
+            model_name,
+            torch_dtype=torch_dtype,
+            attn_implementation=attn_implementation
+        )
         
-        # Explicitly convert any half-precision parameters to float32
+        # Verify that all model parameters are using the expected dtype
         for param in model.parameters():
-            if param.dtype != torch.float32:
-                param.data = param.data.to(torch.float32)
+            param.data = param.data.to(torch_dtype)
+        logger.info("Verified all model parameters are using float32 precision")
         
-        # Set all model parameters to float32 to avoid mixed precision issues
-        model = model.to(torch.float32)
-        
-        print("Verified all model parameters are using float32 precision")
-        
-        # Put model in evaluation mode and move to CPU (or GPU if available)
-        model.eval()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Using device: {device}")
+        # Determine device and move model there
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device)
+        logger.info(f"Using device: {device}")
+        
         return model, feature_extractor
     except Exception as e:
-        print(f"Error loading AST model: {e}")
-        raise e
+        logger.error(f"Error loading AST model: {e}")
+        traceback.print_exc()
+        return None, None
 
 # Map AST model labels to homesounds labels
 # This mapping is based on semantic similarity between the labels from both systems
@@ -461,9 +464,9 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
         # Calculate RMS and dB for silence detection
         rms = np.sqrt(np.mean(audio_data**2))
         db_level = 20 * np.log10(rms) if rms > 0 else -100
-        print(f"Audio data shape: {audio_data.shape}, sample rate: {sample_rate}")
+        logger.info(f"Audio data shape: {audio_data.shape}, sample rate: {sample_rate}")
         if db_level < -65:
-            print(f"Silence detected (db level: {db_level:.2f})")
+            logger.info(f"Silence detected (db level: {db_level:.2f})")
             return {
                 "top_predictions": [{"label": "Silence", "confidence": 0.95}],
                 "mapped_predictions": [{"original_label": "Silence", "label": "silence", "confidence": 0.95}],
@@ -477,7 +480,7 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                 param_dtypes[param.dtype] = 0
             param_dtypes[param.dtype] += 1
         
-        print(f"Model is using dtype: {next(model.parameters()).dtype}")
+        logger.info(f"Model is using dtype: {next(model.parameters()).dtype}")
         
         try:
             # Use the preprocess function to prepare audio input
@@ -492,24 +495,24 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                     # First check the dtype and device before conversion to avoid unnecessary operations
                     if inputs[key].dtype != torch.float32:
                         try:
-                            print(f"Converting input tensor {key} from {inputs[key].dtype} to float32")
+                            logger.info(f"Converting input tensor {key} from {inputs[key].dtype} to float32")
                             inputs[key] = inputs[key].to(dtype=torch.float32)
                         except Exception as e:
-                            print(f"Error converting {key} to float32: {str(e)}")
+                            logger.error(f"Error converting {key} to float32: {str(e)}")
                             # Fallback to safe conversion
                             inputs[key] = inputs[key].float()
                     
                     # Move to the model's device if needed
                     if inputs[key].device != device:
                         try:
-                            print(f"Moving input tensor {key} from {inputs[key].device} to {device}")
+                            logger.info(f"Moving input tensor {key} from {inputs[key].device} to {device}")
                             inputs[key] = inputs[key].to(device=device)
                         except Exception as e:
-                            print(f"Error moving {key} to device {device}: {str(e)}")
+                            logger.error(f"Error moving {key} to device {device}: {str(e)}")
                             # Try with cpu first then move
                             inputs[key] = inputs[key].to("cpu").to(device)
             
-            print(f"Feature extraction completed. Running inference...")
+            logger.info(f"Feature extraction completed. Running inference...")
             
             # Run inference with no gradient tracking for efficiency
             with torch.no_grad():
@@ -517,7 +520,7 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                     # Verify model parameters are float32
                     for name, param in model.named_parameters():
                         if param.dtype != torch.float32:
-                            print(f"Warning: Parameter {name} has dtype {param.dtype}, converting to float32")
+                            logger.warning(f"Warning: Parameter {name} has dtype {param.dtype}, converting to float32")
                             param.data = param.data.to(torch.float32)
                     
                     # Run the model with the prepared inputs, explicit cast to float32
@@ -549,14 +552,14 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                     # Record and log the prediction time
                     end_time = time.time()
                     elapsed = end_time - start_time
-                    print(f"AST prediction completed in {elapsed:.2f} seconds")
+                    logger.info(f"AST prediction completed in {elapsed:.2f} seconds")
                     
                     return predictions
                     
                 except RuntimeError as e:
                     if "Expected all tensors to be on the same device" in str(e):
-                        print(f"Device error in model inference: {str(e)}")
-                        print("Attempting recovery with CPU...")
+                        logger.error(f"Device error in model inference: {str(e)}")
+                        logger.info("Attempting recovery with CPU...")
                         # Move model to CPU as a fallback
                         model = model.to("cpu")
                         
@@ -578,7 +581,7 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                         
                         end_time = time.time()
                         elapsed = end_time - start_time
-                        print(f"AST prediction completed in {elapsed:.2f} seconds (recovery path)")
+                        logger.info(f"AST prediction completed in {elapsed:.2f} seconds (recovery path)")
                         
                         return predictions
                     else:
@@ -586,7 +589,7 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
                         raise
                         
         except Exception as e:
-            print(f"Error in feature extraction or model inference: {str(e)}")
+            logger.error(f"Error in feature extraction or model inference: {str(e)}")
             traceback.print_exc()
             # Return a fallback result
             return {
@@ -596,7 +599,7 @@ def predict_sound(audio_data, sample_rate, model, feature_extractor, threshold=0
             }
     
     except Exception as e:
-        print(f"Critical error in AST prediction: {str(e)}")
+        logger.error(f"Critical error in AST prediction: {str(e)}")
         traceback.print_exc()
         return {
             "top_predictions": [{"label": "Error", "confidence": 0.0}],
@@ -639,10 +642,10 @@ def process_predictions(probs_np, id2label, threshold=0.05, top_k=5):
         })
     
     # Print top predictions for debugging
-    print("===== AST MODEL RAW PREDICTIONS =====")
+    logger.info("===== AST MODEL RAW PREDICTIONS =====")
     for i in range(min(5, len(top_predictions))):
         if i < len(top_predictions):
-            print(f"  {top_predictions[i]['label']}: {top_predictions[i]['confidence']:.6f}")
+            logger.info(f"  {top_predictions[i]['label']}: {top_predictions[i]['confidence']:.6f}")
     
     # Map AST labels to homesounds categories
     mapped_predictions = map_ast_labels_to_homesounds(top_predictions, threshold)
@@ -671,12 +674,12 @@ if __name__ == "__main__":
     audio_data = 0.5 * np.sin(2 * np.pi * 440 * t)
     model, feature_extractor = load_ast_model()
     predictions = predict_sound(audio_data, sample_rate, model, feature_extractor)
-    print("\nTop predictions from AST model:")
+    logger.info("\nTop predictions from AST model:")
     for pred in predictions["top_predictions"]:
-        print(f"  {pred['label']}: {pred['confidence']:.6f}")
-    print("\nMapped predictions for SoundWatch:")
+        logger.info(f"  {pred['label']}: {pred['confidence']:.6f}")
+    logger.info("\nMapped predictions for SoundWatch:")
     for pred in predictions["mapped_predictions"]:
-        print(f"  {pred['label']} (from {pred['original_label']}): {pred['confidence']:.6f}")
+        logger.info(f"  {pred['label']} (from {pred['original_label']}): {pred['confidence']:.6f}")
 
 # Replace existing model with optimized architecture
 def create_improved_model(input_shape, num_classes):
