@@ -469,12 +469,13 @@ def handle_audio_data(data):
         # Log the received audio data event
         logger.info(f"Received audio_data from client, data keys: {list(data.keys()) if isinstance(data, dict) else 'not a dict'}")
         
-        if 'audio_data' in data:
+        # Extract audio data - client sends it with key 'data', not 'audio_data'
+        if 'data' in data:
             # Decode base64 audio data
             try:
-                audio_bytes = base64.b64decode(data['audio_data'])
+                audio_bytes = base64.b64decode(data['data'])
                 audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
-                logger.info(f"Decoded audio data, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
+                logger.debug(f"Decoded audio data, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
                 
                 # Check if audio data is empty or contains only zeros
                 if len(audio_data) == 0:
@@ -490,21 +491,21 @@ def handle_audio_data(data):
             
             # Get sample rate from data or use default
             sample_rate = data.get('sample_rate', 16000)
-            logger.info(f"Audio sample rate: {sample_rate} Hz")
+            logger.debug(f"Audio sample rate: {sample_rate} Hz")
             
-            # Get dB level from data
+            # Get dB level from data - client sends it with key 'db'
             db_level = None
-            if 'db_level' in data:
+            if 'db' in data:
                 try:
-                    db_level = float(data['db_level'])
-                    logger.info(f"Audio dB level: {db_level}")
+                    db_level = float(data['db'])
+                    logger.debug(f"Audio dB level from client: {db_level}")
                 except (ValueError, TypeError):
-                    logger.warning(f"Invalid dB level format: {data.get('db_level')}")
+                    logger.warning(f"Invalid dB level format: {data.get('db')}")
             else:
                 # Calculate dB level if not provided
                 if len(audio_data) > 0:
                     db_level = dbFS(audio_data)
-                    logger.info(f"Calculated dB level: {db_level}")
+                    logger.debug(f"Calculated dB level: {db_level}")
                 else:
                     logger.warning("Cannot calculate dB level for empty audio data")
                     return
@@ -519,14 +520,16 @@ def handle_audio_data(data):
                 logger.info(f"Adding audio data to speech analysis thread (length: {len(audio_data)})")
                 add_audio_for_analysis(audio_data, sample_rate)
             else:
-                logger.warning("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
+                logger.debug("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
             
             # Process audio for sound classification (in parallel)
             if len(audio_data) >= 16000:  # Ensure enough audio data for classification
                 logger.info(f"Processing audio data for sound classification (length: {len(audio_data)})")
                 process_sound_classification(audio_data, sample_rate, db_level)
             else:
-                logger.info(f"Audio data too short for classification, need 16000 samples, got {len(audio_data)}")
+                logger.debug(f"Audio data too short for classification, need 16000 samples, got {len(audio_data)}")
+        else:
+            logger.warning("No 'data' field in received audio data message")
                 
     except Exception as e:
         logger.error(f"Error handling audio data: {e}")
@@ -559,11 +562,28 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 logger.error("Sound classification model not loaded")
                 return
             
+            # Log audio data statistics for debugging
+            logger.info(f"Processing audio data: shape={audio_data.shape}, min={np.min(audio_data)}, max={np.max(audio_data)}, mean={np.mean(audio_data)}")
+            
             # Prepare audio for model input (assuming 1-second window)
             logger.info(f"Computing features from audio data of length {len(audio_data)}")
             try:
                 audio_features = homesounds.compute_features(audio_data, sample_rate)
                 logger.info(f"Computed audio features with shape: {audio_features.shape}")
+                
+                # Add debug visualization and save
+                try:
+                    # Generate a filename based on timestamp
+                    import datetime
+                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    debug_file = f"debug_features_{timestamp}.npy"
+                    
+                    # Save features to file for debugging
+                    np.save(os.path.join('models', debug_file), audio_features)
+                    logger.info(f"Saved debug features to {debug_file}")
+                except Exception as viz_error:
+                    logger.warning(f"Could not save debug features: {viz_error}")
+                
             except Exception as e:
                 logger.error(f"Error computing audio features: {e}")
                 logger.error(traceback.format_exc())
@@ -584,6 +604,10 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
             try:
                 prediction = sound_model.predict(audio_features, verbose=0)[0]
                 logger.info(f"Prediction shape: {prediction.shape}, sum: {np.sum(prediction):.4f}")
+                
+                # Debug: print full prediction array
+                logger.debug(f"Full prediction array: {prediction}")
+                
             except Exception as e:
                 logger.error(f"Error making prediction: {e}")
                 logger.error(traceback.format_exc())

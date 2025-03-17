@@ -3,6 +3,15 @@ Homesounds module for SoundWatch server.
 Contains labels and mappings for sound classification.
 """
 
+import numpy as np
+import scipy.signal as signal
+import logging
+import time
+from collections import defaultdict
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
 # HomeSounds Label Definition
 labels = {
     'dog-bark':0,
@@ -268,3 +277,86 @@ def apply_speech_correction(preds, db_level):
     correction = 0.25 * (1 - np.exp(-db_level/60))
     corrected_prob = max(speech_prob - correction, 0)
     return {**preds, 'speech': corrected_prob}
+
+# Add the compute_features function
+def compute_features(audio_data, sample_rate=16000):
+    """
+    Compute spectrogram features from audio data for sound classification.
+    
+    Args:
+        audio_data (numpy.ndarray): Audio samples as a numpy array
+        sample_rate (int): Sample rate of the audio in Hz
+        
+    Returns:
+        numpy.ndarray: Spectrogram features in shape (1, 96, 64, 1) for model input
+    """
+    try:
+        logger.info(f"Computing features from audio data: shape={audio_data.shape}, sr={sample_rate}")
+        
+        # Normalize audio data to -1 to 1 range
+        if np.max(np.abs(audio_data)) > 0:
+            audio_data = audio_data / np.max(np.abs(audio_data))
+        
+        # Set spectrogram parameters
+        n_fft = 1024  # FFT window size
+        hop_length = 512  # Hop length (stride)
+        n_mels = 64  # Number of Mel bands
+        
+        # Compute spectrogram
+        # Short-time Fourier transform
+        f, t, Zxx = signal.stft(audio_data, fs=sample_rate, nperseg=n_fft, 
+                               noverlap=n_fft-hop_length, window='hann')
+        
+        # Convert to magnitude spectrogram
+        spec = np.abs(Zxx)
+        
+        # Convert to mel scale
+        # Approximate mel scale conversion by taking subset of FFT bins
+        # (For proper mel conversion, a full mel filter bank should be used)
+        max_freq_idx = int(n_mels * 2)  # Approximate upper frequency limit
+        if max_freq_idx < spec.shape[0]:
+            spec = spec[:max_freq_idx, :]
+        
+        # Resize to target shape if needed
+        target_time_steps = 96
+        if spec.shape[1] > target_time_steps:
+            # Take center section if too long
+            start = (spec.shape[1] - target_time_steps) // 2
+            spec = spec[:, start:start+target_time_steps]
+        elif spec.shape[1] < target_time_steps:
+            # Pad with zeros if too short
+            padding = target_time_steps - spec.shape[1]
+            padded_spec = np.zeros((spec.shape[0], target_time_steps))
+            padded_spec[:, :spec.shape[1]] = spec
+            spec = padded_spec
+        
+        # Resize frequency dimension if needed
+        if spec.shape[0] != n_mels:
+            # Simple resize by interpolation (not ideal but works for this purpose)
+            from scipy.ndimage import zoom
+            zoom_factor = (n_mels / spec.shape[0], 1)
+            spec = zoom(spec, zoom_factor, order=1)
+        
+        # Convert to log scale (log mel spectrogram)
+        epsilon = 1e-10  # Small value to avoid log(0)
+        spec = np.log(spec + epsilon)
+        
+        # Normalize to 0-1 range
+        spec = (spec - np.min(spec)) / (np.max(spec) - np.min(spec) + epsilon)
+        
+        # Reshape to model input format: (1, height, width, channels)
+        features = spec.T.reshape(1, target_time_steps, n_mels, 1)
+        
+        logger.info(f"Computed features with shape {features.shape}")
+        return features
+        
+    except Exception as e:
+        logger.error(f"Error computing features: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        # Return empty features with expected shape
+        return np.zeros((1, 96, 64, 1))
+
+def get_class_names():
+    """Return the list of class names for sound classification"""
+    return list(to_human_labels.values())
