@@ -40,30 +40,6 @@ CHUNK = RATE
 MICROPHONES_DESCRIPTION = []
 FPS = 60.0
 
-###########################
-# Download model, if it doesn't exist
-###########################
-MODEL_URL = "https://www.dropbox.com/s/cq1d7uqg0l28211/example_model.hdf5?dl=1"
-MODEL_PATH = "models/example_model.hdf5"
-print("=====")
-print("2 / 2: Checking model... ")
-print("=====")
-model_filename = "models/example_model.hdf5"
-homesounds_model = Path(model_filename)
-if (not homesounds_model.is_file()):
-    print("Downloading example_model.hdf5 [867MB]: ")
-    wget.download(MODEL_URL, MODEL_PATH)
-
-##############################
-# Load Deep Learning Model
-##############################
-print("Using deep learning model: %s" % (model_filename))
-model = load_model(model_filename)
-graph = tf.get_default_graph()
-
-##############################
-# Setup Audio Callback
-##############################
 
 
 def audio_samples(in_data, frame_count, time_info, status_flags):
@@ -147,11 +123,11 @@ def handle_source(json_data):
     predictions.append(pred)
 
     with graph.as_default():
-        if x.shape[0] != 0:
-            x = x.reshape(len(x), 96, 64, 1)
-            print('Successfully reshape x', x)
-            # pred = model.predict(x)
-            # predictions.append(pred)
+    if x.shape[0] != 0:
+        x = x.reshape(len(x), 96, 64, 1)
+        print('Successfully reshape x', x)
+        # pred = model.predict(x)
+        # predictions.append(pred)
 
     for prediction in predictions:
         context_prediction = np.take(
@@ -223,4 +199,12 @@ def test_disconnect():
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=8080, debug=True)
+    import argparse
+    parser = argparse.ArgumentParser(description='Run the SoundWatch server')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--host', default='0.0.0.0', help='Server host (default: 0.0.0.0 to allow connections from anywhere)')
+    parser.add_argument('--port', type=int, default=8080, help='Server port (default: 8080)')
+    args = parser.parse_args()
+    
+    print(f"Starting server on {args.host}:{args.port}")
+    socketio.run(app, host=args.host, port=args.port, debug=args.debug)
