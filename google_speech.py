@@ -363,21 +363,66 @@ def transcribe_with_google(audio_data, sample_rate=16000):
         Transcription text or empty string if transcription failed
     """
     try:
-        # Log audio data info
-        logger.info(f"transcribe_with_google: audio_data shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data)}, max: {np.max(audio_data)}")
+        # Validate and log audio data info
+        if audio_data is None:
+            logger.error("No audio data provided for transcription")
+            return ""
+            
+        if not isinstance(audio_data, np.ndarray):
+            try:
+                logger.warning(f"Converting non-numpy audio data of type {type(audio_data)} to numpy array")
+                audio_data = np.array(audio_data, dtype=np.float32)
+            except Exception as e:
+                logger.error(f"Failed to convert audio data to numpy array: {e}")
+                return ""
         
-        # Initialize the Google Speech client
-        client = GoogleSpeechToText.get_client()
-        if not client:
-            logger.error("Failed to initialize Google Speech client. Check credentials.")
+        # Log audio data statistics
+        try:
+            logger.info(f"transcribe_with_google: audio_data shape: {audio_data.shape}, dtype: {audio_data.dtype}")
+            if len(audio_data) > 0:
+                logger.info(f"audio stats: min={np.min(audio_data):.4f}, max={np.max(audio_data):.4f}, mean={np.mean(audio_data):.4f}, non-zero={np.count_nonzero(audio_data)}")
+                # Check if audio has actual content
+                if np.count_nonzero(audio_data) < len(audio_data) * 0.01:  # Less than 1% non-zero
+                    logger.warning("Audio data appears to be mostly silent (< 1% non-zero values)")
+        except Exception as e:
+            logger.error(f"Error analyzing audio data: {e}")
+        
+        if len(audio_data) < 1000:  # Too short for meaningful transcription
+            logger.warning(f"Audio data too short for transcription: {len(audio_data)} samples")
+            return ""
+            
+        # Initialize Google Speech client
+        try:
+            from google.cloud import speech
+        except ImportError:
+            logger.error("Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
+            return ""
+            
+        # Check if credentials are available
+        if "GOOGLE_APPLICATION_CREDENTIALS" not in os.environ:
+            logger.error("Google Cloud credentials not set. Set GOOGLE_APPLICATION_CREDENTIALS environment variable.")
+            logger.error("Transcription will likely fail without valid credentials.")
+        
+        try:
+            client = speech.SpeechClient()
+        except Exception as e:
+            logger.error(f"Failed to initialize Google Speech client: {e}")
             return ""
         
         # Convert audio to the correct format for Google Speech API
-        # Convert to int16 format that Google Speech API expects
-        audio_int16 = (audio_data * 32767).astype(np.int16)
-        audio_bytes = audio_int16.tobytes()
-        
-        logger.info(f"Converted audio to int16, length in bytes: {len(audio_bytes)}")
+        try:
+            # Ensure audio is normalized between -1 and 1
+            if np.max(np.abs(audio_data)) > 0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
+                
+            # Convert to int16 format that Google Speech API expects (scale to full range)
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+            
+            logger.info(f"Converted audio to int16, length in bytes: {len(audio_bytes)}")
+        except Exception as e:
+            logger.error(f"Error converting audio format: {e}")
+            return ""
         
         # Create RecognitionAudio object
         audio = speech.RecognitionAudio(content=audio_bytes)
@@ -387,56 +432,38 @@ def transcribe_with_google(audio_data, sample_rate=16000):
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=sample_rate,
             language_code="en-US",
-            model="phone_call",  # Changed from "command_and_search" to better handle noisy audio
-            max_alternatives=5,  # Increased from 3 to get more alternatives
+            model="phone_call",  # Good for noisy audio
+            max_alternatives=3,
             enable_automatic_punctuation=True,
-            use_enhanced=True,  # Use enhanced model for better accuracy
-            speech_contexts=[
-                speech.SpeechContext(
-                    phrases=[
-                        # Minimal set of common conversational phrases
-                        "okay", "help", "emergency", "tired", "happy", "sad", "angry",
-                        "scared", "surprised", "sick", "pain", "hurt", "bathroom", "water",
-                        "food", "hungry", "thirsty", "cold", "hot", "yes", "no", "maybe",
-                        "please", "thank you", "sorry", "excuse me", "hello", "goodbye",
-                        "morning", "afternoon", "evening", "night", "today", "tomorrow",
-                        "yesterday", "now", "later", "soon", "never", "always", "sometimes",
-                        "often", "rarely", "here", "there", "this", "that", "these", "those",
-                        "what", "when", "where", "why", "who", "how", "which", "whose",
-                        "can", "could", "would", "should", "will", "shall", "may", "might",
-                        "must", "need", "want", "like", "love", "hate", "feel", "think",
-                        "know", "understand", "remember", "forget", "see", "hear", "smell",
-                        "taste", "touch", "go", "come", "stay", "leave", "arrive", "depart"
-                    ],
-                    boost=5.0  # Reduced from 20.0 to minimize hallucinations
-                )
-            ]
+            use_enhanced=True,
         )
         
         # Perform the transcription
         logger.info("Sending audio to Google Cloud Speech API...")
-        response = client.recognize(config=config, audio=audio)
-        
-        # Process the response
-        if not response.results:
-            logger.warning("No transcription results returned from Google Speech API")
+        try:
+            response = client.recognize(config=config, audio=audio)
+            
+            # Process the response
+            if not response.results:
+                logger.warning("No transcription results returned from Google Speech API")
+                return ""
+            
+            # Get the most likely transcription
+            transcription = response.results[0].alternatives[0].transcript
+            confidence = response.results[0].alternatives[0].confidence
+            logger.info(f"Google Speech API transcription result: '{transcription}' (confidence: {confidence:.2f})")
+            
+            # Return the transcription
+            return transcription
+        except Exception as e:
+            logger.error(f"Error in Google Speech API recognize call: {e}")
             return ""
-        
-        # Get the most likely transcription
-        transcription = response.results[0].alternatives[0].transcript
-        logger.info(f"Google Speech API transcription result: '{transcription}'")
-        
-        # Return the transcription
-        return transcription
-        
+            
     except Exception as e:
         # Format detailed error information for easier debugging
         error_message = f"Google Cloud Speech API error: {str(e)}"
-        error_details = f"Error details: {traceback.format_exc()}"
-        
-        # Log detailed error
         logger.error(error_message)
-        logger.error(error_details)
+        logger.error(traceback.format_exc())
         
         # Return empty string on error
         return ""

@@ -471,22 +471,45 @@ def handle_audio_data(data):
         
         # Extract audio data - client sends it with key 'data', not 'audio_data'
         if 'data' in data:
-            # Decode base64 audio data
-            try:
-                audio_bytes = base64.b64decode(data['data'])
-                audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
-                logger.debug(f"Decoded audio data, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
+            audio_data = None
+            
+            # Check if data is base64-encoded string or a raw list
+            if isinstance(data['data'], str):
+                # Handle base64-encoded string
+                try:
+                    logger.info("Processing audio data as base64-encoded string")
+                    audio_bytes = base64.b64decode(data['data'])
+                    audio_data = np.frombuffer(audio_bytes, dtype=np.float32)
+                except Exception as e:
+                    logger.error(f"Error decoding base64 audio data: {e}")
+                    logger.error(traceback.format_exc())
+                    return
+            elif isinstance(data['data'], list):
+                # Handle list directly - convert to numpy array
+                try:
+                    logger.info(f"Processing audio data as list (length: {len(data['data'])})")
+                    audio_data = np.array(data['data'], dtype=np.float32)
+                except Exception as e:
+                    logger.error(f"Error converting list to numpy array: {e}")
+                    logger.error(traceback.format_exc())
+                    return
+            else:
+                logger.error(f"Unsupported data type: {type(data['data'])}")
+                return
                 
-                # Check if audio data is empty or contains only zeros
-                if len(audio_data) == 0:
-                    logger.warning("Decoded audio data is empty")
-                    return
-                if np.all(audio_data == 0):
-                    logger.warning("Decoded audio data contains only zeros")
-                    return
-            except Exception as e:
-                logger.error(f"Error decoding audio data: {e}")
-                logger.error(traceback.format_exc())
+            # Check if audio data was successfully extracted
+            if audio_data is None:
+                logger.warning("Failed to extract audio data")
+                return
+                
+            logger.info(f"Audio data extracted, shape: {audio_data.shape}, dtype: {audio_data.dtype}, min: {np.min(audio_data) if len(audio_data) > 0 else 'N/A'}, max: {np.max(audio_data) if len(audio_data) > 0 else 'N/A'}")
+            
+            # Check if audio data is empty or contains only zeros
+            if len(audio_data) == 0:
+                logger.warning("Audio data is empty")
+                return
+            if np.all(audio_data == 0):
+                logger.warning("Audio data contains only zeros")
                 return
             
             # Get sample rate from data or use default
@@ -671,23 +694,31 @@ def handle_audio_feature_data(data):
         if 'data' not in data:
             logger.warning("Missing 'data' field in audio feature data")
             return
-            
+        
+        feature_data = None
+        
         # Convert data to numpy array, handling different possible formats
         try:
             # Check if data is already a list
             if isinstance(data['data'], list):
+                logger.info(f"Processing feature data as list (length: {len(data['data'])})")
                 feature_data = np.array(data['data'], dtype=np.float32)
-            else:
+            elif isinstance(data['data'], str):
                 # Try parsing as string (older client format)
+                logger.info(f"Processing feature data as string")
                 data_str = str(data['data'])
                 data_str = data_str.strip('[]')  # Remove brackets if present
                 feature_data = np.fromstring(data_str, dtype=np.float32, sep=',')
+            else:
+                # Try to convert directly if it's some other type
+                logger.info(f"Attempting to convert feature data of type {type(data['data'])}")
+                feature_data = np.array(data['data'], dtype=np.float32)
             
             logger.info(f"Converted feature data shape: {feature_data.shape}")
         except Exception as e:
             logger.error(f"Error converting feature data: {e}")
             logger.error(f"Data type: {type(data['data'])}")
-            logger.error(f"Data preview: {str(data['data'])[:100]}...")
+            logger.error(f"Data preview: {str(data['data'])[:100]}..." if isinstance(data['data'], (str, list)) else "Not displayable")
             return
         
         # Reshape if necessary
@@ -705,6 +736,7 @@ def handle_audio_feature_data(data):
                     feature_data = np.reshape(feature_data, (1, 96, 64, 1))
             except Exception as e:
                 logger.error(f"Error reshaping feature data: {e}")
+                logger.error(traceback.format_exc())
                 return
                 
         # Get dB level if available
@@ -715,6 +747,13 @@ def handle_audio_feature_data(data):
                 logger.info(f"DB level from client: {db_level}")
             except (ValueError, TypeError):
                 logger.warning(f"Invalid dB level format: {data.get('db_level')}")
+                db_level = -100  # Default low value
+        elif 'db' in data:
+            try:
+                db_level = float(data['db'])
+                logger.info(f"DB level from client: {db_level}")
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid dB level format: {data.get('db')}")
                 db_level = -100  # Default low value
                 
         # Process prediction with thread-safe model access
@@ -731,8 +770,16 @@ def handle_audio_feature_data(data):
                 
             # Make prediction
             logger.info("Making prediction with sound model...")
-            prediction = sound_model.predict(feature_data, verbose=0)[0]
-            prediction_count += 1
+            try:
+                prediction = sound_model.predict(feature_data, verbose=0)[0]
+                prediction_count += 1
+                
+                logger.info(f"Prediction shape: {prediction.shape}, sum: {np.sum(prediction):.4f}")
+                logger.debug(f"Full prediction array: {prediction}")
+            except Exception as e:
+                logger.error(f"Error making prediction: {e}")
+                logger.error(traceback.format_exc())
+                return
             
             # Get class with highest probability
             max_idx = np.argmax(prediction)
