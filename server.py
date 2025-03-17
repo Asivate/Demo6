@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 # Import Google Speech API directly - we'll only use this and not Vosk
 try:
-    from google_speech import GoogleSpeechToText, transcribe_with_google
+    from google_speech import GoogleSpeechToText, transcribe_with_google, streaming_transcribe_with_google, AudioStream, close_streaming_transcription
     GOOGLE_SPEECH_AVAILABLE = True
     logger.info("Google Cloud Speech API is available")
 except ImportError:
@@ -97,6 +97,11 @@ classification_buffer = []  # Buffer specifically for sound classification
 classification_buffer_lock = threading.RLock()
 MIN_SAMPLES_FOR_CLASSIFICATION = 16000  # Minimum samples needed for classification
 
+# New buffer for speech transcription
+transcription_buffer = []  # Buffer specifically for speech transcription
+transcription_buffer_lock = threading.RLock()
+MIN_SAMPLES_FOR_TRANSCRIPTION = 15000  # Minimum samples needed for transcription
+
 # Performance timer decorator
 def performance_timer(func):
     """Decorator to log execution time for functions."""
@@ -128,6 +133,8 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
         self.last_sentiment_time = time.time()
         self.sentiment_interval = 2.0  # Analyze sentiment every 2 seconds
         self.sentiment_pipeline = None
+        self.streaming_thread = None
+        self.streaming_active = False
         
         # Initialize the sentiment pipeline
         if ENABLE_SENTIMENT_ANALYSIS:
@@ -140,12 +147,102 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 self.sentiment_pipeline = None
     
     def add_audio_data(self, audio_data, sample_rate):
-        """Add audio data to the processing queue"""
+        """Add audio data to the processing queue and streaming transcription"""
         if self.running and audio_data is not None and len(audio_data) > 0:
             logger.debug(f"Adding audio data to queue, length: {len(audio_data)}")
             self.audio_queue.put((audio_data, sample_rate))
-        else:
-            logger.warning(f"Not adding audio data to queue: running={self.running}, audio_data_length={len(audio_data) if audio_data is not None else 'None'}")
+            
+            # Add to streaming transcription directly
+            if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
+                # Start streaming thread if not running
+                if not self.streaming_active:
+                    self.start_streaming_transcription()
+                
+                # Add audio data to streaming transcription
+                logger.debug(f"Adding audio chunk of length {len(audio_data)} to streaming transcription")
+                add_to_streaming_transcription(audio_data)
+            else:
+                logger.debug("Not adding audio to streaming transcription: Google Speech API or sentiment analysis is disabled")
+    
+    def start_streaming_transcription(self):
+        """Start the streaming transcription in a separate thread"""
+        if self.streaming_active:
+            logger.warning("Streaming transcription already active")
+            return
+            
+        def streaming_thread_func():
+            try:
+                # Create a new global audio stream
+                global streaming_audio
+                streaming_audio = AudioStream()
+                
+                # Start streaming transcription
+                logger.info("Starting streaming transcription thread")
+                
+                # Process streaming transcription results
+                for result in streaming_transcribe_with_google(streaming_audio):
+                    if not self.running:
+                        break
+                        
+                    if result and 'transcript' in result:
+                        transcript = result['transcript']
+                        is_final = result.get('is_final', False)
+                        
+                        if is_final and len(transcript.strip()) > 0:
+                            # For final results, add to transcript and history
+                            logger.info(f"Final streaming transcript: '{transcript}'")
+                            
+                            # Update the current transcript
+                            self.transcript = transcript
+                            
+                            # Add to transcript history with timestamp
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                            entry = {
+                                "timestamp": timestamp,
+                                "text": transcript,
+                                "sentiment": None  # Will be filled in by sentiment analysis
+                            }
+                            transcript_history.append(entry)
+                            
+                            # Limit history size
+                            while len(transcript_history) > MAX_CONVERSATION_HISTORY:
+                                transcript_history.pop(0)
+                            
+                            # Emit transcript update to clients
+                            logger.info(f"Emitting transcript_update to clients: {transcript}")
+                            self.socketio.emit('transcript_update', {
+                                'transcript': transcript,
+                                'timestamp': timestamp
+                            })
+                            
+                            # Also emit a notification to the client
+                            self.socketio.emit('notification', {
+                                'type': 'transcription',
+                                'title': 'Speech Detected',
+                                'message': transcript,
+                                'timestamp': timestamp
+                            })
+                        elif not is_final and len(transcript.strip()) > 0:
+                            # For interim results, just emit updates
+                            logger.debug(f"Interim streaming transcript: '{transcript}'")
+                            
+                            # Emit interim transcript update
+                            self.socketio.emit('interim_transcript', {
+                                'transcript': transcript,
+                                'timestamp': time.strftime("%Y-%m-%d %H:%M:%S")
+                            })
+            except Exception as e:
+                logger.error(f"Error in streaming transcription thread: {e}")
+                logger.error(traceback.format_exc())
+            finally:
+                logger.info("Streaming transcription thread stopped")
+                self.streaming_active = False
+        
+        # Start the streaming thread
+        self.streaming_thread = threading.Thread(target=streaming_thread_func, daemon=True)
+        self.streaming_thread.start()
+        self.streaming_active = True
+        logger.info("Streaming transcription thread started")
     
     def run(self):
         """Main thread loop for continuous speech analysis"""
@@ -157,6 +254,8 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 try:
                     audio_data, sample_rate = self.audio_queue.get(timeout=0.5)
                     logger.debug(f"Got audio data from queue, length: {len(audio_data)}")
+                    
+                    # Process audio for debugging only
                     self.process_audio(audio_data, sample_rate)
                 except queue.Empty:
                     # No data in queue, continue to next iteration
@@ -176,47 +275,13 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
         logger.info("Continuous speech analysis thread stopped")
     
     def process_audio(self, audio_data, sample_rate):
-        """Process audio data for transcription"""
+        """Process individual audio segments (now primarily for logging)"""
         if not GOOGLE_SPEECH_AVAILABLE:
             logger.warning("Google Speech API not available, skipping transcription")
             return
-            
-        try:
-            # Transcribe the audio using Google Speech API
-            logger.info(f"Transcribing audio data of length {len(audio_data)} with Google Speech API")
-            transcript = transcribe_with_google(audio_data, sample_rate)
-            
-            if transcript and isinstance(transcript, str) and len(transcript.strip()) > 0:
-                logger.info(f"Transcription result: '{transcript}'")
-                # Update the current transcript
-                self.transcript += " " + transcript
-                
-                # Add to transcript history with timestamp
-                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-                entry = {
-                    "timestamp": timestamp,
-                    "text": transcript,
-                    "sentiment": None  # Will be filled in by sentiment analysis
-                }
-                transcript_history.append(entry)
-                
-                # Limit history size
-                while len(transcript_history) > MAX_CONVERSATION_HISTORY:
-                    transcript_history.pop(0)
-                
-                # Emit transcript update to clients
-                logger.info(f"Emitting transcript_update to clients: {transcript}")
-                self.socketio.emit('transcript_update', {
-                    'transcript': transcript,
-                    'timestamp': timestamp
-                })
-                
-                logger.info(f"Transcribed: {transcript}")
-            else:
-                logger.info("No valid transcription result returned (empty or not a string)")
-        except Exception as e:
-            logger.error(f"Error transcribing audio: {e}")
-            logger.error(traceback.format_exc())
+        
+        # We're using streaming transcription now, so this method is just for logging
+        logger.debug(f"Audio segment of length {len(audio_data)} received (streaming handles transcription)")
     
     def analyze_sentiment(self):
         """Analyze sentiment of the current transcript"""
@@ -261,9 +326,20 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
             logger.error(traceback.format_exc())
     
     def stop(self):
-        """Stop the continuous analysis thread"""
+        """Stop the continuous analysis thread and streaming transcription"""
         logger.info("Stopping continuous speech analysis thread")
         self.running = False
+        
+        # Close streaming transcription
+        if self.streaming_active:
+            try:
+                close_streaming_transcription()
+                if self.streaming_thread and self.streaming_thread.is_alive():
+                    self.streaming_thread.join(timeout=3)
+            except Exception as e:
+                logger.error(f"Error stopping streaming transcription: {e}")
+        
+        logger.info("Continuous speech analysis thread and streaming stopped")
 
 # Global instance of the continuous speech analysis thread
 continuous_speech_thread = None
@@ -531,19 +607,23 @@ def handle_audio_data(data):
                     logger.warning("Cannot calculate dB level for empty audio data")
                     return
             
-            # Check if audio is too quiet for sentiment analysis
+            # Check if audio is too quiet
             if db_level is not None and db_level < DBLEVEL_THRES:
                 logger.info(f"Audio too quiet (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
                 return
         
-            # Add audio data to continuous speech analysis thread (always process for sentiment analysis)
+            # PARALLEL PROCESSING:
+            # 1. Add audio data to speech streaming thread (for sentiment analysis)
+            # 2. Process audio for sound classification (buffer until we have enough)
+            
+            # 1. Process for streaming speech transcription
             if GOOGLE_SPEECH_AVAILABLE and ENABLE_SENTIMENT_ANALYSIS:
-                logger.info(f"Adding audio data to speech analysis thread (length: {len(audio_data)})")
+                logger.info(f"Adding audio data to streaming transcription (length: {len(audio_data)})")
                 add_audio_for_analysis(audio_data, sample_rate)
             else:
                 logger.debug("Not adding audio to speech analysis thread: Google Speech API or sentiment analysis is disabled")
             
-            # Process audio for sound classification (buffer until we have enough)
+            # 2. Process for sound classification
             with classification_buffer_lock:
                 # Add new audio to the buffer
                 classification_buffer.extend(audio_data)
@@ -565,7 +645,6 @@ def handle_audio_data(data):
                     logger.info("Cleared classification buffer after processing")
         else:
             logger.warning("No 'data' field in received audio data message")
-                
     except Exception as e:
         logger.error(f"Error handling audio data: {e}")
         logger.error(traceback.format_exc())

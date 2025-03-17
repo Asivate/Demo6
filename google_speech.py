@@ -578,3 +578,175 @@ class GoogleSpeechToText:
             Transcribed text
         """
         return transcribe_with_google(audio_data, self.sample_rate) 
+
+# New streaming transcription implementation
+class AudioStream:
+    """A generator class that yields audio chunks for streaming recognition."""
+    def __init__(self):
+        self.chunks = []
+        self.closed = False
+        self._lock = threading.Lock()
+    
+    def add_chunk(self, chunk):
+        """Add an audio chunk to the stream."""
+        with self._lock:
+            self.chunks.append(chunk)
+    
+    def close(self):
+        """Close the stream."""
+        self.closed = True
+    
+    def __iter__(self):
+        return self
+    
+    def __next__(self):
+        """Yield the next audio chunk."""
+        while not self.closed and not self.chunks:
+            time.sleep(0.1)  # Wait for more audio data
+        
+        with self._lock:
+            if self.chunks:
+                return self.chunks.pop(0)
+            elif self.closed:
+                raise StopIteration
+            else:
+                return None
+
+def streaming_transcribe_with_google(audio_stream, sample_rate=16000):
+    """
+    Transcribe streaming audio using Google Cloud Speech-to-Text API.
+    
+    Args:
+        audio_stream: A generator yielding audio chunks
+        sample_rate: Sample rate of the audio
+        
+    Returns:
+        Generator yielding transcription results
+    """
+    try:
+        if not GOOGLE_SPEECH_AVAILABLE:
+            logger.error("Google Cloud Speech API not available. Install with: pip install google-cloud-speech")
+            return
+            
+        # Ensure credentials are set up
+        if not CREDENTIALS_SETUP:
+            logger.warning("Attempting to set up credentials again...")
+            setup_google_credentials()
+            
+        # Create the Speech client
+        client = speech.SpeechClient()
+        
+        # Create RecognitionConfig for streaming
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            language_code="en-US",
+            model="phone_call",  # Good for noisy audio
+            enable_automatic_punctuation=True,
+            use_enhanced=True,
+        )
+        
+        # Create StreamingRecognitionConfig
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True  # Get interim results as speech is processed
+        )
+        
+        # Generator to convert audio chunks to streaming requests
+        def request_generator():
+            # First request must contain only the config
+            yield speech.StreamingRecognizeRequest(streaming_config=streaming_config)
+            
+            # Subsequent requests contain audio data
+            for chunk in audio_stream:
+                if chunk is None:
+                    continue
+                    
+                if isinstance(chunk, np.ndarray):
+                    # Ensure audio is normalized between -1 and 1
+                    if np.max(np.abs(chunk)) > 0:
+                        chunk = chunk / np.max(np.abs(chunk))
+                        
+                    # Convert to int16 format that Google Speech API expects
+                    chunk_int16 = (chunk * 32767).astype(np.int16)
+                    chunk_bytes = chunk_int16.tobytes()
+                elif isinstance(chunk, bytes):
+                    chunk_bytes = chunk
+                else:
+                    # Skip invalid chunks
+                    logger.warning(f"Skipping invalid chunk type: {type(chunk)}")
+                    continue
+                
+                if chunk_bytes:
+                    yield speech.StreamingRecognizeRequest(audio_content=chunk_bytes)
+        
+        # Start streaming recognition
+        logger.info("Starting streaming transcription...")
+        streaming_responses = client.streaming_recognize(request_generator())
+        
+        # Process streaming responses
+        num_chars_printed = 0
+        current_transcript = ""
+        
+        for response in streaming_responses:
+            if not response.results:
+                continue
+                
+            # The result might be for intermediate or final results
+            result = response.results[0]
+            if not result.alternatives:
+                continue
+                
+            # Display the transcription
+            transcript = result.alternatives[0].transcript
+            confidence = result.alternatives[0].confidence if result.is_final else 0
+            
+            # If the result is final, return it
+            if result.is_final:
+                logger.info(f"Final transcript: '{transcript}' (confidence: {confidence:.2f})")
+                current_transcript = ""
+                yield {
+                    'transcript': transcript,
+                    'is_final': True,
+                    'confidence': confidence
+                }
+            else:
+                # For interim results, just log them
+                if transcript != current_transcript:
+                    logger.debug(f"Interim transcript: '{transcript}'")
+                    current_transcript = transcript
+                    yield {
+                        'transcript': transcript, 
+                        'is_final': False,
+                        'confidence': 0.0
+                    }
+                    
+    except Exception as e:
+        logger.error(f"Error in streaming transcription: {e}")
+        logger.error(traceback.format_exc())
+        if "403" in str(e) and "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in str(e):
+            logger.error("Permission denied: Your service account doesn't have the right permissions")
+            logger.error("You need to give your service account the 'Speech API user' role")
+            logger.error("Go to the Google Cloud Console -> IAM -> Edit service account -> Add 'Speech API user' role")
+        return
+
+# Global audio stream for streaming recognition
+streaming_audio = AudioStream()
+
+# Function to add audio to the streaming transcription
+def add_to_streaming_transcription(audio_data):
+    """
+    Add audio data to the streaming transcription.
+    
+    Args:
+        audio_data: Audio data as numpy array
+    """
+    global streaming_audio
+    if audio_data is not None and len(audio_data) > 0:
+        streaming_audio.add_chunk(audio_data)
+
+# Function to close the streaming transcription
+def close_streaming_transcription():
+    """Close the streaming transcription."""
+    global streaming_audio
+    streaming_audio.close() 
