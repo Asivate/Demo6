@@ -202,13 +202,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                     from google.cloud import speech
                     
                     try:
-                        # First request with config but no audio content
-                        logger.debug("Sending initial streaming config request")
-                        yield speech.StreamingRecognizeRequest(
-                            streaming_config=streaming_config
-                        )
-                        
-                        # Subsequent requests with audio content but no config
+                        # No need to send initial config request anymore as we're passing it separately
                         logger.debug("Starting to process audio chunks")
                         while not audio_stream_closed:
                             # Wait for audio data with timeout
@@ -271,8 +265,8 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                         interim_results=True
                     )
                     
-                    # Pass requests directly from the generator
-                    responses = client.streaming_recognize(requests=audio_generator())
+                    # Pass both streaming_config and requests to the method
+                    responses = client.streaming_recognize(config=streaming_config, requests=audio_generator())
                     
                     # Process streaming responses
                     for response in responses:
