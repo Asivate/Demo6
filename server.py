@@ -288,16 +288,22 @@ def load_models():
     """Load all required models"""
     with model_lock:
         try:
-            # Load sound classification model
-            load_sound_classification_model()
+            # Load sound classification model - note we now catch the return value
+            sound_model_loaded = load_sound_classification_model()
             
             # Initialize sentiment analysis model
             initialize_sentiment_analyzer(socketio, sample_rate=16000)
             
-            logger.info("All models loaded successfully")
+            if sound_model_loaded:
+                logger.info("All models loaded successfully")
+                return True
+            else:
+                logger.warning("Sound classification model could not be loaded, but continuing with other functionality")
+                return False
         except Exception as e:
             logger.error(f"Error loading models: {e}")
             logger.error(traceback.format_exc())
+            return False
 
 def load_sound_classification_model():
     """Load the sound classification model"""
@@ -307,7 +313,7 @@ def load_sound_classification_model():
         # Check if model already loaded
         if 'sound_model' in models and models['sound_model'] is not None:
             logger.info("Sound classification model already loaded")
-            return
+            return True
             
         logger.info("Loading sound classification model...")
         
@@ -321,29 +327,61 @@ def load_sound_classification_model():
         # Download model if it doesn't exist
         if not model_path.exists():
             logger.info("Downloading sound classification model...")
-            download_sound_classification_model(model_path)
+            try:
+                download_sound_classification_model(model_path)
+            except Exception as e:
+                logger.error(f"Failed to download model: {e}")
+                return False
         
+        # Check if model exists now
+        if not model_path.exists():
+            logger.error("Model file still doesn't exist after download attempt")
+            return False
+            
         # Load the model
         model = keras.models.load_model(str(model_path))
         models['sound_model'] = model
         
         logger.info("Sound classification model loaded successfully")
+        return True
         
     except Exception as e:
         logger.error(f"Error loading sound classification model: {e}")
         logger.error(traceback.format_exc())
-        raise
+        return False
 
 def download_sound_classification_model(model_path):
     """Download the sound classification model"""
     try:
-        # URL for the model
-        model_url = "https://github.com/SmartWatchProject/SoundWatch/raw/master/models/homesounds_model.h5"
+        # First check if example_model.hdf5 exists and use that
+        example_model_path = Path('models') / 'example_model.hdf5'
+        if example_model_path.exists():
+            logger.info(f"Using existing example model: {example_model_path}")
+            # Copy or link the example model to the expected location
+            import shutil
+            shutil.copy(str(example_model_path), str(model_path))
+            logger.info(f"Copied example model to {model_path}")
+            return
         
-        # Download the model
-        logger.info(f"Downloading model from {model_url}")
-        wget.download(model_url, str(model_path))
-        logger.info(f"Model downloaded to {model_path}")
+        # URLs to try in order
+        model_urls = [
+            "https://github.com/SmartWatchProject/SoundWatch/raw/master/models/homesounds_model.h5",
+            "https://github.com/makeabilitylab/SoundWatch/raw/master/server/models/example_model.hdf5"
+        ]
+        
+        # Try each URL until one works
+        for model_url in model_urls:
+            try:
+                logger.info(f"Attempting to download model from {model_url}")
+                wget.download(model_url, str(model_path))
+                logger.info(f"Model downloaded to {model_path}")
+                return
+            except Exception as e:
+                logger.warning(f"Failed to download from {model_url}: {e}")
+                continue
+                
+        # If we reach here, all URLs failed
+        raise Exception("All download attempts failed")
         
     except Exception as e:
         logger.error(f"Error downloading sound classification model: {e}")
