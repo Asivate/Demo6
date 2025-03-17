@@ -199,38 +199,56 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                 
                 # Create a generator to yield audio chunks for streaming
                 def audio_generator():
-                    # First yield empty content to configure streaming
-                    yield b''
+                    from google.cloud import speech
                     
-                    # Subsequent yields contain audio data
-                    while not audio_stream_closed:
-                        # Wait for audio data with timeout
-                        try:
-                            audio_chunk = audio_stream.get(timeout=2.0)
-                            if audio_chunk is None:
-                                break  # End of stream
-                                
-                            # Convert audio to int16 format
-                            if isinstance(audio_chunk, np.ndarray):
-                                # Normalize if needed
-                                if np.max(np.abs(audio_chunk)) > 0:
-                                    audio_chunk = audio_chunk / np.max(np.abs(audio_chunk))
+                    try:
+                        # First request with config but no audio content
+                        logger.debug("Sending initial streaming config request")
+                        yield speech.StreamingRecognizeRequest(
+                            streaming_config=streaming_config
+                        )
+                        
+                        # Subsequent requests with audio content but no config
+                        logger.debug("Starting to process audio chunks")
+                        while not audio_stream_closed:
+                            # Wait for audio data with timeout
+                            try:
+                                audio_chunk = audio_stream.get(timeout=2.0)
+                                if audio_chunk is None:
+                                    logger.debug("Received None chunk, ending stream")
+                                    break  # End of stream
                                     
-                                # Convert to int16
-                                audio_chunk_int16 = (audio_chunk * 32767).astype(np.int16)
-                                audio_bytes = audio_chunk_int16.tobytes()
-                                
-                                # Yield audio content directly
-                                yield audio_bytes
-                                logger.debug(f"Streamed audio chunk of size {len(audio_bytes)} bytes")
-                        except queue.Empty:
-                            # No audio data available, continue waiting
-                            logger.debug("No audio data in queue, continuing to wait...")
-                            continue
-                        except Exception as e:
-                            logger.error(f"Error in audio generator: {e}")
-                            logger.error(traceback.format_exc())
-                            
+                                # Convert audio to int16 format
+                                if isinstance(audio_chunk, np.ndarray):
+                                    # Check if chunk is valid
+                                    if len(audio_chunk) == 0:
+                                        logger.warning("Skipping empty audio chunk")
+                                        continue
+                                    
+                                    # Normalize if needed
+                                    if np.max(np.abs(audio_chunk)) > 0:
+                                        audio_chunk = audio_chunk / np.max(np.abs(audio_chunk))
+                                        
+                                    # Convert to int16
+                                    audio_chunk_int16 = (audio_chunk * 32767).astype(np.int16)
+                                    audio_bytes = audio_chunk_int16.tobytes()
+                                    
+                                    if len(audio_bytes) > 0:
+                                        # Yield audio content in a proper request format
+                                        logger.debug(f"Sending audio chunk of size {len(audio_bytes)} bytes")
+                                        yield speech.StreamingRecognizeRequest(
+                                            audio_content=audio_bytes
+                                        )
+                                    else:
+                                        logger.warning("Skipping empty audio bytes")
+                            except queue.Empty:
+                                # No audio data available, continue waiting
+                                logger.debug("No audio data in queue, continuing to wait...")
+                                continue
+                    except Exception as e:
+                        logger.error(f"Error in audio generator: {e}")
+                        logger.error(traceback.format_exc())
+                
                 # Initialize the Google Speech client
                 try:
                     from google.cloud import speech
@@ -239,6 +257,7 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                     
                     # Start streaming recognition with the audio generator
                     logger.info("Starting streaming transcription...")
+                    
                     # Create the streaming configuration
                     streaming_config = speech.StreamingRecognitionConfig(
                         config=speech.RecognitionConfig(
@@ -252,8 +271,8 @@ class ContinuousSpeechAnalysisThread(threading.Thread):
                         interim_results=True
                     )
                     
-                    # Pass the config in the right format
-                    responses = client.streaming_recognize(streaming_config, audio_generator())
+                    # Pass requests directly from the generator
+                    responses = client.streaming_recognize(requests=audio_generator())
                     
                     # Process streaming responses
                     for response in responses:
