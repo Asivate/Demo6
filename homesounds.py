@@ -183,6 +183,20 @@ sound_specific_thresholds = {
     # Default threshold of 0.2 will be used for any sound not specified here
 }
 
+def get_sound_specific_threshold(sound_class):
+    """
+    Returns the specific threshold for a given sound class.
+    If the sound class doesn't have a specific threshold, returns the default threshold.
+    
+    Args:
+        sound_class (str): The sound class name
+        
+    Returns:
+        float: The threshold value for the sound class
+    """
+    # Return specific threshold if exists, otherwise return default
+    return sound_specific_thresholds.get(sound_class, PREDICTION_THRES)
+
 # Define function to get class names before it's used
 def get_class_names():
     """
@@ -302,7 +316,7 @@ class SoundDetectionHistory:
         # 1. The sound hasn't been detected recently (avoid duplicate detections)
         # 2. The dB level is sufficiently high (indicating a sharp sound)
         # 3. There's at least some base confidence
-        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES) * 0.3  # Only need 30% of threshold for boosting (was 50%)
+        min_confidence = get_sound_specific_threshold(sound_class) * 0.3  # Only need 30% of threshold for boosting (was 50%)
         
         # Adjust for knocking with special handling
         if sound_class == 'Door knock' and current_confidence > min_confidence:  # Lower activation threshold

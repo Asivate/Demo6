@@ -116,6 +116,7 @@ ENABLE_SPEECH = True  # Control flag for speech processing
 SPEECH_DBLEVEL_THRES = -20  # Minimum dB level to process speech
 SPEECH_BUFFER_SIZE = TARGET_SR * 5  # 5 seconds of audio data for speech processing
 speech_buffer = []  # Buffer to store audio for speech processing
+speech_buffer_lock = threading.RLock()  # Lock for thread-safe access to speech buffer
 
 # Audio buffers for continuous processing
 AUDIO_BUFFER_SIZE = 5  # Buffer size in seconds
