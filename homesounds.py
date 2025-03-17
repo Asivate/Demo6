@@ -155,28 +155,32 @@ original_to_human_labels = {
     'cooking': "Utensils and Cutlery",  # This is likely being confused with knocking
 }
 
-# CORRECTED model index mapping for percussive sounds
-KNOCK_IDX = 6  # Current index for Door knock in to_human_labels 
-DISHES_IDX = 4  # Current index for Dishes in to_human_labels
-GLASS_BREAKING_IDX = 9  # Current index for Glass breaking in to_human_labels
+# Define indices for percussive sounds
+KNOCK_IDX = 6      # Door knock index in the model output
+DISHES_IDX = 4     # Dishes index in the model output
+GLASS_BREAKING_IDX = 9  # Glass breaking index in the model output
+CAR_HORN_IDX = 2   # Car horn index
 
 # Define percussive sounds that need special handling
-percussive_sounds = ['Door knock', 'Glass breaking', 'Dishes']
+percussive_sounds_names = ['Door knock', 'Glass breaking', 'Dishes', 'Car horn']
+percussive_sounds = [KNOCK_IDX, DISHES_IDX, GLASS_BREAKING_IDX, CAR_HORN_IDX]  # Indices for percussive sounds
 
 # Add missing threshold constants
-PREDICTION_THRES = 0.3  # Default prediction threshold for sound detection
+PREDICTION_THRES = 0.2  # Default prediction threshold for sound detection - lowered from 0.3 to 0.2
 DBLEVEL_THRES = -30  # Threshold for dB level to consider sound significant
 
-# Define sound-specific thresholds
+# Define sound-specific thresholds - adjusted based on observed confidence levels
 sound_specific_thresholds = {
-    'Door knock': 0.15,   # Lower threshold for knock detection (from 0.3 to 0.15)
-    'Dishes': 0.4,       # Keep dishes threshold higher to avoid confusion with knocking
-    'door-bell': 0.4,
-    'dog-bark': 0.4,
-    'baby-cry': 0.3,
-    'phone-ring': 0.35,
-    'vacuum-cleaner': 0.35
-    # Default threshold of 0.5 will be used for any sound not specified here
+    'Door knock': 0.1,    # Lowered from 0.15 to 0.1 to better detect knocks
+    'Dishes': 0.2,        # Lowered from 0.4 to 0.2 but still higher than knock
+    'Glass breaking': 0.1, # Lowered to better detect breaking glass
+    'door-bell': 0.2,     # Lowered from 0.4
+    'dog-bark': 0.2,      # Lowered from 0.4
+    'baby-cry': 0.15,     # Lowered from 0.3
+    'phone-ring': 0.2,    # Lowered from 0.35
+    'vacuum-cleaner': 0.2, # Lowered from 0.35
+    'Car horn': 0.1       # Added based on logs showing low confidence for car horn
+    # Default threshold of 0.2 will be used for any sound not specified here
 }
 
 # Define function to get class names before it's used
@@ -202,7 +206,7 @@ def get_class_names():
 class_names = get_class_names()
 model_index_to_sound_class = {
     idx: name for idx, name in enumerate(class_names) 
-    if name in percussive_sounds
+    if name in percussive_sounds_names
 }
 
 # Add temporal smoothing for sound detection
@@ -285,7 +289,7 @@ class SoundDetectionHistory:
         Returns:
             Adjusted confidence level
         """
-        if sound_class not in percussive_sounds:
+        if sound_class not in percussive_sounds_names:
             return current_confidence
             
         current_time = time.time()
@@ -298,14 +302,14 @@ class SoundDetectionHistory:
         # 1. The sound hasn't been detected recently (avoid duplicate detections)
         # 2. The dB level is sufficiently high (indicating a sharp sound)
         # 3. There's at least some base confidence
-        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES) * 0.5  # Only need 50% of threshold for boosting
+        min_confidence = sound_specific_thresholds.get(sound_class, PREDICTION_THRES) * 0.3  # Only need 30% of threshold for boosting (was 50%)
         
         # Adjust for knocking with special handling
         if sound_class == 'Door knock' and current_confidence > min_confidence:  # Lower activation threshold
             # Check for dB spike which is common with knocks
-            if db_level > -20 and time_since_last > min_time_between:  # More sensitive dB threshold (was -15)
+            if db_level > -25 and time_since_last > min_time_between:  # More sensitive dB threshold (was -20)
                 # Boost confidence for knock detection - higher multiplier
-                adjusted_confidence = min(current_confidence * 2.5, 0.95)  # Boost by 2.5x (was 1.5x)
+                adjusted_confidence = min(current_confidence * 3.5, 0.95)  # Boost by 3.5x (was 2.5x)
                 # Record this detection time
                 self.last_detection[sound_class] = current_time
                 logger.info(f"Enhanced Door knock detection: {current_confidence:.4f} → {adjusted_confidence:.4f}")
@@ -314,14 +318,14 @@ class SoundDetectionHistory:
         # Special handling for Dishes class, which often activates during knocking
         if sound_class == 'Dishes' and current_confidence > min_confidence * 0.8:
             # If it's a sharp sound with high dB, it might be a knock misclassified as dishes
-            if db_level > -15 and time_since_last > min_time_between:
+            if db_level > -20 and time_since_last > min_time_between:  # More sensitive dB threshold (was -15)
                 # Check if we have 'knock' data in history to ensure we're not creating false positives
                 if 'Door knock' in self.history and len(self.history['Door knock']) > 0:
                     knock_confidence = self.get_smoothed_confidence('Door knock')
                     # If there's any knock confidence at all, transfer some confidence from dishes to knock
-                    if knock_confidence > 0.05:  # Lowered from 0.1
-                        # Transfer 40% of dishes confidence to Door knock (was just noting this relationship)
-                        knock_boost = current_confidence * 0.4
+                    if knock_confidence > 0.02:  # Lowered from 0.05
+                        # Transfer 60% of dishes confidence to Door knock (was 40%)
+                        knock_boost = current_confidence * 0.6
                         logger.info(f"Transferring confidence from Dishes to Door knock: {knock_boost:.4f}")
                         
                         # Update Door knock confidence
@@ -334,7 +338,17 @@ class SoundDetectionHistory:
                         self.last_detection['Door knock'] = current_time
                         
                         # Return lower confidence for dishes
-                        return current_confidence * 0.6
+                        return current_confidence * 0.4
+        
+        # Special handling for Car horn - added based on logs
+        if sound_class == 'Car horn' and current_confidence > min_confidence:
+            if db_level > -20 and time_since_last > min_time_between:
+                # Boost confidence for car horn detection
+                adjusted_confidence = min(current_confidence * 3.0, 0.95)  # Boost by 3x
+                # Record this detection time
+                self.last_detection[sound_class] = current_time
+                logger.info(f"Enhanced Car horn detection: {current_confidence:.4f} → {adjusted_confidence:.4f}")
+                return adjusted_confidence
         
         return current_confidence
 
@@ -342,73 +356,101 @@ class SoundDetectionHistory:
 detection_history = SoundDetectionHistory(window_size=3, decay_factor=0.7)
 
 # Add a new method to detect abrupt changes in audio levels that might indicate knocking
-def detect_percussive_event(audio_data, sample_rate=16000, threshold=0.25):  # Lower threshold from 0.4 to 0.25
+def detect_percussive_event(audio_data, sample_rate, threshold=0.2, min_gap=0.1, max_gap=0.8):
     """
-    Detect percussive events like knocking in audio data
+    Detect percussive events in audio data, with improved detection for knocking patterns.
     
     Args:
-        audio_data: Audio samples as numpy array
-        sample_rate: Sample rate of the audio
-        threshold: Detection threshold (0-1)
+        audio_data (numpy.ndarray): Audio samples as a numpy array
+        sample_rate (int): Sample rate of the audio in Hz
+        threshold (float): Threshold for detecting peaks (lower = more sensitive)
+        min_gap (float): Minimum gap between peaks in seconds
+        max_gap (float): Maximum gap between peaks in seconds to consider as part of same event
         
     Returns:
-        True if percussive event detected, False otherwise
+        bool: True if a percussive event is detected, False otherwise
     """
     try:
-        # Normalize audio
-        if np.max(np.abs(audio_data)) > 0:
-            audio_norm = audio_data / np.max(np.abs(audio_data))
-        else:
-            return False
-            
-        # Calculate short-term energy
-        frame_length = int(0.01 * sample_rate)  # 10ms frames for better detection (was 15ms)
-        hop_length = int(0.005 * sample_rate)   # 5ms hop (was 7.5ms)
+        logger.info(f"Checking for percussive event in audio shape={audio_data.shape}")
         
-        # Ensure we have enough data
-        if len(audio_norm) < frame_length:
-            return False
-            
+        # Calculate frame size based on 20ms windows
+        frame_size = int(0.02 * sample_rate)  # 20ms frames
+        
         # Calculate energy in each frame
-        energy = []
-        for i in range(0, len(audio_norm) - frame_length, hop_length):
-            frame = audio_norm[i:i+frame_length]
-            energy.append(np.sum(frame**2) / frame_length)
-            
-        # No frames calculated
-        if not energy:
+        num_frames = len(audio_data) // frame_size
+        if num_frames < 3:  # Need at least 3 frames for meaningful analysis
             return False
             
-        # Convert to numpy array
-        energy = np.array(energy)
+        frame_energy = np.zeros(num_frames)
+        for i in range(num_frames):
+            start = i * frame_size
+            end = min(start + frame_size, len(audio_data))
+            frame = audio_data[start:end]
+            frame_energy[i] = np.sum(frame**2) / len(frame)
         
-        # Calculate the derivative of energy to detect sudden changes
-        energy_diff = np.diff(energy)
+        # Normalize energy
+        if np.max(frame_energy) > 0:
+            frame_energy = frame_energy / np.max(frame_energy)
         
-        # Check for characteristic "double peak" pattern common in knocks
-        if len(energy_diff) > 10:
-            # Find peaks using peak detection
-            from scipy.signal import find_peaks
-            peaks, _ = find_peaks(energy_diff, height=threshold*0.4, distance=3)  # More sensitive peak detection
+        # Find peaks in energy
+        # A peak is defined as a frame with energy higher than threshold and higher than adjacent frames
+        peaks = []
+        for i in range(1, len(frame_energy) - 1):
+            if (frame_energy[i] > threshold and 
+                frame_energy[i] > frame_energy[i-1] and 
+                frame_energy[i] > frame_energy[i+1]):
+                peaks.append(i)
+        
+        if len(peaks) == 0:
+            return False
             
-            # If we found more than one peak within a short time
-            if len(peaks) >= 2:
-                # Check if they're spaced appropriately for a knock
-                peak_spacing = np.diff(peaks)
-                # Look for peaks between 4-25 frames apart (wider range to catch more variations)
-                if any((peak_spacing >= 4) & (peak_spacing <= 25)):
-                    logger.info(f"Knock pattern detected: {len(peaks)} peaks, max diff={np.max(energy_diff):.4f}")
+        # Calculate peak times in seconds
+        peak_times = [p * frame_size / sample_rate for p in peaks]
+        
+        # Check for double knocks or triple knocks (common door knock patterns)
+        # This is looking for 2 or 3 peaks within a short time window with appropriate gaps
+        min_gap_frames = int(min_gap * sample_rate / frame_size)
+        max_gap_frames = int(max_gap * sample_rate / frame_size)
+        
+        # Check for pairs of peaks with appropriate spacing
+        for i in range(len(peaks) - 1):
+            gap = peaks[i+1] - peaks[i]
+            if min_gap_frames <= gap <= max_gap_frames:
+                logger.info(f"Detected double-knock pattern with {gap * frame_size / sample_rate:.3f}s gap")
+                return True
+                
+        # Check for triple knocks (three peaks with appropriate spacing)
+        if len(peaks) >= 3:
+            for i in range(len(peaks) - 2):
+                gap1 = peaks[i+1] - peaks[i]
+                gap2 = peaks[i+2] - peaks[i+1]
+                # Both gaps should be within reasonable range
+                if (min_gap_frames <= gap1 <= max_gap_frames and 
+                    min_gap_frames <= gap2 <= max_gap_frames):
+                    logger.info(f"Detected triple-knock pattern with gaps {gap1 * frame_size / sample_rate:.3f}s and {gap2 * frame_size / sample_rate:.3f}s")
                     return True
         
-        # If max energy difference exceeds threshold, it's likely a percussive sound
-        if np.max(energy_diff) > threshold:
-            logger.info(f"Percussive event detected: {np.max(energy_diff):.4f}")
+        # Check for one very strong peak (could be a single loud knock)
+        strong_peak_threshold = 0.8
+        if any(frame_energy > strong_peak_threshold):
+            logger.info(f"Detected single strong percussive event with peak energy {np.max(frame_energy):.3f}")
+            return True
+            
+        # Calculate rate of energy change (first derivative)
+        energy_change = np.diff(frame_energy)
+        
+        # Check for sudden increases in energy (sharp attacks)
+        sharp_attack_threshold = 0.4  # Lower threshold for more sensitivity
+        if any(energy_change > sharp_attack_threshold):
+            logger.info(f"Detected sharp attack with max energy change {np.max(energy_change):.3f}")
             return True
             
         return False
         
     except Exception as e:
-        logger.error(f"Error in percussive event detection: {e}")
+        logger.error(f"Error detecting percussive event: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 def process_predictions(preds, context, db_level, history_length=5):
@@ -505,10 +547,10 @@ def compute_features(audio_data, sample_rate=16000):
         logger.info(f"Computing features from audio data: shape={audio_data.shape}, sr={sample_rate}")
         
         # Check for percussive event
-        is_percussive = detect_percussive_event(audio_data, sample_rate)
+        is_percussive = detect_percussive_event(audio_data, sample_rate, threshold=0.2)  # Lower threshold for more sensitivity
         
         # Pre-emphasis filter to enhance higher frequencies (better for percussive sounds)
-        pre_emphasis = 0.95  # Moderate pre-emphasis coefficient (was 0.97)
+        pre_emphasis = 0.92  # Lower pre-emphasis coefficient for clearer sound (was 0.95)
         emphasized_audio = np.append(audio_data[0], audio_data[1:] - pre_emphasis * audio_data[:-1])
         
         # Normalize audio data to -1 to 1 range
@@ -516,15 +558,15 @@ def compute_features(audio_data, sample_rate=16000):
             emphasized_audio = emphasized_audio / np.max(np.abs(emphasized_audio))
         
         # Set spectrogram parameters
-        n_fft = 512  # Shorter FFT window size for better time resolution (was 1024)
-        hop_length = 256  # Shorter hop for better time resolution (was 512)
+        n_fft = 400  # Shorter FFT window size for better time resolution (was 512)
+        hop_length = 200  # Shorter hop for better time resolution (was 256)
         n_mels = 64  # Number of Mel bands
         
         # For percussive sounds, we might want a slightly shorter window
         if is_percussive:
             logger.info("Using shorter window for percussive sound")
-            n_fft = 256  # Even shorter window for better time resolution (was 512)
-            hop_length = 128  # Shorter hop for better time resolution (was 256)
+            n_fft = 200  # Even shorter window for better time resolution (was 256)
+            hop_length = 100  # Shorter hop for better time resolution (was 128)
         
         # Compute spectrogram
         # Short-time Fourier transform
@@ -575,9 +617,19 @@ def compute_features(audio_data, sample_rate=16000):
             time_deriv[:, 1:] = spec[:, 1:] - spec[:, :-1]
             
             # Blend with original, emphasizing transients
-            spec = spec + 0.5 * np.abs(time_deriv)  # Higher enhancement factor (was 0.3)
+            spec = spec + 0.7 * np.abs(time_deriv)  # Higher enhancement factor (was 0.5)
             
             # Re-normalize
+            spec = (spec - np.min(spec)) / (np.max(spec) - np.min(spec) + epsilon)
+            
+            # Add frequency derivative enhancement for better capturing transients
+            freq_deriv = np.zeros_like(spec)
+            freq_deriv[1:, :] = spec[1:, :] - spec[:-1, :]
+            
+            # Add this to the spectrogram too
+            spec = spec + 0.4 * np.abs(freq_deriv)
+            
+            # Re-normalize again
             spec = (spec - np.min(spec)) / (np.max(spec) - np.min(spec) + epsilon)
         
         # Reshape to model input format: (1, height, width, channels)
