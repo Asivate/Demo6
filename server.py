@@ -782,6 +782,12 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
         if db_level < DBLEVEL_THRES:
             logger.info(f"Audio too quiet for sound classification (dB {db_level} < threshold {DBLEVEL_THRES}), skipping processing")
             return
+            
+        # Check for percussive events before regular classification
+        is_percussive = homesounds.detect_percussive_event(audio_data, sample_rate, threshold=0.4)
+        if is_percussive:
+            logger.info(f"Percussive event detected in audio with dB level {db_level:.2f}")
+            # We'll still do regular classification but with this knowledge
         
         # Perform sound classification with thread-safe model access
         with model_lock:
@@ -839,6 +845,25 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 
                 # Debug: print full prediction array
                 logger.debug(f"Full prediction array: {prediction}")
+                
+                # If percussive event was detected, boost the confidences of percussive sounds
+                if is_percussive:
+                    # Get indices of Door knock and other percussive sounds in model output
+                    knock_idx = 6  # Based on to_human_labels mapping
+                    dishes_idx = 4  # Based on to_human_labels mapping
+                    
+                    # Boost these indices if they have even minimal activation
+                    if prediction[knock_idx] > 0.001:  # Very low threshold
+                        prediction[knock_idx] *= 2.0  # Double the confidence
+                        logger.info(f"Boosted Door knock confidence due to percussive event: {prediction[knock_idx]:.4f}")
+                    
+                    # If dishes is high but knock has any activation, it might be a knock misclassified as dishes
+                    if prediction[dishes_idx] > 0.02 and prediction[knock_idx] > 0.001:
+                        # Transfer some confidence from dishes to knock
+                        transfer = prediction[dishes_idx] * 0.3  # Transfer 30% of dishes confidence
+                        prediction[dishes_idx] -= transfer
+                        prediction[knock_idx] += transfer
+                        logger.info(f"Transferred confidence from Dishes to Door knock: {transfer:.4f}")
             except Exception as e:
                 logger.error(f"Error making prediction: {e}")
                 logger.error(traceback.format_exc())
@@ -877,6 +902,16 @@ def process_sound_classification(audio_data, sample_rate, db_level=None):
                 if adjusted_confidence > best_confidence:
                     best_confidence = adjusted_confidence
                     best_class = sound_class
+            
+            # Special case: if we detected a percussive event but no class is above threshold
+            # and "Door knock" has any confidence at all, boost it
+            if is_percussive and (best_class is None or best_confidence < PREDICTION_THRES):
+                knock_confidence = homesounds.detection_history.get_smoothed_confidence("Door knock")
+                if knock_confidence > 0.001:  # Very minimal threshold
+                    # Force a door knock detection
+                    best_class = "Door knock"
+                    best_confidence = max(knock_confidence * 3, 0.03) # Ensure it passes the threshold
+                    logger.info(f"Forcing Door knock detection due to percussive event: {knock_confidence:.4f} → {best_confidence:.4f}")
             
             if best_class is None:
                 logger.info("No sound class met the confidence threshold, skipping notification")
