@@ -32,9 +32,9 @@ context = homesounds.everything
 # use this to change context -- see homesounds.py
 active_context = homesounds.everything
 
-# thresholds
-PREDICTION_THRES = 0.5  # confidence
-DBLEVEL_THRES = -30  # dB
+# thresholds - aligned with client settings
+PREDICTION_THRES = 0.4  # confidence (matching client)
+DBLEVEL_THRES = -40.0  # dB (matching client)
 
 CHANNELS = 1
 RATE = 16000
@@ -136,16 +136,17 @@ def handle_source_features(json_data):
                     if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
                         socketio.emit('audio_label',
                                   {'label': str(homesounds.to_human_labels[active_context[m]]),
-                                   'accuracy': str(context_prediction[m])})
+                                   'accuracy': str(context_prediction[m]),
+                                   'db': str(db)})
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-                
-                # Use socketio instead of socket
-                socketio.emit('audio_label',
-                            {
-                                'label': 'Unrecognized Sound',
-                                'accuracy': '1.0'
-                            })
+                    else:
+                        socketio.emit('audio_label',
+                                    {
+                                        'label': 'Unrecognized Sound',
+                                        'accuracy': '1.0',
+                                        'db': str(db)
+                                    })
     except Exception as e:
         print(f"Error during feature prediction: {e}")
         socketio.emit('audio_label',
@@ -179,16 +180,18 @@ def handle_source(json_data):
     
     # Make predictions
     print('Making prediction...')
+    print(f'Audio data: shape={np_wav.shape}, min={np_wav.min():.4f}, max={np_wav.max():.4f}, rms={np.sqrt(np.mean(np_wav**2)):.4f}')
     x = waveform_to_examples(np_wav, RATE)
+    print(f'Generated features: shape={x.shape}')
     
     # Check if x is empty (shape[0] == 0)
     if x.shape[0] == 0:
         print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
         # Create dummy features for testing - one frame of the right dimensions
-        x = np.zeros((1, 96, 64))
+        x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
     
     # Add the channel dimension required by the model
-    x = x.reshape(x.shape[0], 96, 64, 1)
+    x = x.reshape(x.shape[0], vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
     print(f'Successfully reshape x {x.shape}')
     
     predictions = []
@@ -208,24 +211,25 @@ def handle_source(json_data):
                     if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
                         socketio.emit('audio_label',
                                     {'label': str(homesounds.to_human_labels[active_context[m]]),
-                                     'accuracy': str(context_prediction[m])})
+                                     'accuracy': str(context_prediction[m]),
+                                     'db': str(db)})
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-                
-                # Use socketio instead of socket
-                socketio.emit('audio_label',
-                            {
-                                'label': 'Unrecognized Sound',
-                                'accuracy': '1.0'
-                            })
+                    else:
+                        socketio.emit('audio_label',
+                                    {
+                                        'label': 'Unrecognized Sound',
+                                        'accuracy': '1.0',
+                                        'db': str(db)
+                                    })
     except Exception as e:
         print(f"Error during prediction: {e}")
-        # Use socketio instead of socket
         socketio.emit('audio_label',
                     {
                         'label': 'Processing Error',
                         'accuracy': '1.0',
-                        'error': str(e)
+                        'error': str(e),
+                        'db': str(db)
                     })
 
 
