@@ -114,11 +114,20 @@ def handle_source_features(json_data):
     global graph, model, sess
     print('Data before transform to np', data)
     x = np.fromstring(data, dtype=np.float16, sep=',')
-    print('data after to numpy', x)
+    print('Data after to numpy:', x.shape, 'min:', x.min(), 'max:', x.max())
+    
+    # Handle multiple frames if present
+    if len(x) > vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
+        print(f"Warning: Received {len(x)} values, expected {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
+        x = x[:vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS]
+    elif len(x) < vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
+        print(f"Warning: Received {len(x)} values, padding to {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
+        padding = np.zeros(vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS - len(x))
+        x = np.concatenate((x, padding))
     
     # Reshape using vggish_params constants
     x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-    print('Successfully reshape audio features', x.shape)
+    print('Successfully reshaped audio features to', x.shape)
 
     predictions = []
     try:
@@ -128,7 +137,7 @@ def handle_source_features(json_data):
                 predictions.append(pred)
                 
                 # Get the dB level from the JSON data or use a default value
-                db = float(json_data.get('db', 0))
+                db = float(json_data.get('db', DBLEVEL_THRES))
 
                 for prediction in predictions:
                     context_prediction = np.take(
@@ -158,7 +167,8 @@ def handle_source_features(json_data):
                     {
                         'label': 'Processing Error',
                         'accuracy': '1.0',
-                        'error': str(e)
+                        'error': str(e),
+                        'db': str(db)
                     },
                     room=request.sid)
 
@@ -190,6 +200,11 @@ def handle_source(json_data):
     x = waveform_to_examples(np_wav, RATE)
     print(f'Generated features: shape={x.shape}')
     
+    # Handle multiple frames - take the first frame if multiple are generated
+    if x.shape[0] > 1:
+        print(f"Multiple frames detected ({x.shape[0]}), using first frame")
+        x = x[0:1]
+    
     # Check if x is empty (shape[0] == 0)
     if x.shape[0] == 0:
         print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
@@ -197,7 +212,7 @@ def handle_source(json_data):
         x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
     
     # Add the channel dimension required by the model
-    x = x.reshape(x.shape[0], vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+    x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
     print(f'Successfully reshape x {x.shape}')
     
     predictions = []
