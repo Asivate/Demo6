@@ -11,6 +11,18 @@ def waveform_to_examples(data, sample_rate):
   if len(data.shape) > 1:
     data = np.mean(data, axis=1)
 
+  # Print audio information for debugging
+  print(f"Audio data: shape={data.shape}, min={data.min():.4f}, max={data.max():.4f}, rms={np.sqrt(np.mean(data**2)):.4f}")
+  
+  # Ensure we have enough samples (at least 1 second at 16kHz)
+  min_samples = vggish_params.SAMPLE_RATE  # 16000 samples
+  if len(data) < min_samples:
+    print(f"Warning: Audio data length {len(data)} is less than 1 second ({min_samples} samples)")
+    # Pad with zeros to reach 1 second if needed
+    padding = np.zeros(min_samples - len(data))
+    data = np.concatenate((data, padding))
+    print(f"Padded audio to {len(data)} samples")
+
   # Compute log mel spectrogram features.
   log_mel = mel_features.log_mel_spectrogram(
       data,
@@ -32,6 +44,14 @@ def waveform_to_examples(data, sample_rate):
       log_mel,
       window_length=example_window_length,
       hop_length=example_hop_length)
+      
+  # Check if we got any frames
+  if log_mel_examples.shape[0] == 0:
+    print("Warning: No frames were generated. Creating dummy frame.")
+    # Create a dummy frame with the right dimensions
+    log_mel_examples = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
+  
+  print(f"Generated features: shape={log_mel_examples.shape}")
   return log_mel_examples
 
 

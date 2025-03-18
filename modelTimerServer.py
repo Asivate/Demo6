@@ -169,32 +169,59 @@ def handle_source(json_data):
     # Compute RMS and convert to dB
     rms = np.sqrt(np.mean(np_wav**2))
     db = dbFS(rms)
+    
+    # Ensure we have enough audio data for feature extraction
+    if len(np_wav) < 16000:
+        print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
+        # Pad with zeros to reach 1 second if needed
+        padding = np.zeros(16000 - len(np_wav))
+        np_wav = np.concatenate((np_wav, padding))
+        print(f"Padded audio to {len(np_wav)} samples")
+    
     # Make predictions
     x = waveform_to_examples(np_wav, RATE)
+    
+    # Check if x is empty (shape[0] == 0)
+    if x.shape[0] == 0:
+        print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
+        # Create dummy features for testing - one frame of the right dimensions
+        x = np.zeros((1, 96, 64))
+    
+    # Add the channel dimension required by the model
+    x = x.reshape(x.shape[0], 96, 64, 1)
+    print(f'Successfully reshape x {x.shape}')
+    
     predictions = []
-
-    with graph.as_default():
-        if x.shape[0] != 0:
-            x = x.reshape(len(x), 96, 64, 1)
+    try:
+        with graph.as_default():
             pred = model.predict(x)
             predictions.append(pred)
 
-        for prediction in predictions:
-            context_prediction = np.take(
-                prediction[0], [homesounds.labels[x] for x in active_context])
-            m = np.argmax(context_prediction)
-            print('Max prediction', str(
-                homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-            if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
-                socketio.emit('audio_label',
-                              {
-                                  'label': str(homesounds.to_human_labels[active_context[m]]),
-                                  'accuracy': str(context_prediction[m]),
-                                  'db': str(db)
-                              },
-                              room=request.sid)
-                print("Prediction: %s (%0.2f)" % (
-                    homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+            for prediction in predictions:
+                context_prediction = np.take(
+                    prediction[0], [homesounds.labels[x] for x in active_context])
+                m = np.argmax(context_prediction)
+                print('Max prediction', str(
+                    homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
+                if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    socketio.emit('audio_label',
+                                {
+                                    'label': str(homesounds.to_human_labels[active_context[m]]),
+                                    'accuracy': str(context_prediction[m]),
+                                    'db': str(db)
+                                },
+                                room=request.sid)
+                    print("Prediction: %s (%0.2f)" % (
+                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+    except Exception as e:
+        print(f"Error during prediction: {e}")
+        socketio.emit('audio_label',
+                {
+                    'label': 'Processing Error',
+                    'accuracy': '1.0',
+                    'error': str(e)
+                },
+                room=request.sid)
 
 
 @app.route('/')
