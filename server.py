@@ -100,39 +100,59 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
 
 
 @socketio.on('audio_feature_data')
-def handle_source(json_data):
+def handle_source_features(json_data):
     data = str(json_data['data'])
     data = data[1:-1]
+    global graph, model
     print('Data before transform to np', data)
     x = np.fromstring(data, dtype=np.float16, sep=',')
     print('data after to numpy', x)
     x = x.reshape(1, 96, 64, 1)
     print('Successfully reshape audio features', x.shape)
 
-    for prediction in predictions:
-        context_prediction = np.take(
-            prediction[0], [homesounds.labels[x] for x in active_context])
-        m = np.argmax(context_prediction)
-        print('Max prediction', str(
-            homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-        if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+    predictions = []
+    try:
+        with graph.as_default():
+            pred = model.predict(x)
+            predictions.append(pred)
+            
+            # Get the dB level from the JSON data or use a default value
+            db = float(json_data.get('db', 0))
+
+            for prediction in predictions:
+                context_prediction = np.take(
+                    prediction[0], [homesounds.labels[x] for x in active_context])
+                m = np.argmax(context_prediction)
+                print('Max prediction', str(
+                    homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
+                if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    socketio.emit('audio_label',
+                              {'label': str(homesounds.to_human_labels[active_context[m]]),
+                               'accuracy': str(context_prediction[m])})
+                    print("Prediction: %s (%0.2f)" % (
+                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+            
+            # Use socketio instead of socket
             socketio.emit('audio_label',
-                          {'label': str(homesounds.to_human_labels[active_context[m]]),
-                           'accuracy': str(context_prediction[m])})
-            print("Prediction: %s (%0.2f)" % (
-                homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-    socket.emit('audio_label',
-                {
-                    'label': 'Unrecognized Sound',
-                    'accuracy': '1.0'
-                })
+                        {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '1.0'
+                        })
+    except Exception as e:
+        print(f"Error during feature prediction: {e}")
+        socketio.emit('audio_label',
+                    {
+                        'label': 'Processing Error',
+                        'accuracy': '1.0',
+                        'error': str(e)
+                    })
 
 
 @socketio.on('audio_data')
 def handle_source(json_data):
     data = str(json_data['data'])
     data = data[1:-1]
-    global graph
+    global graph, model
     np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
         32768.0  # Convert to [-1.0, +1.0]
     # Compute RMS and convert to dB
@@ -165,29 +185,34 @@ def handle_source(json_data):
     
     predictions = []
     try:
-        pred = model.predict(x)
-        predictions.append(pred)
+        # Use the global graph context to run predictions
+        with graph.as_default():
+            pred = model.predict(x)
+            predictions.append(pred)
         
-        for prediction in predictions:
-            context_prediction = np.take(
-                prediction[0], [homesounds.labels[x] for x in active_context])
-            m = np.argmax(context_prediction)
-            print('Max prediction', str(
-                homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-            if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
-                socketio.emit('audio_label',
-                            {'label': str(homesounds.to_human_labels[active_context[m]]),
-                             'accuracy': str(context_prediction[m])})
-                print("Prediction: %s (%0.2f)" % (
-                    homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-        socket.emit('audio_label',
-                    {
-                        'label': 'Unrecognized Sound',
-                        'accuracy': '1.0'
-                    })
+            for prediction in predictions:
+                context_prediction = np.take(
+                    prediction[0], [homesounds.labels[x] for x in active_context])
+                m = np.argmax(context_prediction)
+                print('Max prediction', str(
+                    homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
+                if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    socketio.emit('audio_label',
+                                {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                 'accuracy': str(context_prediction[m])})
+                    print("Prediction: %s (%0.2f)" % (
+                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+            
+            # Use socketio instead of socket
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '1.0'
+                        })
     except Exception as e:
         print(f"Error during prediction: {e}")
-        socket.emit('audio_label',
+        # Use socketio instead of socket
+        socketio.emit('audio_label',
                     {
                         'label': 'Processing Error',
                         'accuracy': '1.0',

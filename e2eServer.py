@@ -161,7 +161,7 @@ def handle_source(json_data):
 def handle_source(json_data):
     data = str(json_data['data'])
     data = data[1:-1]
-    global graph
+    global graph, model
     np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
         32768.0  # Convert to [-1.0, +1.0]
     # Compute RMS and convert to dB
