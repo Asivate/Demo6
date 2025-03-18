@@ -7,6 +7,7 @@ from keras.models import load_model
 import tensorflow as tf
 import numpy as np
 from vggish_input import waveform_to_examples
+import vggish_params
 import homesounds
 from pathlib import Path
 import time
@@ -18,12 +19,12 @@ import os
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
 # the best option based on installed packages.
-async_mode = None
+async_mode = "eventlet"  # Use eventlet for better socket handling
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 # Initialize SocketIO with CORS support and ensure it works with Engine.IO v4
-socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*")
+socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*", ping_timeout=60)
 thread = None
 thread_lock = Lock()
 
@@ -114,7 +115,9 @@ def handle_source_features(json_data):
     print('Data before transform to np', data)
     x = np.fromstring(data, dtype=np.float16, sep=',')
     print('data after to numpy', x)
-    x = x.reshape(1, 96, 64, 1)
+    
+    # Reshape using vggish_params constants
+    x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
     print('Successfully reshape audio features', x.shape)
 
     predictions = []
@@ -137,7 +140,8 @@ def handle_source_features(json_data):
                         socketio.emit('audio_label',
                                   {'label': str(homesounds.to_human_labels[active_context[m]]),
                                    'accuracy': str(context_prediction[m]),
-                                   'db': str(db)})
+                                   'db': str(db)},
+                                   room=request.sid)
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
                     else:
@@ -146,7 +150,8 @@ def handle_source_features(json_data):
                                         'label': 'Unrecognized Sound',
                                         'accuracy': '1.0',
                                         'db': str(db)
-                                    })
+                                    },
+                                    room=request.sid)
     except Exception as e:
         print(f"Error during feature prediction: {e}")
         socketio.emit('audio_label',
@@ -154,7 +159,8 @@ def handle_source_features(json_data):
                         'label': 'Processing Error',
                         'accuracy': '1.0',
                         'error': str(e)
-                    })
+                    },
+                    room=request.sid)
 
 
 @socketio.on('audio_data')
@@ -212,7 +218,8 @@ def handle_source(json_data):
                         socketio.emit('audio_label',
                                     {'label': str(homesounds.to_human_labels[active_context[m]]),
                                      'accuracy': str(context_prediction[m]),
-                                     'db': str(db)})
+                                     'db': str(db)},
+                                    room=request.sid)
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
                     else:
@@ -221,7 +228,8 @@ def handle_source(json_data):
                                         'label': 'Unrecognized Sound',
                                         'accuracy': '1.0',
                                         'db': str(db)
-                                    })
+                                    },
+                                    room=request.sid)
     except Exception as e:
         print(f"Error during prediction: {e}")
         socketio.emit('audio_label',
@@ -230,7 +238,8 @@ def handle_source(json_data):
                         'accuracy': '1.0',
                         'error': str(e),
                         'db': str(db)
-                    })
+                    },
+                    room=request.sid)
 
 
 def background_thread():
