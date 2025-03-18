@@ -36,6 +36,7 @@ active_context = homesounds.everything
 # thresholds - aligned with client settings
 PREDICTION_THRES = 0.4  # confidence (matching client)
 DBLEVEL_THRES = -40.0  # dB (matching client)
+SILENCE_RMS_THRESHOLD = 0.0001  # Threshold to detect silent frames
 
 CHANNELS = 1
 RATE = 16000
@@ -185,6 +186,30 @@ def handle_source(json_data):
     rms = np.sqrt(np.mean(np_wav**2))
     db = dbFS(rms)
     print('Db...', db)
+    
+    # Skip processing if the audio is silent (very low RMS)
+    if rms < SILENCE_RMS_THRESHOLD:
+        print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
+        socketio.emit('audio_label',
+                    {
+                        'label': 'Silent',
+                        'accuracy': '1.0',
+                        'db': str(db)
+                    },
+                    room=request.sid)
+        return
+    
+    # Additional check for near-zero audio frames that might not be caught by RMS threshold
+    if np_wav.max() == 0.0 and np_wav.min() == 0.0:
+        print(f"Detected empty audio frame with all zeros. Skipping processing.")
+        socketio.emit('audio_label',
+                    {
+                        'label': 'Silent',
+                        'accuracy': '1.0',
+                        'db': str(db)
+                    },
+                    room=request.sid)
+        return
     
     # Ensure we have enough audio data for feature extraction
     if len(np_wav) < 16000:
