@@ -21,6 +21,9 @@ import io
 import threading
 import queue
 import json
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -249,16 +252,34 @@ def handle_source(json_data):
     # Process for speech recognition (add to buffer)
     if GOOGLE_CLOUD_ENABLED:
         with speech_buffer_lock:
-            speech_buffer.append(np_wav)
+            # Normalize audio to improve speech recognition
+            # Apply basic noise reduction by cutting off very quiet sounds
+            noise_floor = 0.005  # Adjust this threshold based on your environment
+            clean_audio = np_wav.copy()
+            clean_audio[np.abs(clean_audio) < noise_floor] = 0
+            
+            # Apply basic normalization to increase volume if needed
+            if np.max(np.abs(clean_audio)) < 0.1:  # If audio is very quiet
+                gain_factor = 0.3 / max(np.max(np.abs(clean_audio)), 0.01)  # Target 30% of max amplitude
+                clean_audio = np.clip(clean_audio * gain_factor, -1.0, 1.0)  # Apply gain but prevent clipping
+                print(f"Applied gain of {gain_factor:.2f} to quiet audio")
+            
+            # Store the processed audio
+            speech_buffer.append(clean_audio)
+            buffer_length = sum(len(segment) for segment in speech_buffer)
+            
             # If we have enough data (~3 seconds), process for speech
-            if len(speech_buffer) >= 3:  # 3 chunks of audio is enough for most speech
+            if buffer_length >= RATE * 3:  # 3 seconds of audio (48000 samples)
+                print(f"Processing speech buffer with {len(speech_buffer)} segments, total {buffer_length} samples")
                 # Concatenate the buffered audio segments
                 combined_audio = np.concatenate(speech_buffer)
                 # Add to processing queue
                 speech_processing_queue.put(combined_audio.copy())
                 # Keep the last chunk for overlap (to avoid cutting words)
+                last_segment = speech_buffer[-1]
                 speech_buffer.clear()
-                speech_buffer.append(np_wav)
+                speech_buffer.append(last_segment)
+                print(f"Saved {len(last_segment)} samples for overlap")
     
     # Skip processing if the audio is silent (very low RMS)
     if rms < SILENCE_RMS_THRESHOLD:
@@ -407,6 +428,12 @@ def process_speech_for_sentiment(audio_data):
         # Convert to bytes for Google API
         audio_bytes = audio_data.astype(np.int16).tobytes()
         
+        # Calculate audio metrics for debugging
+        rms = np.sqrt(np.mean(audio_data**2))
+        db = dbFS(rms)
+        peak = np.max(np.abs(audio_data))
+        print(f"Audio metrics before API call: RMS={rms:.6f}, dB={db:.2f}, peak={peak:.6f}, length={len(audio_data)}")
+        
         # Process with Speech API
         audio = speech.RecognitionAudio(content=audio_bytes)
         config = speech.RecognitionConfig(
@@ -416,24 +443,47 @@ def process_speech_for_sentiment(audio_data):
             # Add more configuration options for better results
             enable_automatic_punctuation=True,
             model="default",  # Use "video" for better handling of media content or "phone_call" for phone conversations
-            use_enhanced=True  # Use enhanced model
+            use_enhanced=True,  # Use enhanced model
+            # Add these parameters to improve speech recognition in noisy environments
+            audio_channel_count=CHANNELS,
+            enable_separate_recognition_per_channel=False,
+            # More aggressive noise settings
+            use_enhanced=True,
+            # Try with different speech contexts if needed
+            speech_contexts=[speech.SpeechContext(
+                phrases=["sound", "watch", "notification", "alarm", "alert", "doorbell", "knock", "phone"]
+            )]
         )
         
         print("Sending audio to Google Speech-to-Text API...")
         response = speech_client.recognize(config=config, audio=audio)
+        
+        # Detailed logging of the response
+        print(f"Speech API response: {response}")
+        if hasattr(response, 'results') and response.results:
+            for i, result in enumerate(response.results):
+                print(f"Result {i+1}: {result}")
+                if result.alternatives:
+                    for j, alt in enumerate(result.alternatives):
+                        print(f"  Alternative {j+1}: '{alt.transcript}' (confidence: {alt.confidence})")
+                else:
+                    print("  No alternatives found in this result")
+        else:
+            print("No recognition results returned from API")
         
         if not response.results or not response.results[0].alternatives:
             print("No speech detected in audio segment")
             return
             
         transcript = response.results[0].alternatives[0].transcript
+        confidence = response.results[0].alternatives[0].confidence
         
         # If transcript is empty, skip sentiment analysis
         if not transcript.strip():
             print("Empty transcript, skipping sentiment analysis")
             return
             
-        print(f"Transcript: {transcript}")
+        print(f"Transcript: '{transcript}' (confidence: {confidence})")
             
         # Process with Natural Language API for sentiment
         document = language_v1.Document(
@@ -449,7 +499,7 @@ def process_speech_for_sentiment(audio_data):
         emoji = get_sentiment_emoji(sentiment.score)
         emotion = get_sentiment_emotion(sentiment.score)
         
-        print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
+        print(f"Sentiment analysis: score={sentiment.score}, magnitude={sentiment.magnitude}, emotion={emotion}, emoji={emoji}")
         
         # Calculate approximate dB level
         rms = np.sqrt(np.mean(audio_data**2))
@@ -461,9 +511,11 @@ def process_speech_for_sentiment(audio_data):
         # Create transcript entry for history
         transcript_entry = {
             "transcription": transcript,
+            "confidence": float(confidence),
             "emotion": emotion,
             "emoji": emoji,
             "sentiment_score": float(sentiment.score),
+            "sentiment_magnitude": float(sentiment.magnitude),
             "timestamp": timestamp
         }
         
@@ -475,7 +527,9 @@ def process_speech_for_sentiment(audio_data):
             'emoji': emoji,
             'emotion': emotion,
             'transcription': transcript,
+            'confidence': confidence,
             'sentiment_score': sentiment.score,
+            'sentiment_magnitude': sentiment.magnitude,
             'timestamp': timestamp
         })
         
@@ -507,6 +561,194 @@ def speech_processing_thread_func():
 speech_thread = threading.Thread(target=speech_processing_thread_func)
 speech_thread.daemon = True
 speech_thread.start()
+
+@app.route('/test_sentiment')
+def test_sentiment():
+    """
+    Test endpoint to verify sentiment analysis functionality
+    Access this at http://localhost:8080/test_sentiment
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Cannot test sentiment analysis."
+    
+    try:
+        # Test phrases with different sentiments
+        test_phrases = [
+            "I am very happy today!",
+            "This is terrible, I don't like it at all.",
+            "The weather seems fine today."
+        ]
+        
+        results = []
+        for phrase in test_phrases:
+            # Process with Natural Language API for sentiment
+            document = language_v1.Document(
+                content=phrase,
+                type_=language_v1.Document.Type.PLAIN_TEXT
+            )
+            
+            sentiment = language_client.analyze_sentiment(document=document).document_sentiment
+            
+            # Map sentiment score to emoji and emotion
+            emoji = get_sentiment_emoji(sentiment.score)
+            emotion = get_sentiment_emotion(sentiment.score)
+            
+            results.append({
+                'phrase': phrase,
+                'sentiment_score': sentiment.score,
+                'sentiment_magnitude': sentiment.magnitude,
+                'emotion': emotion,
+                'emoji': emoji
+            })
+        
+        # Format results as HTML
+        html = "<h1>Sentiment Analysis Test</h1>"
+        html += "<p>Testing Google Cloud Natural Language API sentiment analysis</p>"
+        html += "<ul>"
+        for result in results:
+            html += f"<li><strong>Phrase:</strong> '{result['phrase']}'<br>"
+            html += f"<strong>Sentiment:</strong> {result['emotion']} {result['emoji']}<br>"
+            html += f"<strong>Score:</strong> {result['sentiment_score']}, "
+            html += f"<strong>Magnitude:</strong> {result['sentiment_magnitude']}</li>"
+        html += "</ul>"
+        
+        return html
+    
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        return f"Error testing sentiment analysis: {str(e)}<br><pre>{error_trace}</pre>"
+
+@app.route('/test_speech')
+def test_speech():
+    """
+    Test endpoint that simulates speech recognition with a test audio file
+    This helps isolate and test the Google Speech API integration
+    Access this at http://localhost:8080/test_speech
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Cannot test speech recognition."
+    
+    try:
+        # Create a test tone that resembles speech (sine wave with varying frequency)
+        duration = 3  # seconds
+        fs = RATE  # sample rate
+        samples = int(fs * duration)
+        
+        # Create sample speech-like audio (frequency modulated sine wave)
+        t = np.linspace(0, duration, samples, False)
+        
+        # Option 1: Generate synthetic speech-like audio
+        # This creates a frequency modulated tone that has some speech-like characteristics
+        carrier = 220  # base frequency in Hz
+        modulator = 10  # modulation frequency
+        index = 5  # modulation index
+        audio = 0.5 * np.sin(2 * np.pi * carrier * t + index * np.sin(2 * np.pi * modulator * t))
+        
+        # Add some "syllable" like amplitude modulation
+        syllable_env = np.ones_like(t)
+        for i in range(5):  # Create 5 "syllables"
+            start = int(i * samples/5)
+            mid = int((i + 0.5) * samples/5)
+            end = int((i + 1) * samples/5)
+            syllable_env[start:mid] = np.linspace(0.2, 1.0, mid-start)
+            syllable_env[mid:end] = np.linspace(1.0, 0.2, end-mid)
+        
+        audio = audio * syllable_env
+        
+        # Add a little noise
+        noise = np.random.normal(0, 0.01, samples)
+        audio = audio + noise
+        
+        # Ensure it's within [-1, 1]
+        audio = np.clip(audio, -1, 1)
+        
+        # Convert to int16 for the API
+        audio_int16 = (audio * 32767).astype(np.int16)
+        
+        # Try the speech recognition with this test audio
+        audio_bytes = audio_int16.tobytes()
+        audio_obj = speech.RecognitionAudio(content=audio_bytes)
+        
+        # Create config with more debugging options
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            model="default",
+            # Add more options for debugging
+            enable_word_time_offsets=True,
+            enable_word_confidence=True,
+            audio_channel_count=CHANNELS,
+            profanity_filter=False,
+            # Try different models to see if any work better
+            use_enhanced=True
+        )
+        
+        # Call the API
+        print("Testing Speech API with generated audio...")
+        response = speech_client.recognize(config=config, audio=audio_obj)
+        
+        # Generate a plot of the audio waveform for visualization
+        plt.figure(figsize=(10, 4))
+        plt.plot(t, audio)
+        plt.title("Test Audio Waveform")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Amplitude")
+        plt.grid(True)
+        
+        # Save plot to a base64 string to embed in HTML
+        buffer = BytesIO()
+        plt.savefig(buffer, format='png')
+        buffer.seek(0)
+        plot_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
+        plt.close()
+        
+        # Create result HTML
+        html = "<h1>Speech Recognition Test</h1>"
+        html += "<p>Testing Google Cloud Speech-to-Text API with generated test audio</p>"
+        
+        # Add the audio waveform
+        html += "<h2>Test Audio Waveform:</h2>"
+        html += f'<img src="data:image/png;base64,{plot_data}" alt="Test Audio Waveform" />'
+        
+        # Add the API response
+        html += "<h2>API Response:</h2>"
+        html += f"<pre>{str(response)}</pre>"
+        
+        # Format any results
+        if hasattr(response, 'results') and response.results:
+            html += "<h2>Transcription Results:</h2><ul>"
+            for i, result in enumerate(response.results):
+                html += f"<li>Result {i+1}:"
+                if result.alternatives:
+                    for j, alt in enumerate(result.alternatives):
+                        html += f"<br>Alternative {j+1}: '{alt.transcript}' (confidence: {alt.confidence})"
+                else:
+                    html += "<br>No alternatives found in this result"
+                html += "</li>"
+            html += "</ul>"
+        else:
+            html += "<p>No transcription results returned by API</p>"
+        
+        # Add instructions for next steps
+        html += "<h2>Next Steps:</h2>"
+        html += "<p>If you see no results above, that indicates an issue with the Speech-to-Text API recognition.</p>"
+        html += "<p>Possible reasons:</p>"
+        html += "<ul>"
+        html += "<li>The generated test audio doesn't contain actual speech (expected for synthetic audio)</li>"
+        html += "<li>API credentials don't have access to the Speech-to-Text API</li>"
+        html += "<li>There might be configuration issues with the API</li>"
+        html += "</ul>"
+        html += "<p>You can also try the <a href='/test_sentiment'>sentiment analysis test</a> to verify that part of the pipeline.</p>"
+        
+        return html
+        
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        return f"Error testing speech recognition: {str(e)}<br><pre>{error_trace}</pre>"
 
 @app.route('/')
 def index():
