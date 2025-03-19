@@ -1,272 +1,196 @@
 import os
 import time
-import numpy as np
-from google.cloud import speech
-from google.cloud import language_v1 as language
-import logging
 import threading
 import queue
+import numpy as np
+from google.cloud import speech
+from google.cloud import language_v1
+import logging
 
-# Setup logging
+# Set up logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def categorize_sentiment(score, magnitude):
-    """
-    Categorize sentiment based on score and magnitude
-    
-    Args:
-        score (float): Sentiment score (-1.0 to 1.0)
-        magnitude (float): Sentiment magnitude (0.0+)
-    
-    Returns:
-        str: Human-readable sentiment category
-    """
-    if score >= 0.7:
-        return "very positive"
-    elif score >= 0.3:
-        return "positive"
-    elif score >= 0.1:
-        return "slightly positive"
-    elif score <= -0.7:
-        return "very negative"
-    elif score <= -0.3:
-        return "negative" 
-    elif score <= -0.1:
-        return "slightly negative"
-    elif magnitude >= 0.6:  # Mixed sentiment with significant magnitude
-        return "mixed"
-    else:
-        return "neutral"
+logger = logging.getLogger('speech_processor')
 
 class SpeechProcessor:
     """
-    Handles real-time speech recognition using Google Cloud Speech-to-Text API
-    with sentiment analysis using Google Cloud Natural Language API.
+    Handles continuous speech recognition and sentiment analysis.
+    This class manages a buffer of audio data and processes it for both
+    speech recognition and sentiment analysis.
     """
     
     def __init__(self):
-        """Initialize the speech processor with Google Cloud clients."""
-        # Ensure the environment variable is set
-        credentials_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-        if not credentials_path:
-            logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set. Speech recognition may fail.")
+        # Check if Google credentials are set
+        if 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ:
+            logger.warning("GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
         
-        # Initialize the Google Cloud Speech client
-        self._speech_client = speech.SpeechClient()
+        # Initialize Google Cloud clients
+        self.speech_client = speech.SpeechClient()
+        self.language_client = language_v1.LanguageServiceClient()
         
-        # Initialize the Google Cloud Language client for sentiment analysis
-        self._language_client = language.LanguageServiceClient()
-        
-        # Configuration for streaming recognition
-        self._config = speech.RecognitionConfig(
+        # Set up speech recognition config
+        self.speech_config = speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=16000,
             language_code="en-US",
             enable_automatic_punctuation=True,
-            model="default",
-            use_enhanced=True,
         )
         
-        self._streaming_config = speech.StreamingRecognitionConfig(
-            config=self._config,
-            interim_results=True,
+        self.streaming_config = speech.StreamingRecognitionConfig(
+            config=self.speech_config,
+            interim_results=True
         )
         
-        # Buffer for audio data
-        self._audio_queue = queue.Queue()
+        # Audio buffer and processing state
+        self.audio_buffer = queue.Queue()
+        self.is_processing = False
+        self.processing_thread = None
         
-        # Latest transcription results
-        self._latest_results = []
-        self._latest_transcript = ""
-        self._latest_sentiment = None
-        self._buffer = bytearray()
-        self._language_code = "en-US"
+        # Keep track of the latest transcription and sentiment
+        self.latest_transcript = ""
+        self.latest_sentiment = None
         
-        # Flag to control streaming thread
-        self._is_streaming = False
-        self._streaming_thread = None
-
-    def start_streaming(self):
-        """Start the streaming recognition thread."""
-        if self._is_streaming:
+    def start_processing(self):
+        """Start the processing thread for continuous speech recognition."""
+        if self.is_processing:
             return
             
-        self._is_streaming = True
-        self._streaming_thread = threading.Thread(target=self._stream_recognition_thread)
-        self._streaming_thread.daemon = True
-        self._streaming_thread.start()
-        logger.info("Speech recognition streaming started")
-    
-    def stop_streaming(self):
-        """Stop the streaming recognition thread."""
-        self._is_streaming = False
-        if self._streaming_thread and self._streaming_thread.is_alive():
-            self._streaming_thread.join(timeout=2.0)
-            logger.info("Speech recognition streaming stopped")
-        self._latest_results = []
-        self._latest_transcript = ""
-        self._latest_sentiment = None
-    
-    def add_audio_data(self, audio_data, sample_rate=16000):
+        self.is_processing = True
+        self.processing_thread = threading.Thread(target=self._process_audio_stream)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+        logger.info("Speech processing started")
+        
+    def stop_processing(self):
+        """Stop the processing thread."""
+        self.is_processing = False
+        if self.processing_thread:
+            self.processing_thread.join(timeout=2.0)
+            self.processing_thread = None
+        logger.info("Speech processing stopped")
+        
+    def add_audio_data(self, audio_data):
         """
-        Add audio data to the processing queue.
+        Add audio data to the buffer for processing.
         
         Args:
-            audio_data (bytes): Raw audio data
-            sample_rate (int): Sample rate of the audio data
+            audio_data (bytes): Raw audio data to process
         """
-        if self._is_streaming:
-            # Buffer the audio data for recognition
-            if isinstance(audio_data, bytes):
-                self._audio_queue.put(audio_data)
-            else:
-                logger.warning(f"Invalid audio data type: {type(audio_data)}")
-    
-    def _stream_recognition_thread(self):
-        """Thread function for streaming recognition."""
+        self.audio_buffer.put(audio_data)
         
-        while self._is_streaming:
+    def _process_audio_stream(self):
+        """
+        Continuously process audio data from the buffer for speech recognition.
+        This runs in a separate thread.
+        """
+        def audio_generator():
+            while self.is_processing:
+                # Use a timeout to allow checking is_processing condition
+                try:
+                    chunk = self.audio_buffer.get(block=True, timeout=0.1)
+                    yield speech.StreamingRecognizeRequest(audio_content=chunk)
+                except queue.Empty:
+                    continue
+        
+        while self.is_processing:
             try:
-                # Create a generator for audio content only
-                def audio_generator():
-                    while self._is_streaming:
-                        try:
-                            chunk = self._audio_queue.get(block=True, timeout=0.5)
-                            if chunk:
-                                yield chunk
-                        except queue.Empty:
-                            continue
-                        except Exception as e:
-                            logger.error(f"Error in audio generator: {e}")
-                            break
-                
-                # Create streaming recognize requests - ONLY containing audio content
-                # Do NOT include config here - that's passed separately
-                requests = (
-                    speech.StreamingRecognizeRequest(audio_content=content)
-                    for content in audio_generator()
+                responses = self.speech_client.streaming_recognize(
+                    config=self.streaming_config,
+                    requests=audio_generator()
                 )
                 
-                # This is the correct pattern for google-cloud-speech 2.8.0
-                # Pass streaming_config as a separate parameter
-                responses = self._speech_client.streaming_recognize(
-                    config=self._streaming_config,
-                    requests=requests
-                )
-                
-                # Process responses
-                for response in responses:
-                    if not self._is_streaming:
-                        break
-                    
-                    if not response.results:
-                        continue
-                    
-                    for result in response.results:
-                        if not result.alternatives:
-                            continue
-                        
-                        transcript = result.alternatives[0].transcript
-                        
-                        # Process final results (including sentiment analysis)
-                        if result.is_final:
-                            self._latest_transcript = transcript
-                            logger.info(f"Final transcript: {transcript}")
-                            
-                            # Perform sentiment analysis
-                            sentiment_result = self._analyze_sentiment(transcript)
-                            if sentiment_result:
-                                self._latest_results.append({
-                                    'transcript': transcript,
-                                    'language': self._language_code[:2],  # Extract language code (e.g., 'en' from 'en-US')
-                                    'sentiment_score': sentiment_result['score'],
-                                    'sentiment_magnitude': sentiment_result['magnitude'],
-                                    'sentiment_category': sentiment_result['category'],
-                                    'timestamp': time.time()
-                                })
-                                # Keep only the latest 10 results
-                                if len(self._latest_results) > 10:
-                                    self._latest_results = self._latest_results[-10:]
-                        else:
-                            # Interim results
-                            logger.debug(f"Interim transcript: {transcript}")
-            
+                # Process streaming responses
+                self._handle_responses(responses)
             except Exception as e:
-                logger.error(f"Error in speech recognition stream: {e}")
-                # Sleep briefly before attempting to restart
-                time.sleep(2)
+                logger.error(f"Error in speech recognition: {e}")
+                # Brief pause before retrying
+                time.sleep(1)
+    
+    def _handle_responses(self, responses):
+        """
+        Process streaming recognition responses.
+        
+        Args:
+            responses: The stream of responses from the speech recognition service.
+        """
+        for response in responses:
+            if not response.results:
+                continue
                 
-                # Clear the audio queue
-                while not self._audio_queue.empty():
-                    try:
-                        self._audio_queue.get_nowait()
-                    except queue.Empty:
-                        break
+            # Get the most recent result
+            result = response.results[0]
+            
+            if not result.alternatives:
+                continue
+                
+            transcript = result.alternatives[0].transcript
+            
+            # If this is a final result, analyze sentiment
+            if result.is_final:
+                self.latest_transcript = transcript
+                sentiment_data = self._analyze_sentiment(transcript)
+                self.latest_sentiment = sentiment_data
+                
+                # Log the results
+                logger.info(f"Transcript: {transcript}")
+                logger.info(f"Sentiment: {sentiment_data}")
+                
+                # Return a dictionary with both transcript and sentiment
+                result_data = {
+                    'transcript': transcript,
+                    'sentiment': sentiment_data
+                }
+                
+                # This is where we'd emit the result to connected clients
+                # In the server.py file, we'll handle the emitting
+                return result_data
     
     def _analyze_sentiment(self, text):
         """
-        Analyze sentiment in the provided text.
+        Analyze the sentiment of the given text.
         
         Args:
-            text (str): Text to analyze
+            text (str): The text to analyze
             
         Returns:
-            dict: Sentiment analysis results with score, magnitude, and category
+            dict: A dictionary containing sentiment analysis results
         """
-        if not text or len(text.strip()) == 0:
-            return None
-        
         try:
-            # Create a document object
-            document = language.Document(
+            document = language_v1.Document(
                 content=text,
-                type_=language.Document.Type.PLAIN_TEXT,
-                language_code=self._language_code[:2]  # 'en' from 'en-US'
+                type_=language_v1.Document.Type.PLAIN_TEXT
             )
             
-            # Analyze sentiment
-            response = self._language_client.analyze_sentiment(
-                document=document
-            )
+            sentiment = self.language_client.analyze_sentiment(document=document).document_sentiment
             
-            sentiment = response.document_sentiment
-            score = sentiment.score
-            magnitude = sentiment.magnitude
+            # Determine sentiment category based on score
+            category = "neutral"
+            if sentiment.score >= 0.25:
+                category = "positive"
+            elif sentiment.score <= -0.25:
+                category = "negative"
             
-            # Categorize sentiment
-            category = categorize_sentiment(score, magnitude)
-            
-            logger.info(f"Sentiment analysis - Score: {score}, Magnitude: {magnitude}, Category: {category}")
-            
+            # Return structured sentiment data
             return {
-                'score': score,
-                'magnitude': magnitude,
+                'score': sentiment.score,
+                'magnitude': sentiment.magnitude,
                 'category': category
             }
-            
         except Exception as e:
-            logger.error(f"Error in sentiment analysis: {e}")
+            logger.error(f"Error analyzing sentiment: {e}")
             return {
-                'score': 0.0,
-                'magnitude': 0.0,
-                'category': 'neutral'
+                'score': 0,
+                'magnitude': 0,
+                'category': 'error'
             }
     
     def get_latest_results(self):
         """
-        Get the latest recognition results.
+        Get the latest transcript and sentiment analysis results.
         
         Returns:
-            list: List of dictionaries containing transcript and sentiment information
+            dict: Dictionary containing the latest transcript and sentiment analysis
         """
-        return self._latest_results
-    
-    def clear_buffer(self):
-        """Clear the audio buffer."""
-        self._buffer = bytearray()
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except queue.Empty:
-                break 
+        return {
+            'transcript': self.latest_transcript,
+            'sentiment': self.latest_sentiment
+        } 
