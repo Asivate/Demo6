@@ -448,7 +448,6 @@ def process_speech_for_sentiment(audio_data):
             audio_channel_count=CHANNELS,
             enable_separate_recognition_per_channel=False,
             # More aggressive noise settings
-            use_enhanced=True,
             # Try with different speech contexts if needed
             speech_contexts=[speech.SpeechContext(
                 phrases=["sound", "watch", "notification", "alarm", "alert", "doorbell", "knock", "phone"]
