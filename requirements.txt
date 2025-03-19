@@ -19,3 +19,5 @@ keras==2.3.1
 wget
 google-cloud-speech==2.0.1
 google-cloud-language==2.0.0
+pyaudio==0.2.11
+matplotlib==3.3.4
