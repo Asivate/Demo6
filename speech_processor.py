@@ -2,7 +2,7 @@ import os
 import time
 import numpy as np
 from google.cloud import speech
-from google.cloud import language_v2 as language
+from google.cloud import language_v1 as language
 import logging
 import threading
 import queue
@@ -221,7 +221,7 @@ class SpeechProcessor:
             
             # Analyze sentiment
             response = self._language_client.analyze_sentiment(
-                request={"document": document}
+                document=document
             )
             
             sentiment = response.document_sentiment

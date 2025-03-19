@@ -15,14 +15,15 @@ import argparse
 import wget
 from helpers import dbFS
 import os
-# Import the speech_processor module for speech recognition and sentiment analysis
-from speech_processor import SpeechProcessor, categorize_sentiment
-from flask_cors import CORS
-from werkzeug.utils import secure_filename
+import json
 import base64
 import io
 import logging
 import threading
+# Import the speech_processor module for speech recognition and sentiment analysis
+from speech_processor import SpeechProcessor, categorize_sentiment
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -35,6 +36,10 @@ app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*", ping_timeout=60)
 thread = None
 thread_lock = Lock()
+
+# Initialize the speech processor for speech recognition and sentiment analysis
+speech_processor = SpeechProcessor()
+speech_processor_lock = threading.Lock()
 
 # contexts
 context = homesounds.everything
@@ -51,10 +56,6 @@ RATE = 16000
 CHUNK = RATE
 MICROPHONES_DESCRIPTION = []
 FPS = 60.0
-
-# Initialize the speech processor for speech recognition and sentiment analysis
-speech_processor = SpeechProcessor()
-speech_processor_lock = threading.Lock()
 
 ###########################
 # Download model, if it doesn't exist
