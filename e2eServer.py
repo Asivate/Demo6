@@ -140,30 +140,28 @@ def handle_source(json_data):
                 m = np.argmax(context_prediction)
                 print('Max prediction', str(
                     homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                if (context_prediction[m] > PREDICTION_THRES):
-                    print("Prediction: %s (%0.2f)" % (
-                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-                    socketio.emit(
-                        'audio_label',
-                        {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'accuracy': str(context_prediction[m]),
-                            'db': str(db),
-                            'time': str(time),
-                            'record_time': str(record_time)
-                        },
-                        room=request.sid)
+                
+                # Modified condition - look at db and confidence together for debugging
+                print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
+                print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
+                
+                # Original condition was too strict - many sounds were being classified as "Unrecognized"
+                if context_prediction[m] > PREDICTION_THRES:
+                    socketio.emit('audio_label',
+                                {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                 'accuracy': str(context_prediction[m]),
+                                 'db': str(db),
+                                 'record_time': record_time if record_time else ""},
+                                room=request.sid)
                 else:
-                    socketio.emit(
-                        'audio_label',
-                        {
-                            'label': 'Unidentified Sound',
-                            'accuracy': '1.0',
-                            'db': str(db),
-                            'time': str(time),
-                            'record_time': str(record_time)
-                        },
-                        room=request.sid)
+                    socketio.emit('audio_label',
+                                {
+                                    'label': 'Unrecognized Sound',
+                                    'accuracy': '1.0',
+                                    'db': str(db),
+                                    'record_time': record_time if record_time else ""
+                                },
+                                room=request.sid)
     except Exception as e:
         print(f"Error during feature prediction: {e}")
         socketio.emit(
@@ -224,16 +222,28 @@ def handle_source(json_data):
                     m = np.argmax(context_prediction)
                     print('Max prediction', str(
                         homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    
+                    # Modified condition - look at db and confidence together for debugging
+                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
+                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
+                    
+                    # Original condition was too strict - many sounds were being classified as "Unrecognized"
+                    if context_prediction[m] > PREDICTION_THRES:
+                        socketio.emit('audio_label',
+                                    {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                     'accuracy': str(context_prediction[m]),
+                                     'db': str(db),
+                                     'record_time': record_time if record_time else ""},
+                                    room=request.sid)
+                    else:
                         socketio.emit('audio_label',
                                     {
-                                        'label': str(homesounds.to_human_labels[active_context[m]]),
-                                        'accuracy': str(context_prediction[m]),
-                                        'db': str(db)
+                                        'label': 'Unrecognized Sound',
+                                        'accuracy': '1.0',
+                                        'db': str(db),
+                                        'record_time': record_time if record_time else ""
                                     },
                                     room=request.sid)
-                        print("Prediction: %s (%0.2f)" % (
-                            homesounds.to_human_labels[active_context[m]], context_prediction[m]))
     except Exception as e:
         print(f"Error during prediction: {e}")
         socketio.emit('audio_label',

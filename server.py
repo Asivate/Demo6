@@ -110,47 +110,58 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
 
 @socketio.on('audio_feature_data')
 def handle_source_features(json_data):
+    '''Acoustic features: processes a list of features for predictions'''
+    global graph, model, sess
+    
+    # Parse the input
     data = str(json_data['data'])
     data = data[1:-1]
-    global graph, model, sess
     print('Data before transform to np', data)
-    x = np.fromstring(data, dtype=np.float16, sep=',')
-    print('Data after to numpy:', x.shape, 'min:', x.min(), 'max:', x.max())
-    
-    # Handle multiple frames if present
-    if len(x) > vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
-        print(f"Warning: Received {len(x)} values, expected {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
-        x = x[:vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS]
-    elif len(x) < vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
-        print(f"Warning: Received {len(x)} values, padding to {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
-        padding = np.zeros(vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS - len(x))
-        x = np.concatenate((x, padding))
-    
-    # Reshape using vggish_params constants
-    x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-    print('Successfully reshaped audio features to', x.shape)
-
-    predictions = []
     try:
+        x = np.fromstring(data, dtype=np.float16, sep=',')
+        print('Data after to numpy:', x.shape, 'min:', x.min(), 'max:', x.max())
+    
+        # Handle multiple frames if present
+        if len(x) > vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
+            print(f"Warning: Received {len(x)} values, expected {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
+            x = x[:vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS]
+        elif len(x) < vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
+            print(f"Warning: Received {len(x)} values, padding to {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
+            padding = np.zeros(vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS - len(x))
+            x = np.concatenate((x, padding))
+        
+        # Reshape using vggish_params constants
+        x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+        print('Successfully reshaped audio features to', x.shape)
+    
+        predictions = []
+        
+        # Get the dB level from the JSON data or use a default value
+        db = float(json_data.get('db', DBLEVEL_THRES))
+        
+        # Use the global session and graph context to run predictions
         with sess.as_default():
             with graph.as_default():
                 pred = model.predict(x)
                 predictions.append(pred)
                 
-                # Get the dB level from the JSON data or use a default value
-                db = float(json_data.get('db', DBLEVEL_THRES))
-
                 for prediction in predictions:
                     context_prediction = np.take(
                         prediction[0], [homesounds.labels[x] for x in active_context])
                     m = np.argmax(context_prediction)
                     print('Max prediction', str(
                         homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    
+                    # Modified condition - look at db and confidence together for debugging
+                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
+                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
+                    
+                    # Original condition was too strict - many sounds were being classified as "Unrecognized"
+                    if context_prediction[m] > PREDICTION_THRES:
                         socketio.emit('audio_label',
-                                  {'label': str(homesounds.to_human_labels[active_context[m]]),
-                                   'accuracy': str(context_prediction[m]),
-                                   'db': str(db)},
+                                   {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                    'accuracy': str(context_prediction[m]),
+                                    'db': str(db)},
                                    room=request.sid)
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
@@ -169,7 +180,7 @@ def handle_source_features(json_data):
                         'label': 'Processing Error',
                         'accuracy': '1.0',
                         'error': str(e),
-                        'db': str(db)
+                        'db': str('-60.0')  # Default value if db extraction fails
                     },
                     room=request.sid)
 
@@ -254,7 +265,13 @@ def handle_source(json_data):
                     m = np.argmax(context_prediction)
                     print('Max prediction', str(
                         homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
+                    
+                    # Modified condition - look at db and confidence together for debugging
+                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
+                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
+                    
+                    # Original condition was too strict - many sounds were being classified as "Unrecognized"
+                    if context_prediction[m] > PREDICTION_THRES:
                         socketio.emit('audio_label',
                                     {'label': str(homesounds.to_human_labels[active_context[m]]),
                                      'accuracy': str(context_prediction[m]),
