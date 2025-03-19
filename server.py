@@ -24,6 +24,8 @@ import json
 import matplotlib.pyplot as plt
 from io import BytesIO
 import base64
+import re
+import sys
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -94,6 +96,203 @@ except Exception as e:
 speech_buffer = []
 speech_buffer_lock = threading.Lock()
 speech_processing_queue = queue.Queue()
+
+# For streaming speech recognition
+STREAMING_LIMIT = 290000  # ~5 minutes
+streaming_speech_thread = None
+streaming_active = True
+streaming_recognizer = None
+
+class StreamingRecognizer:
+    """Manages streaming speech recognition for continuous audio processing"""
+    
+    def __init__(self):
+        self.client = speech.SpeechClient()
+        self.streaming_config = speech.StreamingRecognitionConfig(
+            config=speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=RATE,
+                language_code="en-US",
+                max_alternatives=1,
+                enable_automatic_punctuation=True,
+                use_enhanced=True,
+                model="default",
+                audio_channel_count=CHANNELS,
+            ),
+            interim_results=True,
+        )
+        self.audio_generator = None
+        self.audio_queue = queue.Queue()
+        self.is_active = True
+        self.last_transcript = ""
+        self.last_response_time = time.time()
+        
+    def add_audio(self, audio_data):
+        """Add audio data to the processing queue"""
+        if self.is_active:
+            self.audio_queue.put(audio_data)
+            
+    def stop(self):
+        """Stop the streaming recognition"""
+        self.is_active = False
+        
+    def audio_generator_function(self):
+        """Generates audio chunks from the audio queue"""
+        while self.is_active:
+            # Get audio data, waiting up to 100ms
+            try:
+                chunk = self.audio_queue.get(timeout=0.1)
+                if chunk is not None:
+                    # Convert to bytes
+                    audio_chunk = chunk.astype(np.int16).tobytes()
+                    yield speech.StreamingRecognizeRequest(audio_content=audio_chunk)
+            except queue.Empty:
+                # If no data, just continue
+                continue
+            except Exception as e:
+                print(f"Error in audio generator: {e}")
+                continue
+                
+    def process_streaming_responses(self, responses):
+        """Process streaming responses from the API"""
+        try:
+            for response in responses:
+                if not self.is_active:
+                    break
+                    
+                if not response.results:
+                    continue
+                    
+                # Multiple results might be present in the response
+                for result in response.results:
+                    if not result.alternatives:
+                        continue
+                        
+                    # Get the transcript
+                    transcript = result.alternatives[0].transcript
+                    confidence = result.alternatives[0].confidence
+                    
+                    # Only process final results (not interim)
+                    if result.is_final:
+                        self.last_response_time = time.time()
+                        self.last_transcript = transcript
+                        print(f"Final transcript: '{transcript}' (confidence: {confidence})")
+                        
+                        # Skip empty transcripts
+                        if not transcript.strip():
+                            continue
+                            
+                        # Process transcript for sentiment analysis
+                        try:
+                            # Create document for sentiment analysis
+                            document = language_v1.Document(
+                                content=transcript,
+                                type_=language_v1.Document.Type.PLAIN_TEXT
+                            )
+                            
+                            # Analyze sentiment
+                            sentiment_response = language_client.analyze_sentiment(document=document)
+                            sentiment = sentiment_response.document_sentiment
+                            
+                            # Map to emoji and emotion
+                            emoji = get_sentiment_emoji(sentiment.score)
+                            emotion = get_sentiment_emotion(sentiment.score)
+                            
+                            print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
+                            
+                            # Create timestamp
+                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                            
+                            # Create transcript entry
+                            transcript_entry = {
+                                "transcription": transcript,
+                                "confidence": float(confidence),
+                                "emotion": emotion,
+                                "emoji": emoji,
+                                "sentiment_score": float(sentiment.score),
+                                "sentiment_magnitude": float(sentiment.magnitude),
+                                "timestamp": timestamp
+                            }
+                            
+                            # Send to all connected clients
+                            socketio.emit('audio_label', {
+                                'label': 'Speech',
+                                'accuracy': '1.0',
+                                'emoji': emoji,
+                                'emotion': emotion,
+                                'transcription': transcript,
+                                'confidence': confidence,
+                                'sentiment_score': sentiment.score,
+                                'sentiment_magnitude': sentiment.magnitude,
+                                'timestamp': timestamp
+                            })
+                            
+                            # Also emit transcript update event
+                            socketio.emit('transcript_update', transcript_entry)
+                            
+                        except Exception as e:
+                            print(f"Error processing sentiment for transcript: {e}")
+                            
+                    else:
+                        # Interim result
+                        print(f"Interim transcript: '{transcript}'")
+                        
+        except Exception as e:
+            print(f"Error processing streaming responses: {e}")
+                
+    def start_streaming(self):
+        """Start streaming recognition in a loop"""
+        retry_count = 0
+        max_retries = 5
+        
+        while self.is_active and retry_count < max_retries:
+            try:
+                print("Starting streaming recognition session")
+                streaming_recognize = self.client.streaming_recognize(
+                    config=self.streaming_config,
+                    requests=self.audio_generator_function()
+                )
+                
+                # Process responses
+                self.process_streaming_responses(streaming_recognize)
+                
+                # If we get here, the stream ended naturally
+                print("Streaming recognition session ended")
+                retry_count = 0
+                
+            except Exception as e:
+                retry_count += 1
+                print(f"Streaming recognition error (retry {retry_count}/{max_retries}): {e}")
+                time.sleep(1)  # Wait before retrying
+                
+        print("Streaming recognition stopped")
+
+def start_streaming_recognition():
+    """Start the streaming recognition thread"""
+    global streaming_recognizer, streaming_active
+    
+    if not GOOGLE_CLOUD_ENABLED:
+        print("Google Cloud services not enabled. Cannot start streaming recognition.")
+        return
+        
+    streaming_active = True
+    streaming_recognizer = StreamingRecognizer()
+    
+    # Start in a background thread
+    thread = threading.Thread(target=streaming_recognizer.start_streaming)
+    thread.daemon = True
+    thread.start()
+    
+    print("Streaming recognition thread started")
+    return streaming_recognizer
+
+def stop_streaming_recognition():
+    """Stop the streaming recognition"""
+    global streaming_recognizer, streaming_active
+    if streaming_recognizer:
+        streaming_active = False
+        streaming_recognizer.stop()
+        print("Streaming recognition stopped")
 
 ###########################
 # Download model, if it doesn't exist
@@ -240,7 +439,7 @@ def handle_source_features(json_data):
 def handle_source(json_data):
     data = str(json_data['data'])
     data = data[1:-1]
-    global graph, model, sess
+    global graph, model, sess, streaming_recognizer
     np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
         32768.0  # Convert to [-1.0, +1.0]
     # Compute RMS and convert to dB
@@ -249,37 +448,22 @@ def handle_source(json_data):
     db = dbFS(rms)
     print('Db...', db)
     
-    # Process for speech recognition (add to buffer)
-    if GOOGLE_CLOUD_ENABLED:
-        with speech_buffer_lock:
-            # Normalize audio to improve speech recognition
-            # Apply basic noise reduction by cutting off very quiet sounds
-            noise_floor = 0.005  # Adjust this threshold based on your environment
-            clean_audio = np_wav.copy()
-            clean_audio[np.abs(clean_audio) < noise_floor] = 0
-            
-            # Apply basic normalization to increase volume if needed
-            if np.max(np.abs(clean_audio)) < 0.1:  # If audio is very quiet
-                gain_factor = 0.3 / max(np.max(np.abs(clean_audio)), 0.01)  # Target 30% of max amplitude
-                clean_audio = np.clip(clean_audio * gain_factor, -1.0, 1.0)  # Apply gain but prevent clipping
-                print(f"Applied gain of {gain_factor:.2f} to quiet audio")
-            
-            # Store the processed audio
-            speech_buffer.append(clean_audio)
-            buffer_length = sum(len(segment) for segment in speech_buffer)
-            
-            # If we have enough data (~3 seconds), process for speech
-            if buffer_length >= RATE * 3:  # 3 seconds of audio (48000 samples)
-                print(f"Processing speech buffer with {len(speech_buffer)} segments, total {buffer_length} samples")
-                # Concatenate the buffered audio segments
-                combined_audio = np.concatenate(speech_buffer)
-                # Add to processing queue
-                speech_processing_queue.put(combined_audio.copy())
-                # Keep the last chunk for overlap (to avoid cutting words)
-                last_segment = speech_buffer[-1]
-                speech_buffer.clear()
-                speech_buffer.append(last_segment)
-                print(f"Saved {len(last_segment)} samples for overlap")
+    # Process for streaming speech recognition (send directly to streaming recognizer)
+    if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
+        # Normalize audio to improve speech recognition
+        # Apply basic noise reduction by cutting off very quiet sounds
+        noise_floor = 0.005  # Adjust this threshold based on your environment
+        clean_audio = np_wav.copy()
+        clean_audio[np.abs(clean_audio) < noise_floor] = 0
+        
+        # Apply basic normalization to increase volume if needed
+        if np.max(np.abs(clean_audio)) < 0.1:  # If audio is very quiet
+            gain_factor = 0.3 / max(np.max(np.abs(clean_audio)), 0.01)  # Target 30% of max amplitude
+            clean_audio = np.clip(clean_audio * gain_factor, -1.0, 1.0)  # Apply gain but prevent clipping
+            print(f"Applied gain of {gain_factor:.2f} to quiet audio")
+        
+        # Send directly to streaming recognizer
+        streaming_recognizer.add_audio(clean_audio)
     
     # Skip processing if the audio is silent (very low RMS)
     if rms < SILENCE_RMS_THRESHOLD:
@@ -795,6 +979,11 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='0.0.0.0', help='Server host (default: 0.0.0.0 to allow connections from anywhere)')
     parser.add_argument('--port', type=int, default=8080, help='Server port (default: 8080)')
     args = parser.parse_args()
+    
+    # Start streaming speech recognition if Google Cloud is enabled
+    if GOOGLE_CLOUD_ENABLED:
+        print("Starting streaming speech recognition...")
+        streaming_recognizer = start_streaming_recognition()
     
     print(f"Starting server on {args.host}:{args.port}")
     socketio.run(app, host=args.host, port=args.port, debug=args.debug)
