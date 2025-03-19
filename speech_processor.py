@@ -149,8 +149,12 @@ class SpeechProcessor:
                             logger.error(f"Error in request generator: {e}")
                             break
                 
-                # Call the API with the generated requests
-                responses = self._speech_client.streaming_recognize(requests=generate_requests())
+                # For google-cloud-speech 2.8.0, we need to pass config explicitly
+                # The requests param is a generator, and config should be the StreamingRecognitionConfig
+                responses = self._speech_client.streaming_recognize(
+                    config=self._streaming_config,
+                    requests=generate_requests()
+                )
                 
                 # Process responses
                 for response in responses:
