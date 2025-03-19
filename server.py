@@ -354,8 +354,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run the SoundWatch server')
     parser.add_argument('--debug', action='store_true', help='Enable debug mode')
     parser.add_argument('--host', default='0.0.0.0', help='Server host (default: 0.0.0.0 to allow connections from anywhere)')
-    parser.add_argument('--port', type=int, default=8080, help='Server port (default: 8080)')
     args = parser.parse_args()
     
-    print(f"Starting server on {args.host}:{args.port}")
-    socketio.run(app, host=args.host, port=args.port, debug=args.debug)
+    PORT = 4040  # Fixed port for the server
+    print(f"Starting server on {args.host}:{PORT}")
+    socketio.run(app, host=args.host, port=PORT, debug=args.debug)
