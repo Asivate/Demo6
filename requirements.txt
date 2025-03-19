@@ -17,5 +17,5 @@ numpy==1.18.5
 tensorflow==1.15.0
 keras==2.3.1
 wget
-google-cloud-speech==2.21.0
-google-cloud-language==2.12.0
+google-cloud-speech==2.24.0
+google-cloud-language==2.13.0

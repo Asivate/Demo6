@@ -15,12 +15,12 @@ import argparse
 import wget
 from helpers import dbFS
 import os
-import logging
-from speech_processor import SpeechProcessor
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('server')
+from google.cloud import speech
+from google.cloud import language_v1
+import io
+import threading
+import queue
+import json
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -50,8 +50,47 @@ CHUNK = RATE
 MICROPHONES_DESCRIPTION = []
 FPS = 60.0
 
-# Initialize Speech Processor for speech recognition and sentiment analysis
-speech_processor = SpeechProcessor()
+###########################
+# Initialize Google Cloud clients
+###########################
+# Initialize Google Cloud clients - use environment credentials
+try:
+    # Check if credentials are properly set
+    if not os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+        print("WARNING: GOOGLE_APPLICATION_CREDENTIALS environment variable is not set.")
+        print(f"Current environment variables: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'Not set')}")
+        print("Attempting to initialize clients without explicit credentials (will use default credentials if available)...")
+    else:
+        print(f"Using credentials from: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')}")
+        # Check if the file exists and is readable
+        cred_path = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS')
+        if os.path.exists(cred_path):
+            print(f"Credentials file exists at {cred_path}")
+            if os.access(cred_path, os.R_OK):
+                print("Credentials file is readable.")
+            else:
+                print("WARNING: Credentials file exists but is not readable!")
+        else:
+            print(f"WARNING: Credentials file does not exist at {cred_path}")
+    
+    # Initialize clients
+    speech_client = speech.SpeechClient()
+    language_client = language_v1.LanguageServiceClient()
+    print("Google Cloud clients initialized successfully")
+    GOOGLE_CLOUD_ENABLED = True
+except Exception as e:
+    print("Failed to initialize Google Cloud clients. Speech-to-text and sentiment analysis will be disabled.")
+    print(f"Error: {e}")
+    print("To fix this issue:")
+    print("1. Ensure GOOGLE_APPLICATION_CREDENTIALS environment variable is set to your credentials JSON file")
+    print("2. Verify the credentials file exists and is readable")
+    print("3. Make sure the credentials have access to Speech-to-Text and Natural Language APIs")
+    GOOGLE_CLOUD_ENABLED = False
+
+# Buffer for speech recognition (holds audio data for processing)
+speech_buffer = []
+speech_buffer_lock = threading.Lock()
+speech_processing_queue = queue.Queue()
 
 ###########################
 # Download model, if it doesn't exist
@@ -207,6 +246,20 @@ def handle_source(json_data):
     db = dbFS(rms)
     print('Db...', db)
     
+    # Process for speech recognition (add to buffer)
+    if GOOGLE_CLOUD_ENABLED:
+        with speech_buffer_lock:
+            speech_buffer.append(np_wav)
+            # If we have enough data (~3 seconds), process for speech
+            if len(speech_buffer) >= 3:  # 3 chunks of audio is enough for most speech
+                # Concatenate the buffered audio segments
+                combined_audio = np.concatenate(speech_buffer)
+                # Add to processing queue
+                speech_processing_queue.put(combined_audio.copy())
+                # Keep the last chunk for overlap (to avoid cutting words)
+                speech_buffer.clear()
+                speech_buffer.append(np_wav)
+    
     # Skip processing if the audio is silent (very low RMS)
     if rms < SILENCE_RMS_THRESHOLD:
         print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
@@ -307,49 +360,6 @@ def handle_source(json_data):
                     },
                     room=request.sid)
 
-    # ENHANCEMENT: Also process this audio for speech recognition
-    # Convert int16 to bytes for speech recognition
-    try:
-        # Convert audio data back to bytes
-        raw_audio_bytes = (np_wav * 32768.0).astype(np.int16).tobytes()
-        
-        # Add to speech processor buffer
-        speech_processor.add_audio_data(raw_audio_bytes)
-        
-        # If speech processor isn't running, start it
-        if not speech_processor.is_processing:
-            speech_processor.start_processing()
-    except Exception as e:
-        logger.error(f"Error sending audio to speech processor: {e}")
-
-
-@socketio.on('speech_recognition_start')
-def handle_speech_start():
-    """Handle client requests to start speech recognition."""
-    logger.info(f"Client {request.sid} requested to start speech recognition")
-    
-    # Start speech processing if not already started
-    if not speech_processor.is_processing:
-        speech_processor.start_processing()
-        
-    socketio.emit('speech_recognition_status', {'status': 'started'}, room=request.sid)
-
-@socketio.on('speech_recognition_stop')
-def handle_speech_stop():
-    """Handle client requests to stop speech recognition."""
-    logger.info(f"Client {request.sid} requested to stop speech recognition")
-    
-    # Stop speech processing
-    speech_processor.stop_processing()
-    
-    socketio.emit('speech_recognition_status', {'status': 'stopped'}, room=request.sid)
-
-@socketio.on('get_speech_results')
-def handle_get_speech_results():
-    """Return the latest speech recognition results to the client."""
-    results = speech_processor.get_latest_results()
-    socketio.emit('speech_transcript', results, room=request.sid)
-
 
 def background_thread():
     """Example of how to send server generated events to clients."""
@@ -361,6 +371,142 @@ def background_thread():
                       {'data': 'Server generated event', 'count': count},
                       namespace='/test')
 
+def get_sentiment_emoji(score):
+    """Convert sentiment score to appropriate emoji"""
+    if score > 0.7:
+        return "😄"
+    elif score > 0.3:
+        return "🙂"
+    elif score > -0.3:
+        return "😐"
+    elif score > -0.7:
+        return "😕"
+    else:
+        return "😢"
+        
+def get_sentiment_emotion(score):
+    """Convert sentiment score to emotion label"""
+    if score > 0.7:
+        return "Very Positive"
+    elif score > 0.3:
+        return "Positive"
+    elif score > -0.3:
+        return "Neutral"
+    elif score > -0.7:
+        return "Negative"
+    else:
+        return "Very Negative"
+
+def process_speech_for_sentiment(audio_data):
+    """Process audio data for speech recognition and sentiment analysis"""
+    if not GOOGLE_CLOUD_ENABLED:
+        print("Google Cloud services not enabled. Skipping speech processing.")
+        return
+    
+    try:
+        # Convert to bytes for Google API
+        audio_bytes = audio_data.astype(np.int16).tobytes()
+        
+        # Process with Speech API
+        audio = speech.RecognitionAudio(content=audio_bytes)
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            # Add more configuration options for better results
+            enable_automatic_punctuation=True,
+            model="default",  # Use "video" for better handling of media content or "phone_call" for phone conversations
+            use_enhanced=True  # Use enhanced model
+        )
+        
+        print("Sending audio to Google Speech-to-Text API...")
+        response = speech_client.recognize(config=config, audio=audio)
+        
+        if not response.results or not response.results[0].alternatives:
+            print("No speech detected in audio segment")
+            return
+            
+        transcript = response.results[0].alternatives[0].transcript
+        
+        # If transcript is empty, skip sentiment analysis
+        if not transcript.strip():
+            print("Empty transcript, skipping sentiment analysis")
+            return
+            
+        print(f"Transcript: {transcript}")
+            
+        # Process with Natural Language API for sentiment
+        document = language_v1.Document(
+            content=transcript,
+            type_=language_v1.Document.Type.PLAIN_TEXT
+        )
+        
+        print("Analyzing sentiment with Google Natural Language API...")
+        sentiment_response = language_client.analyze_sentiment(document=document)
+        sentiment = sentiment_response.document_sentiment
+        
+        # Map sentiment score to emoji and emotion
+        emoji = get_sentiment_emoji(sentiment.score)
+        emotion = get_sentiment_emotion(sentiment.score)
+        
+        print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
+        
+        # Calculate approximate dB level
+        rms = np.sqrt(np.mean(audio_data**2))
+        db = dbFS(rms)
+        
+        # Create timestamp for the transcript
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        
+        # Create transcript entry for history
+        transcript_entry = {
+            "transcription": transcript,
+            "emotion": emotion,
+            "emoji": emoji,
+            "sentiment_score": float(sentiment.score),
+            "timestamp": timestamp
+        }
+        
+        # Send to connected clients
+        socketio.emit('audio_label', {
+            'label': 'Speech',
+            'accuracy': '1.0',
+            'db': str(db),
+            'emoji': emoji,
+            'emotion': emotion,
+            'transcription': transcript,
+            'sentiment_score': sentiment.score,
+            'timestamp': timestamp
+        })
+        
+        # Also emit a transcript update event for clients that maintain transcript history
+        socketio.emit('transcript_update', transcript_entry)
+        
+        return transcript_entry
+        
+    except Exception as e:
+        print(f"Error processing speech: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+# Speech processing thread function
+def speech_processing_thread_func():
+    """Background thread that processes the speech queue"""
+    print("Speech processing thread started")
+    while True:
+        try:
+            audio_data = speech_processing_queue.get(timeout=1)
+            process_speech_for_sentiment(audio_data)
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"Error in speech processing thread: {e}")
+
+# Start the speech processing thread
+speech_thread = threading.Thread(target=speech_processing_thread_func)
+speech_thread.daemon = True
+speech_thread.start()
 
 @app.route('/')
 def index():
@@ -401,34 +547,6 @@ def test_disconnect():
     print('Client disconnected', request.sid)
 
 
-# Background task to emit speech recognition updates to clients
-def speech_recognition_background():
-    """
-    Periodically check for new speech recognition results and emit them to connected clients.
-    This runs continuously in a background thread.
-    """
-    logger.info("Starting speech recognition background task")
-    
-    while True:
-        # Sleep to avoid excessive CPU usage
-        socketio.sleep(0.5)
-        
-        # Skip if no processing is happening
-        if not speech_processor.is_processing:
-            continue
-            
-        try:
-            # Get the latest results
-            results = speech_processor.get_latest_results()
-            
-            # Only emit if we have meaningful results
-            if results['transcript'] and results['sentiment']:
-                # Broadcast to all connected clients
-                socketio.emit('speech_transcript', results)
-        except Exception as e:
-            logger.error(f"Error in speech recognition background task: {e}")
-
-
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Run the SoundWatch server')
@@ -438,8 +556,4 @@ if __name__ == '__main__':
     args = parser.parse_args()
     
     print(f"Starting server on {args.host}:{args.port}")
-    
-    # Start the speech recognition background task
-    socketio.start_background_task(speech_recognition_background)
-    
     socketio.run(app, host=args.host, port=args.port, debug=args.debug)
