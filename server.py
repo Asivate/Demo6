@@ -126,26 +126,52 @@ class StreamingRecognizer:
         self.is_active = True
         self.last_transcript = ""
         self.last_response_time = time.time()
+        self.last_audio_time = time.time()
+        self.keep_alive_timer = None
+        self.empty_audio_chunk = np.zeros(int(RATE * 0.1), dtype=np.float32)  # 100ms of silence
         
     def add_audio(self, audio_data):
         """Add audio data to the processing queue"""
         if self.is_active:
             self.audio_queue.put(audio_data)
+            self.last_audio_time = time.time()
             
     def stop(self):
         """Stop the streaming recognition"""
         self.is_active = False
+        if self.keep_alive_timer:
+            self.keep_alive_timer.cancel()
+        self.audio_queue.put(None)  # Signal to stop the generator
+        
+    def send_keep_alive(self):
+        """Send an empty audio chunk to keep the stream alive"""
+        if self.is_active:
+            # Only send keep-alive if we haven't received real audio in 2 seconds
+            now = time.time()
+            if now - self.last_audio_time > 2.0:
+                print("Sending keep-alive audio chunk to prevent timeout")
+                self.audio_queue.put(self.empty_audio_chunk)
+            
+            # Schedule the next keep-alive check
+            self.keep_alive_timer = threading.Timer(1.0, self.send_keep_alive)
+            self.keep_alive_timer.daemon = True
+            self.keep_alive_timer.start()
         
     def audio_generator_function(self):
         """Generates audio chunks from the audio queue"""
+        # Start the keep-alive timer
+        self.send_keep_alive()
+        
         while self.is_active:
             # Get audio data, waiting up to 100ms
             try:
                 chunk = self.audio_queue.get(timeout=0.1)
-                if chunk is not None:
-                    # Convert to bytes
-                    audio_chunk = chunk.astype(np.int16).tobytes()
-                    yield speech.StreamingRecognizeRequest(audio_content=audio_chunk)
+                if chunk is None:  # None is our signal to stop
+                    break
+                    
+                # Convert to bytes
+                audio_chunk = chunk.astype(np.int16).tobytes()
+                yield speech.StreamingRecognizeRequest(audio_content=audio_chunk)
             except queue.Empty:
                 # If no data, just continue
                 continue
@@ -243,10 +269,12 @@ class StreamingRecognizer:
     def start_streaming(self):
         """Start streaming recognition in a loop"""
         retry_count = 0
-        max_retries = 5
+        max_retries = 10  # Increased from 5 to 10
+        restart_interval = 180  # 3 minutes - restart the stream periodically to avoid issues
         
         while self.is_active and retry_count < max_retries:
             try:
+                stream_start_time = time.time()
                 print("Starting streaming recognition session")
                 streaming_recognize = self.client.streaming_recognize(
                     config=self.streaming_config,
@@ -257,14 +285,57 @@ class StreamingRecognizer:
                 self.process_streaming_responses(streaming_recognize)
                 
                 # If we get here, the stream ended naturally
-                print("Streaming recognition session ended")
-                retry_count = 0
+                stream_duration = time.time() - stream_start_time
+                print(f"Streaming recognition session ended after {stream_duration:.1f} seconds")
                 
+                # If the stream ended normally and ran for a significant time, reset retry count
+                if stream_duration > 30:
+                    retry_count = 0
+                else:
+                    # If the stream ended quickly, count as a retry
+                    retry_count += 1
+                    print(f"Stream ended quickly (retry {retry_count}/{max_retries})")
+                
+                # Check if we need to restart due to timeout
+                if stream_duration >= restart_interval:
+                    print(f"Stream ran for {stream_duration:.1f} seconds, restarting for freshness")
+                    time.sleep(1)  # Brief pause before restart
+                else:
+                    # If it ended quickly, wait longer before retry to avoid rapid cycling
+                    wait_time = min(5 * retry_count, 30)  # Progressive backoff, max 30 seconds
+                    print(f"Waiting {wait_time} seconds before restarting stream")
+                    time.sleep(wait_time)
+                    
             except Exception as e:
                 retry_count += 1
                 print(f"Streaming recognition error (retry {retry_count}/{max_retries}): {e}")
-                time.sleep(1)  # Wait before retrying
+                if self.keep_alive_timer:
+                    self.keep_alive_timer.cancel()
                 
+                # Detailed error handling to help diagnose issues
+                import traceback
+                traceback.print_exc()
+                
+                # Check for specific error types and provide more context
+                error_str = str(e).lower()
+                if "timeout" in error_str:
+                    print("Error appears to be a timeout. Check network connectivity and API quotas.")
+                elif "unauthenticated" in error_str or "permission" in error_str:
+                    print("Error may be related to authentication. Check Google Cloud credentials.")
+                elif "not found" in error_str:
+                    print("API endpoint not found. Check if the Speech-to-Text API is enabled in your Google Cloud project.")
+                
+                # Progressive backoff on retries
+                wait_time = min(5 * retry_count, 60)  # Progressive backoff, max 60 seconds
+                print(f"Waiting {wait_time} seconds before retry attempt")
+                time.sleep(wait_time)
+                
+        if self.keep_alive_timer:
+            self.keep_alive_timer.cancel()
+        
+        if retry_count >= max_retries:
+            print(f"Exceeded maximum number of retries ({max_retries}). Stopping streaming recognition.")
+        
         print("Streaming recognition stopped")
 
 def start_streaming_recognition():
@@ -277,6 +348,12 @@ def start_streaming_recognition():
         
     streaming_active = True
     streaming_recognizer = StreamingRecognizer()
+    
+    # Print information about the environment
+    print("Starting streaming recognition with the following settings:")
+    print(f"- Sample rate: {RATE} Hz")
+    print(f"- Channels: {CHANNELS}")
+    print(f"- Google credentials: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'Not set')}")
     
     # Start in a background thread
     thread = threading.Thread(target=streaming_recognizer.start_streaming)
@@ -293,6 +370,12 @@ def stop_streaming_recognition():
         streaming_active = False
         streaming_recognizer.stop()
         print("Streaming recognition stopped")
+
+def restart_streaming_recognition():
+    """Restart the streaming recognition system"""
+    stop_streaming_recognition()
+    time.sleep(2)  # Allow time for cleanup
+    return start_streaming_recognition()
 
 ###########################
 # Download model, if it doesn't exist
@@ -434,6 +517,46 @@ def handle_source_features(json_data):
                     },
                     room=request.sid)
 
+def assess_audio_quality(audio_data):
+    """
+    Analyze audio data to determine if it's suitable for speech recognition
+    Returns: (is_suitable, reason, processed_audio)
+    """
+    # Calculate audio metrics
+    rms = np.sqrt(np.mean(audio_data**2))
+    peak = np.max(np.abs(audio_data))
+    db = dbFS(rms)
+    
+    # Check for silence
+    if rms < 0.001:  # Extremely quiet
+        return False, f"Audio too quiet (RMS: {rms:.6f}, dB: {db:.2f})", None
+        
+    # Check for near-zero audio
+    if peak < 0.01:  # Very low peak amplitude
+        return False, f"Audio peak too low (peak: {peak:.6f})", None
+    
+    # Process the audio to improve quality
+    processed_audio = audio_data.copy()
+    
+    # Apply noise reduction (cut off very quiet sounds)
+    noise_floor = 0.002  # Lower from original 0.005 to be less aggressive
+    processed_audio[np.abs(processed_audio) < noise_floor] = 0
+    
+    # Apply normalization if audio is quiet but not silent
+    if peak < 0.3 and peak > 0.01:
+        gain_factor = min(0.5 / peak, 5.0)  # Target 50% of max, but cap at 5x gain
+        processed_audio = np.clip(processed_audio * gain_factor, -1.0, 1.0)
+        print(f"Applied gain of {gain_factor:.2f} to audio (original peak: {peak:.3f})")
+    
+    # Calculate processed metrics
+    processed_rms = np.sqrt(np.mean(processed_audio**2))
+    processed_peak = np.max(np.abs(processed_audio))
+    processed_db = dbFS(processed_rms)
+    
+    print(f"Audio quality: Original(RMS: {rms:.4f}, peak: {peak:.4f}, dB: {db:.1f}) → " +
+          f"Processed(RMS: {processed_rms:.4f}, peak: {processed_peak:.4f}, dB: {processed_db:.1f})")
+    
+    return True, "Audio suitable for recognition", processed_audio
 
 @socketio.on('audio_data')
 def handle_source(json_data):
@@ -442,32 +565,26 @@ def handle_source(json_data):
     global graph, model, sess, streaming_recognizer
     np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
         32768.0  # Convert to [-1.0, +1.0]
+    
     # Compute RMS and convert to dB
-    print('Successfully convert to NP rep', np_wav)
     rms = np.sqrt(np.mean(np_wav**2))
     db = dbFS(rms)
-    print('Db...', db)
+    print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
     
-    # Process for streaming speech recognition (send directly to streaming recognizer)
+    # Process for streaming speech recognition
     if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-        # Normalize audio to improve speech recognition
-        # Apply basic noise reduction by cutting off very quiet sounds
-        noise_floor = 0.005  # Adjust this threshold based on your environment
-        clean_audio = np_wav.copy()
-        clean_audio[np.abs(clean_audio) < noise_floor] = 0
+        # Assess and process audio for better recognition
+        is_suitable, reason, processed_audio = assess_audio_quality(np_wav)
         
-        # Apply basic normalization to increase volume if needed
-        if np.max(np.abs(clean_audio)) < 0.1:  # If audio is very quiet
-            gain_factor = 0.3 / max(np.max(np.abs(clean_audio)), 0.01)  # Target 30% of max amplitude
-            clean_audio = np.clip(clean_audio * gain_factor, -1.0, 1.0)  # Apply gain but prevent clipping
-            print(f"Applied gain of {gain_factor:.2f} to quiet audio")
-        
-        # Send directly to streaming recognizer
-        streaming_recognizer.add_audio(clean_audio)
+        if is_suitable:
+            # Send the processed audio to the streaming recognizer
+            streaming_recognizer.add_audio(processed_audio)
+        else:
+            print(f"Skipping audio for speech recognition: {reason}")
     
-    # Skip processing if the audio is silent (very low RMS)
+    # Skip sound classification processing if the audio is silent (very low RMS)
     if rms < SILENCE_RMS_THRESHOLD:
-        print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
+        print(f"Detected silent audio frame (RMS: {rms}, dB: {db:.1f}). Skipping classification.")
         socketio.emit('audio_label',
                     {
                         'label': 'Silent',
@@ -479,7 +596,7 @@ def handle_source(json_data):
     
     # Additional check for near-zero audio frames that might not be caught by RMS threshold
     if np_wav.max() == 0.0 and np_wav.min() == 0.0:
-        print(f"Detected empty audio frame with all zeros. Skipping processing.")
+        print(f"Detected empty audio frame with all zeros. Skipping classification.")
         socketio.emit('audio_label',
                     {
                         'label': 'Silent',
@@ -498,8 +615,7 @@ def handle_source(json_data):
         print(f"Padded audio to {len(np_wav)} samples")
     
     # Make predictions
-    print('Making prediction...')
-    print(f'Audio data: shape={np_wav.shape}, min={np_wav.min():.4f}, max={np_wav.max():.4f}, rms={np.sqrt(np.mean(np_wav**2)):.4f}')
+    print('Making sound classification prediction...')
     x = waveform_to_examples(np_wav, RATE)
     print(f'Generated features: shape={x.shape}')
     
@@ -516,7 +632,6 @@ def handle_source(json_data):
     
     # Add the channel dimension required by the model
     x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-    print(f'Successfully reshape x {x.shape}')
     
     predictions = []
     try:
@@ -530,12 +645,7 @@ def handle_source(json_data):
                     context_prediction = np.take(
                         prediction[0], [homesounds.labels[x] for x in active_context])
                     m = np.argmax(context_prediction)
-                    print('Max prediction', str(
-                        homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    
-                    # Modified condition - look at db and confidence together for debugging
-                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
-                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
+                    print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
                     
                     # Original condition was too strict - many sounds were being classified as "Unrecognized"
                     if context_prediction[m] > PREDICTION_THRES:
@@ -544,8 +654,6 @@ def handle_source(json_data):
                                      'accuracy': str(context_prediction[m]),
                                      'db': str(db)},
                                     room=request.sid)
-                        print("Prediction: %s (%0.2f)" % (
-                            homesounds.to_human_labels[active_context[m]], context_prediction[m]))
                     else:
                         socketio.emit('audio_label',
                                     {
@@ -971,6 +1079,69 @@ def test_connect():
 def test_disconnect():
     print('Client disconnected', request.sid)
 
+@app.route('/speech_status')
+def speech_status():
+    """
+    Returns information about the current status of the speech recognition system
+    Useful for debugging
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Speech recognition unavailable."
+    
+    if 'streaming_recognizer' not in globals() or streaming_recognizer is None:
+        return "No active streaming recognizer found."
+    
+    # Calculate timings
+    now = time.time()
+    last_audio_age = now - streaming_recognizer.last_audio_time
+    last_response_age = now - streaming_recognizer.last_response_time
+    
+    status_html = "<h1>Speech Recognition Status</h1>"
+    status_html += "<ul>"
+    status_html += f"<li>Streaming active: {streaming_active}</li>"
+    status_html += f"<li>Last audio received: {last_audio_age:.1f} seconds ago</li>"
+    status_html += f"<li>Last transcript received: {last_response_age:.1f} seconds ago</li>"
+    status_html += f"<li>Last transcript: '{streaming_recognizer.last_transcript}'</li>"
+    status_html += "</ul>"
+    
+    status_html += "<h2>Troubleshooting</h2>"
+    status_html += "<ul>"
+    status_html += "<li>If 'Last audio received' is very recent but no transcriptions are appearing:</li>"
+    status_html += "<ul><li>Check that your audio contains speech and is loud enough</li>"
+    status_html += "<li>Check Google Cloud Speech API quota usage</li>"
+    status_html += "<li>Try restarting the server</li></ul>"
+    status_html += "</ul>"
+    
+    status_html += "<p><a href='/test_speech'>Run Speech Test</a> | <a href='/test_sentiment'>Run Sentiment Test</a></p>"
+    
+    return status_html
+
+@app.route('/restart_speech')
+def restart_speech_endpoint():
+    """
+    Endpoint to manually restart the speech recognition system
+    Useful when issues occur
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Speech recognition unavailable."
+    
+    try:
+        # Stop current recognizer if it exists
+        if 'streaming_recognizer' in globals() and streaming_recognizer is not None:
+            stop_streaming_recognition()
+            time.sleep(2)  # Allow time for cleanup
+        
+        # Start a new recognizer
+        new_recognizer = start_streaming_recognition()
+        
+        if new_recognizer:
+            return "Speech recognition system restarted successfully. <a href='/speech_status'>Check status</a>"
+        else:
+            return "Failed to restart speech recognition system."
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        return f"Error restarting speech recognition: {str(e)}<br><pre>{error_trace}</pre>"
 
 if __name__ == '__main__':
     import argparse
