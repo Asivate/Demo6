@@ -27,6 +27,7 @@ import base64
 import re
 import sys
 import pyaudio
+import math
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -127,14 +128,94 @@ class SimpleStreamingRecognizer:
         self.is_active = True
         self.last_transcript = ""
         self.last_response_time = time.time()
+        self.last_audio_time = time.time()
         self.thread = None
+        
+        # Chunk size management
+        self.MAX_CHUNK_SIZE = 15360  # Maximum chunk size in bytes (as per Google's documentation)
+        self.optimal_chunk_size = 1600  # Default size (will be adjusted based on sample rate)
+        self.adjust_chunk_size()
+        
+        # VAD parameters
+        self.vad_enabled = True
+        self.silence_threshold = 0.01  # RMS threshold for silence detection
+        self.silence_duration = 0  # Counter for silence duration
+        self.max_silence_duration = 5  # Maximum silence duration in seconds before reconnection
+        self.speech_active = False
+        
+        # Keep-alive parameters
+        self.keep_alive_audio = np.zeros(int(RATE * 0.1), dtype=np.float32)  # 100ms of silence
+        self.keep_alive_interval = 2.0  # Send keep-alive every 2 seconds of silence
+        self.last_keep_alive_time = time.time()
+        
+        # Reconnection parameters
+        self.reconnect_count = 0
+        self.max_reconnect_attempts = 10
+        self.reconnect_backoff = 1.0  # Start with 1 second backoff, will increase
+        self.max_stream_duration = 240  # Maximum stream duration in seconds (4 minutes)
+        self.stream_start_time = time.time()
+    
+    def adjust_chunk_size(self):
+        """Adjust optimal chunk size based on sample rate and channels"""
+        # Calculate bytes per second based on sample rate, channels, and bit depth
+        bytes_per_second = RATE * CHANNELS * 2  # 2 bytes per sample for 16-bit audio
+        
+        # Set optimal chunk size to be ~100ms of audio but ensure it's below the maximum
+        self.optimal_chunk_size = min(int(bytes_per_second * 0.1), self.MAX_CHUNK_SIZE)
+        print(f"Set optimal chunk size to {self.optimal_chunk_size} bytes")
+    
+    def is_silent(self, audio_data):
+        """Detect if audio is silent based on RMS"""
+        rms = np.sqrt(np.mean(audio_data**2))
+        return rms < self.silence_threshold
     
     def add_audio(self, audio_data):
-        """Add audio data to the processing queue"""
-        if self.is_active:
-            # Convert float32 [-1.0, 1.0] to int16
-            int16_data = (audio_data * 32768).astype(np.int16)
-            self.audio_queue.put(int16_data.tobytes())
+        """Add audio data to the processing queue with VAD"""
+        if not self.is_active:
+            return
+            
+        # Convert float32 [-1.0, 1.0] to int16
+        int16_data = (audio_data * 32768).astype(np.int16)
+        
+        # Voice Activity Detection
+        if self.vad_enabled:
+            is_silent = self.is_silent(audio_data)
+            
+            if is_silent:
+                self.silence_duration += len(audio_data) / RATE
+                
+                # If we've been silent for too long, consider sending keep-alive
+                if self.silence_duration >= self.keep_alive_interval:
+                    current_time = time.time()
+                    # Only send keep-alive if we haven't sent one recently
+                    if current_time - self.last_keep_alive_time >= self.keep_alive_interval:
+                        print(f"Sending keep-alive packet after {self.silence_duration:.1f}s of silence")
+                        self.last_keep_alive_time = current_time
+                        keep_alive_int16 = (self.keep_alive_audio * 32768).astype(np.int16)
+                        self.audio_queue.put(keep_alive_int16.tobytes())
+                
+                # If silence persists too long, consider reconnecting the stream
+                if self.silence_duration > self.max_silence_duration and self.speech_active:
+                    print(f"Silence detected for {self.silence_duration:.1f}s, will initiate graceful reconnection")
+                    self.speech_active = False
+                    # Don't immediately reconnect - just mark that speech is no longer active
+            else:
+                # Reset silence duration when sound is detected
+                self.silence_duration = 0
+                self.speech_active = True
+        
+        # Check if we need to split the chunk due to size constraints
+        audio_bytes = int16_data.tobytes()
+        if len(audio_bytes) > self.MAX_CHUNK_SIZE:
+            # Split the audio into appropriate sized chunks
+            for i in range(0, len(audio_bytes), self.optimal_chunk_size):
+                chunk = audio_bytes[i:i+self.optimal_chunk_size]
+                self.audio_queue.put(chunk)
+            print(f"Split large audio chunk ({len(audio_bytes)} bytes) into {math.ceil(len(audio_bytes)/self.optimal_chunk_size)} smaller chunks")
+        else:
+            self.audio_queue.put(audio_bytes)
+        
+        self.last_audio_time = time.time()
     
     def stop(self):
         """Stop the streaming recognition"""
@@ -143,24 +224,56 @@ class SimpleStreamingRecognizer:
     
     def audio_generator(self):
         """Generate audio chunks from the queue"""
+        buffer = b''
+        
         while self.is_active:
-            chunk = self.audio_queue.get()
-            if chunk is None:
-                return
+            # Check if stream has been active too long and needs rotation
+            if time.time() - self.stream_start_time > self.max_stream_duration:
+                print(f"Stream active for {self.max_stream_duration}s, initiating planned rotation")
+                return  # End this stream to allow a new one to start
             
-            data = [chunk]
+            try:
+                chunk = self.audio_queue.get(timeout=0.5)  # Short timeout to check for stream duration
+                if chunk is None:
+                    return
+                
+                # Accumulate audio in buffer
+                buffer += chunk
+                
+                # If buffer reaches optimal size, yield it
+                if len(buffer) >= self.optimal_chunk_size:
+                    yield buffer
+                    buffer = b''
+                
+                # Get any additional chunks without blocking
+                while True:
+                    try:
+                        chunk = self.audio_queue.get(block=False)
+                        if chunk is None:
+                            return
+                        
+                        # If adding this chunk would exceed max size, yield current buffer first
+                        if len(buffer) + len(chunk) > self.MAX_CHUNK_SIZE:
+                            if buffer:  # Only yield if buffer has content
+                                yield buffer
+                                buffer = b''
+                        
+                        buffer += chunk
+                    except queue.Empty:
+                        break
+                
+                # If we have accumulated data, yield it
+                if buffer:
+                    yield buffer
+                    buffer = b''
+                    
+            except queue.Empty:
+                # Timeout occurred, continue loop to check if stream needs rotation
+                continue
             
-            # Get any additional chunks that might be in the queue
-            while True:
-                try:
-                    chunk = self.audio_queue.get(block=False)
-                    if chunk is None:
-                        return
-                    data.append(chunk)
-                except queue.Empty:
-                    break
-            
-            yield b''.join(data)
+        # Yield any remaining data before exiting
+        if buffer:
+            yield buffer
     
     def process_responses(self, responses):
         """Process streaming responses from the API"""
@@ -247,15 +360,26 @@ class SimpleStreamingRecognizer:
             print(f"Error processing streaming responses: {e}")
             import traceback
             traceback.print_exc()
+            
+            # If we encounter specific Google API errors that suggest reconnecting would help,
+            # set is_active to False to allow for reconnection
+            error_str = str(e).lower()
+            if "timeout" in error_str or "deadline" in error_str or "unavailable" in error_str:
+                print("Detected API timeout or connection issue, signaling for reconnection")
+                return False  # Signal that reconnection is needed
+            
+        return True  # Signal successful processing
     
     def run(self):
-        """Run the streaming recognition in a continuous loop"""
+        """Run the streaming recognition in a continuous loop with improved error handling"""
         retry_count = 0
-        max_retries = 10
+        max_retries = self.max_reconnect_attempts
         
         while self.is_active and retry_count < max_retries:
             try:
                 print("Starting streaming recognition session")
+                self.stream_start_time = time.time()
+                self.reconnect_count = retry_count
                 
                 # Create the generator for audio chunks
                 audio_generator = self.audio_generator()
@@ -269,12 +393,20 @@ class SimpleStreamingRecognizer:
                 # Start streaming recognition
                 responses = self.client.streaming_recognize(self.streaming_config, requests)
                 
-                # Process responses
-                self.process_responses(responses)
+                # Process responses - if it returns False, reconnection is needed
+                success = self.process_responses(responses)
                 
-                # If we get here, the stream ended naturally
-                print("Streaming recognition session ended normally")
-                retry_count = 0
+                # If we get here, the stream ended
+                if success:
+                    print("Streaming recognition session ended normally")
+                    retry_count = 0  # Reset retry count on successful completion
+                else:
+                    # Process_responses signaled we should reconnect
+                    retry_count += 1
+                    print(f"Stream needs reconnection (attempt {retry_count}/{max_retries})")
+                
+                # Wait briefly before reconnecting to avoid rapid cycling
+                time.sleep(0.5)
                 
             except Exception as e:
                 retry_count += 1
@@ -283,11 +415,14 @@ class SimpleStreamingRecognizer:
                 traceback.print_exc()
                 
                 # Implement progressive backoff
-                wait_time = min(5 * retry_count, 30)
-                print(f"Waiting {wait_time} seconds before retry...")
-                time.sleep(wait_time)
+                backoff_time = min(self.reconnect_backoff * retry_count, 30)
+                print(f"Waiting {backoff_time} seconds before retry...")
+                time.sleep(backoff_time)
                 
-        print("Streaming recognition stopped")
+        if not self.is_active:
+            print("Streaming recognition stopped by request")
+        elif retry_count >= max_retries:
+            print(f"Exceeded maximum number of retries ({max_retries}). Stopping streaming recognition.")
     
     def start(self):
         """Start the streaming recognition in a background thread"""
@@ -1176,63 +1311,145 @@ def test_disconnect():
 
 @app.route('/speech_status')
 def speech_status():
-    """
-    Returns information about the current status of the speech recognition system
-    Useful for debugging
-    """
+    """Endpoint to check the status of speech recognition"""
+    
     if not GOOGLE_CLOUD_ENABLED:
-        return "Google Cloud services not enabled. Speech recognition unavailable."
+        return "Google Cloud services not enabled. Speech recognition is disabled."
     
     if 'streaming_recognizer' not in globals() or streaming_recognizer is None:
-        return "No active streaming recognizer found."
+        return "Speech recognition has not been initialized."
     
-    # Calculate timings
-    now = time.time()
-    last_audio_age = now - streaming_recognizer.last_audio_time
-    last_response_age = now - streaming_recognizer.last_response_time
+    # Calculate health metrics
+    current_time = time.time()
+    time_since_last_response = current_time - streaming_recognizer.last_response_time
+    time_since_last_audio = current_time - streaming_recognizer.last_audio_time
     
-    status_html = "<h1>Speech Recognition Status</h1>"
-    status_html += "<ul>"
-    status_html += f"<li>Streaming active: {streaming_active}</li>"
-    status_html += f"<li>Last audio received: {last_audio_age:.1f} seconds ago</li>"
-    status_html += f"<li>Last transcript received: {last_response_age:.1f} seconds ago</li>"
-    status_html += f"<li>Last transcript: '{streaming_recognizer.last_transcript}'</li>"
-    status_html += "</ul>"
+    # Format status info
+    status_info = {
+        "active": streaming_active,
+        "last_transcript": streaming_recognizer.last_transcript,
+        "time_since_last_response": f"{time_since_last_response:.1f} seconds",
+        "time_since_last_audio": f"{time_since_last_audio:.1f} seconds",
+        "silence_duration": f"{streaming_recognizer.silence_duration:.1f} seconds",
+        "reconnect_count": streaming_recognizer.reconnect_count,
+        "stream_age": f"{current_time - streaming_recognizer.stream_start_time:.1f} seconds",
+        "stream_max_age": f"{streaming_recognizer.max_stream_duration} seconds",
+        "vad_enabled": streaming_recognizer.vad_enabled,
+        "silence_threshold": streaming_recognizer.silence_threshold,
+    }
     
-    status_html += "<h2>Troubleshooting</h2>"
-    status_html += "<ul>"
-    status_html += "<li>If 'Last audio received' is very recent but no transcriptions are appearing:</li>"
-    status_html += "<ul><li>Check that your audio contains speech and is loud enough</li>"
-    status_html += "<li>Check Google Cloud Speech API quota usage</li>"
-    status_html += "<li>Try restarting the server</li></ul>"
-    status_html += "</ul>"
+    # Determine overall health
+    if not streaming_active:
+        health = "OFFLINE"
+    elif time_since_last_response > 120:
+        health = "CRITICAL - No responses received in over 2 minutes"
+    elif time_since_last_response > 60:
+        health = "WARNING - No responses received in over 1 minute"
+    elif streaming_recognizer.reconnect_count > 5:
+        health = "WARNING - Multiple reconnection attempts"
+    else:
+        health = "OK"
     
-    status_html += "<p><a href='/test_speech'>Run Speech Test</a> | <a href='/test_sentiment'>Run Sentiment Test</a></p>"
+    status_info["health"] = health
     
-    return status_html
+    # Format a nice HTML response
+    html = f"""
+    <html>
+    <head>
+        <title>Speech Recognition Status</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            h1 {{ color: #333; }}
+            .status {{ padding: 10px; margin: 10px 0; border-radius: 5px; }}
+            .ok {{ background-color: #dff0d8; color: #3c763d; }}
+            .warning {{ background-color: #fcf8e3; color: #8a6d3b; }}
+            .critical {{ background-color: #f2dede; color: #a94442; }}
+            .offline {{ background-color: #f5f5f5; color: #777; }}
+            table {{ width: 100%; border-collapse: collapse; }}
+            th, td {{ padding: 8px; text-align: left; border-bottom: 1px solid #ddd; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .controls {{ margin-top: 20px; }}
+            button {{ padding: 8px 16px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }}
+            button:hover {{ background-color: #45a049; }}
+        </style>
+    </head>
+    <body>
+        <h1>Speech Recognition Status</h1>
+        
+        <div class="status {health.split(' ')[0].lower()}">
+            <strong>Status:</strong> {health}
+        </div>
+        
+        <h2>Current Configuration</h2>
+        <table>
+            <tr><th>Parameter</th><th>Value</th></tr>
+            <tr><td>Active</td><td>{status_info['active']}</td></tr>
+            <tr><td>VAD Enabled</td><td>{status_info['vad_enabled']}</td></tr>
+            <tr><td>Silence Threshold</td><td>{status_info['silence_threshold']}</td></tr>
+            <tr><td>Stream Age</td><td>{status_info['stream_age']}</td></tr>
+            <tr><td>Stream Max Age</td><td>{status_info['stream_max_age']}</td></tr>
+            <tr><td>Reconnect Count</td><td>{status_info['reconnect_count']}</td></tr>
+        </table>
+        
+        <h2>Runtime Metrics</h2>
+        <table>
+            <tr><th>Metric</th><th>Value</th></tr>
+            <tr><td>Time Since Last Response</td><td>{status_info['time_since_last_response']}</td></tr>
+            <tr><td>Time Since Last Audio</td><td>{status_info['time_since_last_audio']}</td></tr>
+            <tr><td>Current Silence Duration</td><td>{status_info['silence_duration']}</td></tr>
+        </table>
+        
+        <h2>Last Transcript</h2>
+        <div style="padding: 10px; background-color: #f5f5f5; border-radius: 5px;">
+            {status_info['last_transcript'] if status_info['last_transcript'] else "<i>No transcripts yet</i>"}
+        </div>
+        
+        <div class="controls">
+            <a href="/restart_speech"><button>Restart Speech Recognition</button></a>
+            <a href="/"><button style="background-color: #2196F3;">Back to Home</button></a>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
 
 @app.route('/restart_speech')
-def restart_speech_endpoint():
-    """
-    Endpoint to manually restart the speech recognition system
-    Useful when issues occur
-    """
+def restart_speech():
+    """Endpoint to manually restart speech recognition"""
+    
     if not GOOGLE_CLOUD_ENABLED:
-        return "Google Cloud services not enabled. Speech recognition unavailable."
+        return "Google Cloud services not enabled. Cannot restart speech recognition."
     
     try:
+        global streaming_recognizer, streaming_active
+        
         # Stop current recognizer if it exists
         if 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-            stop_streaming_recognition()
-            time.sleep(2)  # Allow time for cleanup
+            print("Stopping current streaming recognizer")
+            streaming_recognizer.stop()
+            time.sleep(1)  # Give it time to stop
         
         # Start a new recognizer
-        new_recognizer = start_streaming_recognition()
+        print("Starting new streaming recognizer")
+        streaming_active = True
+        start_streaming_recognition()
         
-        if new_recognizer:
-            return "Speech recognition system restarted successfully. <a href='/speech_status'>Check status</a>"
-        else:
-            return "Failed to restart speech recognition system."
+        return """
+        <html>
+        <head>
+            <meta http-equiv="refresh" content="2;url=/speech_status" />
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; text-align: center; }
+            </style>
+        </head>
+        <body>
+            <h1>Speech Recognition Restarted</h1>
+            <p>Redirecting to status page...</p>
+            <p><a href="/speech_status">Click here if not redirected</a></p>
+        </body>
+        </html>
+        """
     except Exception as e:
         import traceback
         error_trace = traceback.format_exc()
