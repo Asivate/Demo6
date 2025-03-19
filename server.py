@@ -178,13 +178,34 @@ def handle_source_features(json_data):
                     
                     # Original condition was too strict - many sounds were being classified as "Unrecognized"
                     if context_prediction[m] > PREDICTION_THRES:
+                        sound_label = str(homesounds.to_human_labels[active_context[m]])
                         socketio.emit('audio_label',
-                                   {'label': str(homesounds.to_human_labels[active_context[m]]),
+                                   {'label': sound_label,
                                     'accuracy': str(context_prediction[m]),
                                     'db': str(db)},
                                    room=request.sid)
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
+                            
+                        # Check if the detected sound is a fire/hazard alarm
+                        if sound_label == "Fire/Smoke Alarm" and float(context_prediction[m]) > 0.7:
+                            logger.info(f"Fire alarm detected with accuracy {context_prediction[m]}")
+                            
+                            # Send notification to all connected clients
+                            socketio.emit('alarm_notification', 
+                                        {'device_id': 'sound_detector', 
+                                        'message': 'Fire alarm sound detected! Notifying IoT devices.',
+                                        'timestamp': time.time()})
+                                        
+                            # Find all connected NodeMCU devices and send command
+                            for device_id, device_info in nodemcu_devices.items():
+                                if time.time() - device_info.get('last_update', 0) < 300:  # Consider devices active in last 5 minutes
+                                    # Send command to turn off the light bulb for all devices
+                                    socketio.emit('device_command', {
+                                        'device_id': device_id,
+                                        'command': 'turn_off_light'
+                                    })
+                                    logger.info(f"Sent turn_off_light command to device {device_id}")
                     else:
                         socketio.emit('audio_label',
                                     {
@@ -533,6 +554,143 @@ def clear_speech_buffer():
     with speech_processor_lock:
         speech_processor.clear_buffer()
     return jsonify({"status": "success", "message": "Speech buffer cleared"})
+
+# Add global variable to track device status
+nodemcu_devices = {}
+
+# NodeMCU IoT Device Routes
+@app.route('/api/buzzer_alert', methods=['POST'])
+def buzzer_alert():
+    """
+    Endpoint for NodeMCU to report buzzer activation (fire/alarm detection)
+    """
+    try:
+        data = request.json
+        device_id = data.get('device_id', 'unknown')
+        buzzer_status = data.get('buzzer_status', False)
+        battery_level = data.get('battery', 100)
+        
+        # Store device status
+        nodemcu_devices[device_id] = {
+            'buzzer_status': buzzer_status,
+            'battery': battery_level,
+            'last_update': time.time(),
+            'ip': request.remote_addr
+        }
+        
+        logger.info(f"Buzzer alert received from device {device_id}: {buzzer_status}")
+        
+        # If buzzer is active, automatically turn off the associated appliance (light bulb)
+        if buzzer_status:
+            # Send alert notification to all connected clients
+            socketio.emit('alarm_notification', 
+                          {'device_id': device_id, 
+                           'message': 'Fire alarm detected! Turning off connected appliance.',
+                           'timestamp': time.time()})
+            
+            # Send command to turn off the light bulb
+            return jsonify({
+                'status': 'success',
+                'message': 'Alert received, turning off appliance',
+                'command': 'turn_off_light'
+            })
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Status update received'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error processing buzzer alert: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/device_command', methods=['POST'])
+def device_command():
+    """
+    Endpoint to send commands to NodeMCU devices
+    """
+    try:
+        data = request.json
+        device_id = data.get('device_id')
+        command = data.get('command')
+        
+        if not device_id or device_id not in nodemcu_devices:
+            return jsonify({
+                'status': 'error',
+                'message': 'Device not found'
+            }), 404
+            
+        # Update device command status
+        nodemcu_devices[device_id]['last_command'] = command
+        nodemcu_devices[device_id]['command_time'] = time.time()
+        
+        logger.info(f"Command {command} sent to device {device_id}")
+        
+        return jsonify({
+            'status': 'success',
+            'message': f'Command {command} sent to device {device_id}'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error sending command to device: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        }), 400
+
+@app.route('/api/devices', methods=['GET'])
+def list_devices():
+    """
+    Return a list of connected NodeMCU devices and their status
+    """
+    return jsonify({
+        'status': 'success',
+        'devices': nodemcu_devices
+    })
+
+@app.route('/api/control/<device_id>/<command>', methods=['GET'])
+def manual_device_control(device_id, command):
+    """
+    Manually control a device via web interface
+    """
+    if device_id not in nodemcu_devices:
+        return jsonify({
+            'status': 'error',
+            'message': f'Device {device_id} not found'
+        }), 404
+        
+    if command not in ['turn_on_light', 'turn_off_light']:
+        return jsonify({
+            'status': 'error',
+            'message': f'Invalid command: {command}'
+        }), 400
+        
+    # Update device command status
+    nodemcu_devices[device_id]['last_command'] = command
+    nodemcu_devices[device_id]['command_time'] = time.time()
+    
+    # Emit the command via socket.io for immediate effect
+    socketio.emit('device_command', {
+        'device_id': device_id,
+        'command': command
+    })
+    
+    logger.info(f"Manual command {command} sent to device {device_id}")
+    
+    return jsonify({
+        'status': 'success',
+        'message': f'Command {command} sent to device {device_id}'
+    })
+
+@app.route('/iot-dashboard')
+def iot_dashboard():
+    """
+    Simple web dashboard to view and control IoT devices
+    """
+    return render_template('iot-dashboard.html', devices=nodemcu_devices)
 
 if __name__ == '__main__':
     # Start with speech recognition enabled
