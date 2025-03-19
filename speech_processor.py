@@ -146,8 +146,11 @@ class SpeechProcessor:
         
         while self._is_streaming:
             try:
-                # Start streaming recognition - explicitly name the 'requests' parameter
-                responses = self._speech_client.streaming_recognize(requests=request_generator())
+                # Start streaming recognition - provide both config and requests parameters
+                responses = self._speech_client.streaming_recognize(
+                    config=self._streaming_config,
+                    requests=request_generator()
+                )
                 
                 # Process streaming responses
                 for response in responses:
