@@ -26,6 +26,7 @@ from io import BytesIO
 import base64
 import re
 import sys
+import pyaudio
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -103,262 +104,219 @@ streaming_speech_thread = None
 streaming_active = True
 streaming_recognizer = None
 
-class StreamingRecognizer:
-    """Manages streaming speech recognition for continuous audio processing"""
+class SimpleStreamingRecognizer:
+    """Simple streaming speech recognition based on proven implementation"""
     
     def __init__(self):
         self.client = speech.SpeechClient()
+        self.config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            max_alternatives=1,
+            enable_automatic_punctuation=True,
+            use_enhanced=True,
+            model="default",
+            audio_channel_count=CHANNELS,
+        )
         self.streaming_config = speech.StreamingRecognitionConfig(
-            config=speech.RecognitionConfig(
-                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-                sample_rate_hertz=RATE,
-                language_code="en-US",
-                max_alternatives=1,
-                enable_automatic_punctuation=True,
-                use_enhanced=True,
-                model="default",
-                audio_channel_count=CHANNELS,
-            ),
+            config=self.config,
             interim_results=True,
         )
-        self.audio_generator = None
         self.audio_queue = queue.Queue()
         self.is_active = True
         self.last_transcript = ""
         self.last_response_time = time.time()
-        self.last_audio_time = time.time()
-        self.keep_alive_timer = None
-        self.empty_audio_chunk = np.zeros(int(RATE * 0.1), dtype=np.float32)  # 100ms of silence
-        
+        self.thread = None
+    
     def add_audio(self, audio_data):
         """Add audio data to the processing queue"""
         if self.is_active:
-            self.audio_queue.put(audio_data)
-            self.last_audio_time = time.time()
-            
+            # Convert float32 [-1.0, 1.0] to int16
+            int16_data = (audio_data * 32768).astype(np.int16)
+            self.audio_queue.put(int16_data.tobytes())
+    
     def stop(self):
         """Stop the streaming recognition"""
         self.is_active = False
-        if self.keep_alive_timer:
-            self.keep_alive_timer.cancel()
-        self.audio_queue.put(None)  # Signal to stop the generator
-        
-    def send_keep_alive(self):
-        """Send an empty audio chunk to keep the stream alive"""
-        if self.is_active:
-            # Only send keep-alive if we haven't received real audio in 2 seconds
-            now = time.time()
-            if now - self.last_audio_time > 2.0:
-                print("Sending keep-alive audio chunk to prevent timeout")
-                self.audio_queue.put(self.empty_audio_chunk)
-            
-            # Schedule the next keep-alive check
-            self.keep_alive_timer = threading.Timer(1.0, self.send_keep_alive)
-            self.keep_alive_timer.daemon = True
-            self.keep_alive_timer.start()
-        
-    def audio_generator_function(self):
-        """Generates audio chunks from the audio queue"""
-        # Start the keep-alive timer
-        self.send_keep_alive()
-        
+        self.audio_queue.put(None)  # Signal to stop
+    
+    def audio_generator(self):
+        """Generate audio chunks from the queue"""
         while self.is_active:
-            # Get audio data, waiting up to 100ms
-            try:
-                chunk = self.audio_queue.get(timeout=0.1)
-                if chunk is None:  # None is our signal to stop
+            chunk = self.audio_queue.get()
+            if chunk is None:
+                return
+            
+            data = [chunk]
+            
+            # Get any additional chunks that might be in the queue
+            while True:
+                try:
+                    chunk = self.audio_queue.get(block=False)
+                    if chunk is None:
+                        return
+                    data.append(chunk)
+                except queue.Empty:
                     break
-                    
-                # Convert to bytes
-                audio_chunk = chunk.astype(np.int16).tobytes()
-                yield speech.StreamingRecognizeRequest(audio_content=audio_chunk)
-            except queue.Empty:
-                # If no data, just continue
-                continue
-            except Exception as e:
-                print(f"Error in audio generator: {e}")
-                continue
-                
-    def process_streaming_responses(self, responses):
+            
+            yield b''.join(data)
+    
+    def process_responses(self, responses):
         """Process streaming responses from the API"""
         try:
             for response in responses:
                 if not self.is_active:
                     break
-                    
+                
                 if not response.results:
                     continue
+                
+                result = response.results[0]  # Get the first result
+                
+                if not result.alternatives:
+                    continue
+                
+                transcript = result.alternatives[0].transcript
+                confidence = result.alternatives[0].confidence if hasattr(result.alternatives[0], 'confidence') else 0.0
+                
+                if result.is_final:
+                    self.last_response_time = time.time()
+                    self.last_transcript = transcript
+                    print(f"Final transcript: '{transcript}' (confidence: {confidence})")
                     
-                # Multiple results might be present in the response
-                for result in response.results:
-                    if not result.alternatives:
+                    # Skip empty transcripts
+                    if not transcript.strip():
                         continue
-                        
-                    # Get the transcript
-                    transcript = result.alternatives[0].transcript
-                    confidence = result.alternatives[0].confidence
                     
-                    # Only process final results (not interim)
-                    if result.is_final:
-                        self.last_response_time = time.time()
-                        self.last_transcript = transcript
-                        print(f"Final transcript: '{transcript}' (confidence: {confidence})")
+                    # Process for sentiment analysis
+                    try:
+                        # Create document for sentiment analysis
+                        document = language_v1.Document(
+                            content=transcript,
+                            type_=language_v1.Document.Type.PLAIN_TEXT
+                        )
                         
-                        # Skip empty transcripts
-                        if not transcript.strip():
-                            continue
-                            
-                        # Process transcript for sentiment analysis
-                        try:
-                            # Create document for sentiment analysis
-                            document = language_v1.Document(
-                                content=transcript,
-                                type_=language_v1.Document.Type.PLAIN_TEXT
-                            )
-                            
-                            # Analyze sentiment
-                            sentiment_response = language_client.analyze_sentiment(document=document)
-                            sentiment = sentiment_response.document_sentiment
-                            
-                            # Map to emoji and emotion
-                            emoji = get_sentiment_emoji(sentiment.score)
-                            emotion = get_sentiment_emotion(sentiment.score)
-                            
-                            print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
-                            
-                            # Create timestamp
-                            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                            
-                            # Create transcript entry
-                            transcript_entry = {
-                                "transcription": transcript,
-                                "confidence": float(confidence),
-                                "emotion": emotion,
-                                "emoji": emoji,
-                                "sentiment_score": float(sentiment.score),
-                                "sentiment_magnitude": float(sentiment.magnitude),
-                                "timestamp": timestamp
-                            }
-                            
-                            # Send to all connected clients
-                            socketio.emit('audio_label', {
-                                'label': 'Speech',
-                                'accuracy': '1.0',
-                                'emoji': emoji,
-                                'emotion': emotion,
-                                'transcription': transcript,
-                                'confidence': confidence,
-                                'sentiment_score': sentiment.score,
-                                'sentiment_magnitude': sentiment.magnitude,
-                                'timestamp': timestamp
-                            })
-                            
-                            # Also emit transcript update event
-                            socketio.emit('transcript_update', transcript_entry)
-                            
-                        except Exception as e:
-                            print(f"Error processing sentiment for transcript: {e}")
-                            
-                    else:
-                        # Interim result
-                        print(f"Interim transcript: '{transcript}'")
+                        # Analyze sentiment
+                        sentiment_response = language_client.analyze_sentiment(document=document)
+                        sentiment = sentiment_response.document_sentiment
                         
+                        # Map to emoji and emotion
+                        emoji = get_sentiment_emoji(sentiment.score)
+                        emotion = get_sentiment_emotion(sentiment.score)
+                        
+                        print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
+                        
+                        # Create timestamp
+                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                        
+                        # Create transcript entry
+                        transcript_entry = {
+                            "transcription": transcript,
+                            "confidence": float(confidence),
+                            "emotion": emotion,
+                            "emoji": emoji,
+                            "sentiment_score": float(sentiment.score),
+                            "sentiment_magnitude": float(sentiment.magnitude),
+                            "timestamp": timestamp
+                        }
+                        
+                        # Send to all connected clients
+                        socketio.emit('audio_label', {
+                            'label': 'Speech',
+                            'accuracy': '1.0',
+                            'emoji': emoji,
+                            'emotion': emotion,
+                            'transcription': transcript,
+                            'confidence': confidence,
+                            'sentiment_score': sentiment.score,
+                            'sentiment_magnitude': sentiment.magnitude,
+                            'timestamp': timestamp
+                        })
+                        
+                        # Also emit transcript update event
+                        socketio.emit('transcript_update', transcript_entry)
+                        
+                    except Exception as e:
+                        print(f"Error processing sentiment for transcript: {e}")
+                else:
+                    # Interim result
+                    print(f"Interim transcript: '{transcript}'")
+                    
         except Exception as e:
             print(f"Error processing streaming responses: {e}")
-                
-    def start_streaming(self):
-        """Start streaming recognition in a loop"""
+            import traceback
+            traceback.print_exc()
+    
+    def run(self):
+        """Run the streaming recognition in a continuous loop"""
         retry_count = 0
-        max_retries = 10  # Increased from 5 to 10
-        restart_interval = 180  # 3 minutes - restart the stream periodically to avoid issues
+        max_retries = 10
         
         while self.is_active and retry_count < max_retries:
             try:
-                stream_start_time = time.time()
                 print("Starting streaming recognition session")
-                streaming_recognize = self.client.streaming_recognize(
-                    config=self.streaming_config,
-                    requests=self.audio_generator_function()
+                
+                # Create the generator for audio chunks
+                audio_generator = self.audio_generator()
+                
+                # Create streaming recognize requests
+                requests = (
+                    speech.StreamingRecognizeRequest(audio_content=content)
+                    for content in audio_generator
                 )
                 
+                # Start streaming recognition
+                responses = self.client.streaming_recognize(self.streaming_config, requests)
+                
                 # Process responses
-                self.process_streaming_responses(streaming_recognize)
+                self.process_responses(responses)
                 
                 # If we get here, the stream ended naturally
-                stream_duration = time.time() - stream_start_time
-                print(f"Streaming recognition session ended after {stream_duration:.1f} seconds")
+                print("Streaming recognition session ended normally")
+                retry_count = 0
                 
-                # If the stream ended normally and ran for a significant time, reset retry count
-                if stream_duration > 30:
-                    retry_count = 0
-                else:
-                    # If the stream ended quickly, count as a retry
-                    retry_count += 1
-                    print(f"Stream ended quickly (retry {retry_count}/{max_retries})")
-                
-                # Check if we need to restart due to timeout
-                if stream_duration >= restart_interval:
-                    print(f"Stream ran for {stream_duration:.1f} seconds, restarting for freshness")
-                    time.sleep(1)  # Brief pause before restart
-                else:
-                    # If it ended quickly, wait longer before retry to avoid rapid cycling
-                    wait_time = min(5 * retry_count, 30)  # Progressive backoff, max 30 seconds
-                    print(f"Waiting {wait_time} seconds before restarting stream")
-                    time.sleep(wait_time)
-                    
             except Exception as e:
                 retry_count += 1
                 print(f"Streaming recognition error (retry {retry_count}/{max_retries}): {e}")
-                if self.keep_alive_timer:
-                    self.keep_alive_timer.cancel()
-                
-                # Detailed error handling to help diagnose issues
                 import traceback
                 traceback.print_exc()
                 
-                # Check for specific error types and provide more context
-                error_str = str(e).lower()
-                if "timeout" in error_str:
-                    print("Error appears to be a timeout. Check network connectivity and API quotas.")
-                elif "unauthenticated" in error_str or "permission" in error_str:
-                    print("Error may be related to authentication. Check Google Cloud credentials.")
-                elif "not found" in error_str:
-                    print("API endpoint not found. Check if the Speech-to-Text API is enabled in your Google Cloud project.")
-                
-                # Progressive backoff on retries
-                wait_time = min(5 * retry_count, 60)  # Progressive backoff, max 60 seconds
-                print(f"Waiting {wait_time} seconds before retry attempt")
+                # Implement progressive backoff
+                wait_time = min(5 * retry_count, 30)
+                print(f"Waiting {wait_time} seconds before retry...")
                 time.sleep(wait_time)
                 
-        if self.keep_alive_timer:
-            self.keep_alive_timer.cancel()
-        
-        if retry_count >= max_retries:
-            print(f"Exceeded maximum number of retries ({max_retries}). Stopping streaming recognition.")
-        
         print("Streaming recognition stopped")
+    
+    def start(self):
+        """Start the streaming recognition in a background thread"""
+        self.thread = threading.Thread(target=self.run)
+        self.thread.daemon = True
+        self.thread.start()
+        return self.thread
 
 def start_streaming_recognition():
-    """Start the streaming recognition thread"""
+    """Start the streaming recognition thread using the simplified implementation"""
     global streaming_recognizer, streaming_active
     
     if not GOOGLE_CLOUD_ENABLED:
         print("Google Cloud services not enabled. Cannot start streaming recognition.")
         return
-        
+    
     streaming_active = True
-    streaming_recognizer = StreamingRecognizer()
+    
+    # Use the simpler streaming recognizer implementation
+    streaming_recognizer = SimpleStreamingRecognizer()
     
     # Print information about the environment
-    print("Starting streaming recognition with the following settings:")
+    print("Starting streaming speech recognition with the following settings:")
     print(f"- Sample rate: {RATE} Hz")
     print(f"- Channels: {CHANNELS}")
     print(f"- Google credentials: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'Not set')}")
     
     # Start in a background thread
-    thread = threading.Thread(target=streaming_recognizer.start_streaming)
-    thread.daemon = True
-    thread.start()
+    streaming_recognizer.start()
     
     print("Streaming recognition thread started")
     return streaming_recognizer
@@ -569,34 +527,19 @@ def handle_source(json_data):
     # Compute RMS and convert to dB
     rms = np.sqrt(np.mean(np_wav**2))
     db = dbFS(rms)
+    
+    # Log basic audio metrics
     print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
     
-    # Process for streaming speech recognition
+    # Process for speech recognition
     if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-        # Assess and process audio for better recognition
-        is_suitable, reason, processed_audio = assess_audio_quality(np_wav)
-        
-        if is_suitable:
-            # Send the processed audio to the streaming recognizer
-            streaming_recognizer.add_audio(processed_audio)
-        else:
-            print(f"Skipping audio for speech recognition: {reason}")
+        # Send audio to the streaming recognizer
+        # No need for extensive preprocessing now, our recognizer handles conversion
+        streaming_recognizer.add_audio(np_wav)
     
     # Skip sound classification processing if the audio is silent (very low RMS)
     if rms < SILENCE_RMS_THRESHOLD:
-        print(f"Detected silent audio frame (RMS: {rms}, dB: {db:.1f}). Skipping classification.")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Silent',
-                        'accuracy': '1.0',
-                        'db': str(db)
-                    },
-                    room=request.sid)
-        return
-    
-    # Additional check for near-zero audio frames that might not be caught by RMS threshold
-    if np_wav.max() == 0.0 and np_wav.min() == 0.0:
-        print(f"Detected empty audio frame with all zeros. Skipping classification.")
+        print(f"Detected silent audio frame. Skipping classification.")
         socketio.emit('audio_label',
                     {
                         'label': 'Silent',
@@ -614,54 +557,53 @@ def handle_source(json_data):
         np_wav = np.concatenate((np_wav, padding))
         print(f"Padded audio to {len(np_wav)} samples")
     
-    # Make predictions
-    print('Making sound classification prediction...')
-    x = waveform_to_examples(np_wav, RATE)
-    print(f'Generated features: shape={x.shape}')
-    
-    # Handle multiple frames - take the first frame if multiple are generated
-    if x.shape[0] > 1:
-        print(f"Multiple frames detected ({x.shape[0]}), using first frame")
-        x = x[0:1]
-    
-    # Check if x is empty (shape[0] == 0)
-    if x.shape[0] == 0:
-        print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
-        # Create dummy features for testing - one frame of the right dimensions
-        x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
-    
-    # Add the channel dimension required by the model
-    x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-    
-    predictions = []
+    # Sound classification processing
     try:
+        # Make predictions
+        print('Making sound classification prediction...')
+        x = waveform_to_examples(np_wav, RATE)
+        
+        # Handle multiple frames - take the first frame if multiple are generated
+        if x.shape[0] > 1:
+            print(f"Multiple frames detected ({x.shape[0]}), using first frame")
+            x = x[0:1]
+        
+        # Check if x is empty (shape[0] == 0)
+        if x.shape[0] == 0:
+            print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
+            # Create dummy features for testing - one frame of the right dimensions
+            x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
+        
+        # Add the channel dimension required by the model
+        x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+        
         # Use the global session and graph context to run predictions
         with sess.as_default():
             with graph.as_default():
                 pred = model.predict(x)
-                predictions.append(pred)
-            
-                for prediction in predictions:
-                    context_prediction = np.take(
-                        prediction[0], [homesounds.labels[x] for x in active_context])
-                    m = np.argmax(context_prediction)
-                    print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
-                    
-                    # Original condition was too strict - many sounds were being classified as "Unrecognized"
-                    if context_prediction[m] > PREDICTION_THRES:
-                        socketio.emit('audio_label',
-                                    {'label': str(homesounds.to_human_labels[active_context[m]]),
-                                     'accuracy': str(context_prediction[m]),
-                                     'db': str(db)},
-                                    room=request.sid)
-                    else:
-                        socketio.emit('audio_label',
-                                    {
-                                        'label': 'Unrecognized Sound',
-                                        'accuracy': '1.0',
-                                        'db': str(db)
-                                    },
-                                    room=request.sid)
+                
+                context_prediction = np.take(
+                    pred[0], [homesounds.labels[x] for x in active_context])
+                m = np.argmax(context_prediction)
+                print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
+                
+                # If confidence is high enough, send the label
+                if context_prediction[m] > PREDICTION_THRES:
+                    socketio.emit('audio_label',
+                                {
+                                    'label': str(homesounds.to_human_labels[active_context[m]]),
+                                    'accuracy': str(context_prediction[m]),
+                                    'db': str(db)
+                                },
+                                room=request.sid)
+                else:
+                    socketio.emit('audio_label',
+                                {
+                                    'label': 'Unrecognized Sound',
+                                    'accuracy': '1.0',
+                                    'db': str(db)
+                                },
+                                room=request.sid)
     except Exception as e:
         print(f"Error during prediction: {e}")
         socketio.emit('audio_label',
@@ -1041,6 +983,159 @@ def test_speech():
         error_trace = traceback.format_exc()
         return f"Error testing speech recognition: {str(e)}<br><pre>{error_trace}</pre>"
 
+@app.route('/test_direct_mic')
+def test_direct_mic():
+    """
+    Test endpoint that launches a direct microphone stream for testing
+    This mimics the user's working example directly for maximum compatibility
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Cannot test speech recognition."
+    
+    # Run the test in a separate thread
+    thread = threading.Thread(target=run_direct_mic_test)
+    thread.daemon = True
+    thread.start()
+    
+    return """
+    <h1>Direct Microphone Test Started</h1>
+    <p>A direct microphone test has been started on the server. This test bypasses the regular streaming pipeline
+    and directly connects to the microphone like the user's working example.</p>
+    <p>Check the server logs for transcription results. This test will run for 30 seconds.</p>
+    <p><a href="/speech_status">Check Speech Recognition Status</a></p>
+    """
+
+def run_direct_mic_test():
+    """Run a direct microphone test using the approach from the user's working example"""
+    try:
+        print("Starting direct microphone test - this mimics the user's working example")
+        
+        # Create speech client
+        client = speech.SpeechClient()
+        
+        # Configure recognition
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            use_enhanced=True,
+            model="default",
+            audio_channel_count=CHANNELS,
+        )
+        
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True,
+        )
+        
+        # Create microphone stream class (similar to user's example)
+        class DirectMicrophoneStream:
+            """Opens a recording stream as a generator yielding the audio chunks."""
+            def __init__(self, rate, chunk):
+                self._rate = rate
+                self._chunk = chunk
+                self._buff = queue.Queue()
+                self.closed = True
+
+            def __enter__(self):
+                self._audio_interface = pyaudio.PyAudio()
+                self._audio_stream = self._audio_interface.open(
+                    format=pyaudio.paInt16,
+                    channels=CHANNELS,
+                    rate=self._rate,
+                    input=True,
+                    frames_per_buffer=self._chunk,
+                    stream_callback=self._fill_buffer,
+                )
+                self.closed = False
+                return self
+
+            def __exit__(self, type, value, traceback):
+                self._audio_stream.stop_stream()
+                self._audio_stream.close()
+                self.closed = True
+                self._buff.put(None)
+                self._audio_interface.terminate()
+
+            def _fill_buffer(self, in_data, frame_count, time_info, status_flags):
+                """Continuously collect data from the audio stream into the buffer."""
+                self._buff.put(in_data)
+                return None, pyaudio.paContinue
+
+            def generator(self):
+                while not self.closed:
+                    chunk = self._buff.get()
+                    if chunk is None:
+                        return
+                    data = [chunk]
+
+                    # Now consume whatever other data's still buffered.
+                    while True:
+                        try:
+                            chunk = self._buff.get(block=False)
+                            if chunk is None:
+                                return
+                            data.append(chunk)
+                        except queue.Empty:
+                            break
+
+                    yield b''.join(data)
+        
+        # Simple response handler
+        def handle_responses(responses):
+            for response in responses:
+                if not response.results:
+                    continue
+                
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+                
+                transcript = result.alternatives[0].transcript
+                
+                if result.is_final:
+                    print(f"DIRECT TEST - Final transcript: '{transcript}'")
+                else:
+                    print(f"DIRECT TEST - Interim transcript: '{transcript}'")
+        
+        # Start direct mic stream test
+        print("DIRECT TEST - Opening microphone stream")
+        with DirectMicrophoneStream(RATE, CHUNK) as stream:
+            audio_generator = stream.generator()
+            
+            # Create streaming recognize requests
+            requests = (
+                speech.StreamingRecognizeRequest(audio_content=content)
+                for content in audio_generator
+            )
+            
+            # Start streaming recognition
+            print("DIRECT TEST - Starting streaming recognition")
+            responses = client.streaming_recognize(streaming_config, requests)
+            
+            # Set up timeout - run for 30 seconds maximum
+            def stop_after(stream_obj, seconds):
+                print(f"DIRECT TEST - Will run for {seconds} seconds")
+                time.sleep(seconds)
+                print("DIRECT TEST - Stopping stream now")
+                stream_obj.closed = True
+            
+            # Start timeout thread
+            timeout_thread = threading.Thread(target=stop_after, args=(stream, 30))
+            timeout_thread.daemon = True
+            timeout_thread.start()
+            
+            # Process responses
+            handle_responses(responses)
+            
+        print("DIRECT TEST - Test completed")
+        
+    except Exception as e:
+        print(f"DIRECT TEST - Error during test: {e}")
+        import traceback
+        traceback.print_exc()
+
 @app.route('/')
 def index():
     return render_template('index.html',)
@@ -1142,6 +1237,142 @@ def restart_speech_endpoint():
         import traceback
         error_trace = traceback.format_exc()
         return f"Error restarting speech recognition: {str(e)}<br><pre>{error_trace}</pre>"
+
+@app.route('/test_fixed_audio')
+def test_fixed_audio():
+    """
+    Test speech recognition with a fixed audio sample
+    This helps verify if the Google Speech API is working correctly
+    """
+    if not GOOGLE_CLOUD_ENABLED:
+        return "Google Cloud services not enabled. Cannot test speech recognition."
+    
+    try:
+        # Run the test in a separate thread
+        thread = threading.Thread(target=run_fixed_audio_test)
+        thread.daemon = True
+        thread.start()
+        
+        return """
+        <h1>Fixed Audio Test Started</h1>
+        <p>A test using a generated speech sample has been started.</p>
+        <p>This test will send a simple sine wave audio sample to the Google Speech API 
+        to verify if the API connection and authentication are working properly.</p>
+        <p>Check the server logs for results.</p>
+        <p><a href="/speech_status">Check Speech Recognition Status</a></p>
+        """
+    except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
+        return f"Error starting fixed audio test: {str(e)}<br><pre>{error_trace}</pre>"
+
+def run_fixed_audio_test():
+    """
+    Run a test with fixed audio data to verify API functionality
+    This uses a simple generated tone that should be recognized as speech
+    """
+    try:
+        print("Starting fixed audio sample test")
+        
+        # Create speech client
+        client = speech.SpeechClient()
+        
+        # Configure recognition
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            enable_automatic_punctuation=True,
+            model="default",
+            audio_channel_count=1,
+        )
+        
+        # Generate a simple audio sample (sine wave)
+        duration_seconds = 3
+        sample_count = int(RATE * duration_seconds)
+        
+        # Create a sine wave with varying frequency to simulate speech
+        t = np.linspace(0, duration_seconds, sample_count, False)
+        
+        # Create syllable-like pattern (basic speech simulation)
+        # Start with 200Hz base frequency
+        frequencies = 200 + 100 * np.sin(2 * np.pi * 2 * t)  # Vary between ~100-300Hz
+        
+        # Generate sine wave with varying frequency
+        audio_data = 0.5 * np.sin(2 * np.pi * frequencies * t)
+        
+        # Apply amplitude modulation to simulate syllables
+        syllable_rate = 4  # 4 syllables per second
+        amplitude_mod = 0.5 + 0.5 * np.sin(2 * np.pi * syllable_rate * t)
+        audio_data = audio_data * amplitude_mod
+        
+        # Convert to int16
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        
+        # Convert to bytes
+        audio_bytes = audio_int16.tobytes()
+        
+        print(f"FIXED TEST - Created {duration_seconds}s test audio sample")
+        
+        # Create audio content
+        audio = speech.RecognitionAudio(content=audio_bytes)
+        
+        # Send synchronous request
+        print("FIXED TEST - Sending synchronous recognition request")
+        response = client.recognize(config=config, audio=audio)
+        
+        # Process response
+        if response.results:
+            for result in response.results:
+                for alternative in result.alternatives:
+                    print(f"FIXED TEST - Transcript: '{alternative.transcript}'")
+                    print(f"FIXED TEST - Confidence: {alternative.confidence}")
+            print("FIXED TEST - Successfully received transcription from API")
+        else:
+            print("FIXED TEST - No transcription results returned from API")
+            
+        # Try streaming recognition as well
+        print("FIXED TEST - Now testing streaming recognition")
+        
+        # Configure streaming recognition
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=config,
+            interim_results=True,
+        )
+        
+        # Split audio into chunks to simulate streaming
+        chunk_duration_ms = 100  # 100ms chunks
+        samples_per_chunk = int(RATE * chunk_duration_ms / 1000)
+        chunks = [audio_int16[i:i+samples_per_chunk] for i in range(0, len(audio_int16), samples_per_chunk)]
+        
+        # Create generator for chunks
+        def audio_chunk_generator():
+            for chunk in chunks:
+                yield speech.StreamingRecognizeRequest(audio_content=chunk.tobytes())
+        
+        # Start streaming recognition
+        print(f"FIXED TEST - Sending {len(chunks)} streaming chunks")
+        streaming_responses = client.streaming_recognize(streaming_config, audio_chunk_generator())
+        
+        # Process streaming responses
+        any_results = False
+        for response in streaming_responses:
+            if response.results:
+                any_results = True
+                for result in response.results:
+                    for alternative in result.alternatives:
+                        result_type = "Final" if result.is_final else "Interim"
+                        print(f"FIXED TEST - {result_type} transcript: '{alternative.transcript}'")
+        
+        if not any_results:
+            print("FIXED TEST - No streaming transcription results returned from API")
+        
+        print("FIXED TEST - Test completed")
+        
+    except Exception as e:
+        print(f"FIXED TEST - Error during test: {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == '__main__':
     import argparse
