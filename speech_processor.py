@@ -146,9 +146,9 @@ class SpeechProcessor:
         
         while self._is_streaming:
             try:
-                # Start streaming recognition - provide both config and requests parameters
+                # Start streaming recognition - only pass the requests parameter
+                # Since the first request in the generator already includes the streaming_config
                 responses = self._speech_client.streaming_recognize(
-                    config=self._streaming_config,
                     requests=request_generator()
                 )
                 
