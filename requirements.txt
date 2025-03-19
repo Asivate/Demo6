@@ -23,4 +23,7 @@ torchlibrosa==0.0.9
 panns-inference==0.1.1
 scikit-learn==0.24.2
 google-cloud-speech==2.9.3
-google-cloud-language==2.4.3 
+google-cloud-language==2.4.3
+keras==2.3.1
+tensorflow==1.15.5
+google-api-core==2.7.0 
