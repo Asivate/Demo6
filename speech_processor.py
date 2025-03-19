@@ -147,7 +147,9 @@ class SpeechProcessor:
         while self._is_streaming:
             try:
                 # Start streaming recognition
-                responses = self._speech_client.streaming_recognize(request_generator())
+                responses = self._speech_client.streaming_recognize(
+                    requests=request_generator()
+                )
                 
                 # Process streaming responses
                 for response in responses:

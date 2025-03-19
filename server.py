@@ -25,6 +25,13 @@ from speech_processor import SpeechProcessor, categorize_sentiment
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
+# Configure logging
+logger = logging.getLogger('soundwatch_server')
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
+
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
 # the best option based on installed packages.
