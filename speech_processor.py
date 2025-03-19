@@ -130,19 +130,19 @@ class SpeechProcessor:
             try:
                 # Create an explicit generator
                 def generate_requests():
-                    # First request must be config only
-                    first_request = speech.StreamingRecognizeRequest()
-                    first_request.streaming_config.CopyFrom(self._streaming_config)
-                    yield first_request
+                    # First request must be config only - directly set streaming_config in version 2.8.0
+                    yield speech.StreamingRecognizeRequest(
+                        streaming_config=self._streaming_config
+                    )
                     
                     # Subsequent requests are audio data only
                     while self._is_streaming:
                         try:
                             chunk = self._audio_queue.get(block=True, timeout=0.5)
                             if chunk:
-                                request = speech.StreamingRecognizeRequest()
-                                request.audio_content = chunk
-                                yield request
+                                yield speech.StreamingRecognizeRequest(
+                                    audio_content=chunk
+                                )
                         except queue.Empty:
                             continue
                         except Exception as e:
@@ -150,9 +150,8 @@ class SpeechProcessor:
                             break
                 
                 # For google-cloud-speech 2.8.0, we need to pass config explicitly
-                # The requests param is a generator, and config should be the StreamingRecognitionConfig
+                # But the config is already being sent in the first request of the generator
                 responses = self._speech_client.streaming_recognize(
-                    config=self._streaming_config,
                     requests=generate_requests()
                 )
                 
