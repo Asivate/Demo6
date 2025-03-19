@@ -26,4 +26,6 @@ google-cloud-speech==2.9.3
 google-cloud-language==2.4.3
 keras==2.3.1
 tensorflow==1.15.5
-google-api-core==2.7.0 
+google-api-core==2.7.0
+wget==3.2
+pathlib==1.0.1 
