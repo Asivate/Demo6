@@ -322,34 +322,37 @@ def process_audio_for_speech_recognition(audio_data, sid):
         sid: Socket ID of the client
     """
     try:
-        # Add the audio data to the speech processor
-        speech_processor.add_audio_data(audio_data)
+        # Convert numpy array to bytes
+        audio_bytes = audio_data.tobytes()
+        
+        # Add the audio data to the speech processor with thread safety
+        with speech_processor_lock:
+            speech_processor.add_audio_data(audio_bytes)
         
         # Get the latest results from the speech processor
         results = speech_processor.get_latest_results()
         
-        # Only emit results if we have a transcript
-        if results["transcript"]:
-            # Get a human-readable sentiment category
-            sentiment_score = results["sentiment"]["score"]
-            sentiment_magnitude = results["sentiment"]["magnitude"]
-            sentiment_category = categorize_sentiment(sentiment_score, sentiment_magnitude)
+        # Only emit results if we have results
+        if results and len(results) > 0:
+            # Get the most recent result
+            latest_result = results[-1]
             
             # Send the transcript and sentiment analysis to the client
             socketio.emit('speech_transcript',
                         {
-                            'transcript': results["transcript"],
-                            'language': results["language"],
-                            'sentiment_score': str(sentiment_score),
-                            'sentiment_magnitude': str(sentiment_magnitude),
-                            'sentiment_category': sentiment_category
+                            'transcript': latest_result['transcript'],
+                            'language': latest_result['language'],
+                            'sentiment_score': str(latest_result['sentiment_score']),
+                            'sentiment_magnitude': str(latest_result['sentiment_magnitude']),
+                            'sentiment_category': latest_result['sentiment_category']
                         },
                         room=sid)
             
-            print(f"Speech transcript: {results['transcript']}")
-            print(f"Sentiment: {sentiment_category} (score: {sentiment_score}, magnitude: {sentiment_magnitude})")
+            print(f"Speech transcript: {latest_result['transcript']}")
+            print(f"Sentiment: {latest_result['sentiment_category']} (score: {latest_result['sentiment_score']}, magnitude: {latest_result['sentiment_magnitude']})")
     except Exception as e:
         print(f"Error processing audio for speech recognition: {e}")
+        logger.error(f"Speech recognition error: {e}", exc_info=True)
 
 
 def background_thread():

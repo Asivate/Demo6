@@ -126,33 +126,33 @@ class SpeechProcessor:
     def _stream_recognition_thread(self):
         """Thread function for streaming recognition."""
         
-        def request_generator():
-            # First request contains the configuration
-            yield speech.StreamingRecognizeRequest(streaming_config=self._streaming_config)
-            
-            # Subsequent requests contain audio data
-            while self._is_streaming:
-                try:
-                    # Get audio data from the queue with a timeout
-                    chunk = self._audio_queue.get(block=True, timeout=0.5)
-                    if chunk:
-                        yield speech.StreamingRecognizeRequest(audio_content=chunk)
-                except queue.Empty:
-                    # No audio data available, continue
-                    continue
-                except Exception as e:
-                    logger.error(f"Error in request generator: {e}")
-                    break
-        
         while self._is_streaming:
             try:
-                # Start streaming recognition - only pass the requests parameter
-                # Since the first request in the generator already includes the streaming_config
-                responses = self._speech_client.streaming_recognize(
-                    requests=request_generator()
-                )
+                # Create an explicit generator
+                def generate_requests():
+                    # First request must be config only
+                    first_request = speech.StreamingRecognizeRequest()
+                    first_request.streaming_config.CopyFrom(self._streaming_config)
+                    yield first_request
+                    
+                    # Subsequent requests are audio data only
+                    while self._is_streaming:
+                        try:
+                            chunk = self._audio_queue.get(block=True, timeout=0.5)
+                            if chunk:
+                                request = speech.StreamingRecognizeRequest()
+                                request.audio_content = chunk
+                                yield request
+                        except queue.Empty:
+                            continue
+                        except Exception as e:
+                            logger.error(f"Error in request generator: {e}")
+                            break
                 
-                # Process streaming responses
+                # Call the API with the generated requests
+                responses = self._speech_client.streaming_recognize(requests=generate_requests())
+                
+                # Process responses
                 for response in responses:
                     if not self._is_streaming:
                         break
