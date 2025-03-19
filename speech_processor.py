@@ -128,31 +128,31 @@ class SpeechProcessor:
         
         while self._is_streaming:
             try:
-                # Create an explicit generator
-                def generate_requests():
-                    # First request must be config only - directly set streaming_config in version 2.8.0
-                    yield speech.StreamingRecognizeRequest(
-                        streaming_config=self._streaming_config
-                    )
-                    
-                    # Subsequent requests are audio data only
+                # Create a generator for audio content only
+                def audio_generator():
                     while self._is_streaming:
                         try:
                             chunk = self._audio_queue.get(block=True, timeout=0.5)
                             if chunk:
-                                yield speech.StreamingRecognizeRequest(
-                                    audio_content=chunk
-                                )
+                                yield chunk
                         except queue.Empty:
                             continue
                         except Exception as e:
-                            logger.error(f"Error in request generator: {e}")
+                            logger.error(f"Error in audio generator: {e}")
                             break
                 
-                # For google-cloud-speech 2.8.0, we need to pass config explicitly
-                # But the config is already being sent in the first request of the generator
+                # Create streaming recognize requests - ONLY containing audio content
+                # Do NOT include config here - that's passed separately
+                requests = (
+                    speech.StreamingRecognizeRequest(audio_content=content)
+                    for content in audio_generator()
+                )
+                
+                # This is the correct pattern for google-cloud-speech 2.8.0
+                # Pass streaming_config as a separate parameter
                 responses = self._speech_client.streaming_recognize(
-                    requests=generate_requests()
+                    config=self._streaming_config,
+                    requests=requests
                 )
                 
                 # Process responses
