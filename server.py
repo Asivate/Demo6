@@ -275,6 +275,90 @@ def handle_source(json_data):
         logger.exception(e)
         return {'status': 'error', 'message': str(e)}
 
+def process_audio(audio_data):
+    """Process audio data to make sound predictions
+    
+    Args:
+        audio_data: List of audio samples (int values)
+        
+    Returns:
+        Dictionary with prediction results including label, accuracy, and db level
+    """
+    global graph, model, sess
+    try:
+        # Convert to numpy array and normalize to [-1.0, +1.0]
+        np_wav = np.array(audio_data, dtype=np.int16) / 32768.0
+        
+        # Compute RMS and convert to dB
+        rms = np.sqrt(np.mean(np_wav**2))
+        db = dbFS(rms)
+        
+        # Ensure we have enough audio data for feature extraction
+        if len(np_wav) < 16000:  # Less than 1 second at 16kHz
+            logger.warning(f"Audio length {len(np_wav)} is less than 1 second (16000 samples), padding...")
+            # Pad with zeros to reach 1 second if needed
+            padding = np.zeros(16000 - len(np_wav))
+            np_wav = np.concatenate((np_wav, padding))
+            logger.info(f"Padded audio to {len(np_wav)} samples")
+        
+        # Make predictions - convert raw audio to spectrograms
+        x = waveform_to_examples(np_wav, RATE)
+        
+        # Check if features were successfully extracted
+        if x.shape[0] == 0:
+            logger.warning("Feature extraction produced empty array, using dummy features")
+            # Create dummy features for low-energy audio
+            x = np.zeros((1, 96, 64))
+        
+        # Add the channel dimension required by the model
+        x = x.reshape(x.shape[0], 96, 64, 1)
+        logger.debug(f'Reshaped features to {x.shape}')
+        
+        predictions = []
+        
+        # Use the global session and graph context to run predictions
+        with sess.as_default():
+            with graph.as_default():
+                pred = model.predict(x)
+                predictions.append(pred)
+                
+                for prediction in predictions:
+                    context_prediction = np.take(
+                        prediction[0], [homesounds.labels[x] for x in active_context])
+                    m = np.argmax(context_prediction)
+                    logger.debug(f"Max prediction: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]})")
+                    
+                    # Check if prediction meets threshold
+                    if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
+                        logger.info(f"Prediction: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.2f})")
+                        
+                        return {
+                            'label': str(homesounds.to_human_labels[active_context[m]]),
+                            'accuracy': str(context_prediction[m]),
+                            'db': str(db)
+                        }
+                    else:
+                        if context_prediction[m] <= PREDICTION_THRES:
+                            logger.info(f"Prediction below confidence threshold: {context_prediction[m]:.2f} < {PREDICTION_THRES}")
+                        if db <= DBLEVEL_THRES:
+                            logger.info(f"Audio level below threshold: {db} < {DBLEVEL_THRES}")
+                        
+                        return {
+                            'label': 'Unrecognized Sound',
+                            'accuracy': '1.0',
+                            'db': str(db)
+                        }
+                    
+    except Exception as e:
+        logger.error(f"Error in process_audio: {str(e)}")
+        logger.exception(e)
+        
+        return {
+            'label': 'Processing Error',
+            'accuracy': '0.0',
+            'error': str(e),
+            'db': '-60.0'
+        }
 
 def background_thread():
     """Example of how to send server generated events to clients."""
@@ -353,7 +437,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8080, help='Port to bind to')
     args = parser.parse_args()
-
+    
     # Configure logging
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
