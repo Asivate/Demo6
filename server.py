@@ -227,170 +227,53 @@ def handle_source_features(json_data):
 
 @socketio.on('audio_data')
 def handle_source(json_data):
-    global graph, model, sess
-    
+    """Process audio data received from clients"""
     try:
-        print(f"Received audio_data event: {type(json_data)}")
-        
-        # Directly access the list/array from the JSON data
-        audio_list = json_data['data']
-        
-        # Check if data is empty
-        if not audio_list:
-            print("Received empty audio data list. Skipping.")
-            socketio.emit('audio_label',
-                        {
-                            'label': 'Empty Data',
-                            'accuracy': '1.0',
-                            'db': '-60.0'
-                        },
-                        room=request.sid)
-            return {"status": "error", "message": "Empty audio data"}
+        if not json_data or 'data' not in json_data:
+            logger.warning("Received empty or invalid audio data")
+            return {'status': 'error', 'message': 'Invalid audio data format'}
 
-        # Convert the list of shorts/integers to a NumPy array of float32
-        np_wav = np.array(audio_list, dtype=np.float32) / 32768.0 # Convert to [-1.0, +1.0]
+        logger.debug("Received audio data for processing")
+        audio_data = json_data.get('data', [])
         
-        print(f'Successfully converted JSON list to NP array. Shape: {np_wav.shape}')
+        # If empty array received, emit a message and return
+        if not audio_data or len(audio_data) == 0:
+            logger.warning("Received empty audio data array")
+            emit('audio_label', {
+                'label': 'Empty Audio',
+                'accuracy': '0.0',
+                'db': '0.0'
+            })
+            return {'status': 'warning', 'message': 'Empty audio data received'}
 
-        # Compute RMS and convert to dB
-        rms = np.sqrt(np.mean(np_wav**2))
-        db = dbFS(rms)
-        print(f'Db: {db:.2f}, RMS: {rms:.4f}')
+        # Extract record time if present (for latency measurement)
+        record_time = json_data.get('record_time', 0)
         
-        # Add record_time from JSON data if present (for latency testing)
-        record_time = None
-        if 'record_time' in json_data:
-            record_time = json_data['record_time']
-            print(f'Record time: {record_time}')
+        # Log the size of the received audio data
+        logger.info(f"Processing audio data with {len(audio_data)} samples")
         
-        # Skip processing if the audio is silent (very low RMS)
-        if rms < SILENCE_RMS_THRESHOLD:
-            print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
-            socketio.emit('audio_label',
-                        {
-                            'label': 'Silent',
-                            'accuracy': '1.0',
-                            'db': str(db),
-                            'record_time': record_time
-                        },
-                        room=request.sid)
-            return {"status": "success", "message": "Silent audio detected"}
+        # Process audio data to make predictions
+        result = process_audio(audio_data)
         
-        # Additional check for near-zero audio frames that might not be caught by RMS threshold
-        if np_wav.max() == 0.0 and np_wav.min() == 0.0:
-            print(f"Detected empty audio frame with all zeros. Skipping processing.")
-            socketio.emit('audio_label',
-                        {
-                            'label': 'Silent',
-                            'accuracy': '1.0',
-                            'db': str(db),
-                            'record_time': record_time
-                        },
-                        room=request.sid)
-            return {"status": "success", "message": "Zero-value audio detected"}
-        
-        # Ensure we have enough audio data for feature extraction
-        if len(np_wav) < 16000:
-            print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
-            # Pad with zeros to reach 1 second if needed
-            padding = np.zeros(16000 - len(np_wav))
-            np_wav = np.concatenate((np_wav, padding))
-            print(f"Padded audio to {len(np_wav)} samples")
-        
-        # Make predictions
-        print('Making prediction...')
-        print(f'Audio data: shape={np_wav.shape}, min={np_wav.min():.4f}, max={np_wav.max():.4f}, rms={np.sqrt(np.mean(np_wav**2)):.4f}')
-        x = waveform_to_examples(np_wav, RATE)
-        print(f'Generated features: shape={x.shape}')
-        
-        # Handle the case where features could not be extracted
-        if x.shape[0] == 0:
-            print("Warning: Could not extract features from audio. Sending 'Unrecognized' label.")
-            socketio.emit('audio_label',
-                      {
-                          'label': 'Unrecognized Sound',
-                          'accuracy': '1.0',
-                          'db': str(db),
-                          'record_time': record_time
-                      },
-                      room=request.sid)
-            return {"status": "error", "message": "Could not extract features"}
-        
-        predictions = []
-        
-        # Use the global session and graph context to run predictions
-        with sess.as_default():
-            with graph.as_default():
-                # Reshape the features for the model
-                x = x.reshape(len(x), 96, 64, 1)
-                print(f'Reshaped features to: {x.shape}')
+        # Log prediction results
+        if result and 'label' in result:
+            logger.info(f"Prediction result: {result['label']} with confidence {result.get('accuracy', 'N/A')}")
+            
+            # Include record_time in response if it was provided
+            if record_time:
+                result['record_time'] = record_time
                 
-                # Run the model prediction
-                pred = model.predict(x)
-                predictions.append(pred)
-                
-                for prediction in predictions:
-                    context_prediction = np.take(
-                        prediction[0], [homesounds.labels[x] for x in active_context])
-                    m = np.argmax(context_prediction)
-                    print('Max prediction', str(
-                        homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    
-                    # Print prediction details for debugging
-                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
-                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
-                    
-                    # Send the prediction result back to the client
-                    if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
-                        result = {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'accuracy': str(context_prediction[m]),
-                            'db': str(db)
-                        }
-                        if record_time is not None:
-                            result['record_time'] = record_time
-                            
-                        socketio.emit('audio_label', result, room=request.sid)
-                        print("Prediction: %s (%0.2f)" % (
-                            homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-                        return {"status": "success", "message": f"Prediction: {homesounds.to_human_labels[active_context[m]]}"}
-                    else:
-                        result = {
-                            'label': 'Unrecognized Sound',
-                            'accuracy': '1.0',
-                            'db': str(db)
-                        }
-                        if record_time is not None:
-                            result['record_time'] = record_time
-                            
-                        socketio.emit('audio_label', result, room=request.sid)
-                        print("Unrecognized sound (confidence or db below threshold)")
-                        return {"status": "success", "message": "Unrecognized sound (confidence or db below threshold)"}
-    
-    except KeyError as e:
-        print(f"KeyError in audio data processing: {e}")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Missing Key in Data',
-                        'accuracy': '1.0',
-                        'error': str(e),
-                        'db': '-60.0'
-                    },
-                    room=request.sid)
-        return {"status": "error", "message": f"Missing key: {e}"}
+            # Emit the prediction back to client
+            emit('audio_label', result)
+            return {'status': 'success', 'processed': True}
+        else:
+            logger.warning("No prediction result generated")
+            return {'status': 'warning', 'message': 'No prediction generated'}
+            
     except Exception as e:
-        print(f"Error in audio data processing: {e}")
-        import traceback
-        traceback.print_exc()
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Processing Error',
-                        'accuracy': '1.0',
-                        'error': str(e),
-                        'db': '-60.0'
-                    },
-                    room=request.sid)
-        return {"status": "error", "message": f"Processing error: {e}"}
+        logger.error(f"Error processing audio data: {str(e)}")
+        logger.exception(e)
+        return {'status': 'error', 'message': str(e)}
 
 
 def background_thread():
@@ -445,28 +328,50 @@ def test_disconnect():
 
 @socketio.on('ping')
 def handle_ping(data):
-    """
-    Handler for ping messages sent from clients to test connection
-    Returns the received data along with a server timestamp
-    """
+    """Handle ping requests to test connection status"""
     try:
-        logger.info(f"Received ping from client {request.sid}")
-        logger.debug(f"Ping data: {data}")
-        
-        # Create response with original data plus server timestamp
+        logger.info(f"Received ping from client: {data}")
+        # Add server timestamp
         response = {
-            "status": "ok",
-            "server_time": int(time.time() * 1000),  # Server timestamp in milliseconds
-            "client_data": data
+            'status': 'ok',
+            'server_time': int(time.time() * 1000),
+            'message': 'Server connection is active'
         }
-        
+        # Include any data sent by client
+        if isinstance(data, dict):
+            response.update({'client_data': data})
         return response
     except Exception as e:
-        logger.error(f"Error handling ping: {e}")
-        return {"status": "error", "message": str(e)}
+        logger.error(f"Error handling ping: {str(e)}")
+        return {'status': 'error', 'message': str(e)}
 
 
 if __name__ == '__main__':
-    logger.info("Starting SoundWatch server with audio processing capabilities")
-    # Use 0.0.0.0 to make server accessible from external connections
-    socketio.run(app, host='0.0.0.0', port=8080, debug=True, allow_unsafe_werkzeug=True)
+    # Add command line argument parsing
+    parser = argparse.ArgumentParser(description='SoundWatch Server')
+    parser.add_argument('--debug', action='store_true', help='Enable debug mode')
+    parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to')
+    parser.add_argument('--port', type=int, default=8080, help='Port to bind to')
+    args = parser.parse_args()
+
+    # Configure logging
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    logger = logging.getLogger('SoundWatch-Server')
+    logger.info('Starting SoundWatch server with audio processing capabilities')
+
+    # Start the server
+    try:
+        # Remove the 'allow_unsafe_werkzeug' parameter which causes errors
+        socketio.run(
+            app,
+            host=args.host,
+            port=args.port,
+            debug=args.debug
+        )
+    except Exception as e:
+        logger.error(f"Failed to start server: {str(e)}")
+        logger.exception(e)
