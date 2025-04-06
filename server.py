@@ -187,77 +187,88 @@ def handle_source_features(json_data):
 
 @socketio.on('audio_data')
 def handle_source(json_data):
-    data = str(json_data['data'])
-    data = data[1:-1]
     global graph, model, sess
-    np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
-        32768.0  # Convert to [-1.0, +1.0]
-    # Compute RMS and convert to dB
-    print('Successfully convert to NP rep', np_wav)
-    rms = np.sqrt(np.mean(np_wav**2))
-    db = dbFS(rms)
-    print('Db...', db)
     
-    # Skip processing if the audio is silent (very low RMS)
-    if rms < SILENCE_RMS_THRESHOLD:
-        print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Silent',
-                        'accuracy': '1.0',
-                        'db': str(db)
-                    },
-                    room=request.sid)
-        return
-    
-    # Additional check for near-zero audio frames that might not be caught by RMS threshold
-    if np_wav.max() == 0.0 and np_wav.min() == 0.0:
-        print(f"Detected empty audio frame with all zeros. Skipping processing.")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Silent',
-                        'accuracy': '1.0',
-                        'db': str(db)
-                    },
-                    room=request.sid)
-        return
-    
-    # Ensure we have enough audio data for feature extraction
-    if len(np_wav) < 16000:
-        print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
-        # Pad with zeros to reach 1 second if needed
-        padding = np.zeros(16000 - len(np_wav))
-        np_wav = np.concatenate((np_wav, padding))
-        print(f"Padded audio to {len(np_wav)} samples")
-    
-    # Make predictions
-    print('Making prediction...')
-    print(f'Audio data: shape={np_wav.shape}, min={np_wav.min():.4f}, max={np_wav.max():.4f}, rms={np.sqrt(np.mean(np_wav**2)):.4f}')
-    x = waveform_to_examples(np_wav, RATE)
-    print(f'Generated features: shape={x.shape}')
-    
-    # Handle multiple frames - take the first frame if multiple are generated
-    if x.shape[0] > 1:
-        print(f"Multiple frames detected ({x.shape[0]}), using first frame")
-        x = x[0:1]
-    
-    # Check if x is empty (shape[0] == 0)
-    if x.shape[0] == 0:
-        print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
-        # Create dummy features for testing - one frame of the right dimensions
-        x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
-    
-    # Add the channel dimension required by the model
-    x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-    print(f'Successfully reshape x {x.shape}')
-    
-    predictions = []
     try:
-        # Use the global session and graph context to run predictions
-        with sess.as_default():
-            with graph.as_default():
-                pred = model.predict(x)
-                predictions.append(pred)
+        # Directly access the list/array from the JSON data
+        audio_list = json_data['data']
+        
+        # Check if data is empty
+        if not audio_list:
+            print("Received empty audio data list. Skipping.")
+            # Optionally emit a specific label or do nothing
+            return
+
+        # Convert the list of shorts/integers to a NumPy array of float32
+        np_wav = np.array(audio_list, dtype=np.float32) / 32768.0 # Convert to [-1.0, +1.0]
+        
+        print(f'Successfully converted JSON list to NP array. Shape: {np_wav.shape}')
+
+        # Compute RMS and convert to dB
+        rms = np.sqrt(np.mean(np_wav**2))
+        db = dbFS(rms)
+        print(f'Db: {db:.2f}, RMS: {rms:.4f}')
+        
+        # Skip processing if the audio is silent (very low RMS)
+        if rms < SILENCE_RMS_THRESHOLD:
+            print(f"Detected silent audio frame (RMS: {rms}, min={np_wav.min():.4f}, max={np_wav.max():.4f}). Skipping processing.")
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Silent',
+                            'accuracy': '1.0',
+                            'db': str(db)
+                        },
+                        room=request.sid)
+            return
+        
+        # Additional check for near-zero audio frames that might not be caught by RMS threshold
+        if np_wav.max() == 0.0 and np_wav.min() == 0.0:
+            print(f"Detected empty audio frame with all zeros. Skipping processing.")
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Silent',
+                            'accuracy': '1.0',
+                            'db': str(db)
+                        },
+                        room=request.sid)
+            return
+        
+        # Ensure we have enough audio data for feature extraction
+        if len(np_wav) < 16000:
+            print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
+            # Pad with zeros to reach 1 second if needed
+            padding = np.zeros(16000 - len(np_wav))
+            np_wav = np.concatenate((np_wav, padding))
+            print(f"Padded audio to {len(np_wav)} samples")
+        
+        # Make predictions
+        print('Making prediction...')
+        print(f'Audio data: shape={np_wav.shape}, min={np_wav.min():.4f}, max={np_wav.max():.4f}, rms={np.sqrt(np.mean(np_wav**2)):.4f}')
+        x = waveform_to_examples(np_wav, RATE)
+        print(f'Generated features: shape={x.shape}')
+        
+        # Handle multiple frames - take the first frame if multiple are generated
+        if x.shape[0] > 1:
+            print(f"Multiple frames detected ({x.shape[0]}), using first frame")
+            x = x[0:1]
+        
+        # Check if x is empty (shape[0] == 0)
+        if x.shape[0] == 0:
+            print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
+            # Create dummy features for testing - one frame of the right dimensions
+            x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
+        
+        # Add the channel dimension required by the model
+        x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+        print(f'Successfully reshape x {x.shape}')
+        
+        predictions = []
+        try:
+            # Use the global session and graph context to run predictions
+            with sess.as_default():
+                with graph.as_default():
+                    pred = model.predict(x)
+                    predictions.append(pred)
             
                 for prediction in predictions:
                     context_prediction = np.take(
@@ -287,16 +298,26 @@ def handle_source(json_data):
                                         'db': str(db)
                                     },
                                     room=request.sid)
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Processing Error',
+                            'accuracy': '1.0',
+                            'error': str(e),
+                            'db': str(db)
+                        },
+                        room=request.sid)
+    except KeyError as e:
+        print(f"Error: Missing key '{e}' in incoming JSON data for 'audio_data' event.")
+        # Handle the error appropriately, maybe emit an error message back
+        socketio.emit('audio_label', {'label': 'Error: Bad Data Format', 'accuracy': '1.0', 'db': '-60.0'}, room=request.sid)
     except Exception as e:
-        print(f"Error during prediction: {e}")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Processing Error',
-                        'accuracy': '1.0',
-                        'error': str(e),
-                        'db': str(db)
-                    },
-                    room=request.sid)
+        print(f"Error processing audio_data: {e}")
+        import traceback
+        traceback.print_exc()
+        # Handle other potential errors during processing
+        socketio.emit('audio_label', {'label': 'Server Processing Error', 'accuracy': '1.0', 'db': '-60.0'}, room=request.sid)
 
 
 def background_thread():
