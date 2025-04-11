@@ -225,65 +225,18 @@ def handle_source_features(json_data):
                     room=request.sid)
 
 
-    """Process audio data received from clients"""
-    try:
-        if not json_data or 'data' not in json_data:
-            logger.warning("Received empty or invalid audio data")
-            return {'status': 'error', 'message': 'Invalid audio data format'}
-
-        logger.debug("Received audio data for processing")
-        audio_data = json_data.get('data', [])
-        
-        # If empty array received, emit a message and return
-        if not audio_data or len(audio_data) == 0:
-            logger.warning("Received empty audio data array")
-            emit('audio_label', {
-                'label': 'Empty Audio',
-                'accuracy': '0.0',
-                'db': '0.0'
-            })
-            return {'status': 'warning', 'message': 'Empty audio data received'}
-
-        # Extract record time if present (for latency measurement)
-        record_time = json_data.get('record_time', 0)
-        
-        # Log the size of the received audio data
-        logger.info(f"Processing audio data with {len(audio_data)} samples")
-        
-        # Process audio data to make predictions
-        result = process_audio(audio_data)
-        
-        # Log prediction results
-        if result and 'label' in result:
-            logger.info(f"Prediction result: {result['label']} with confidence {result.get('accuracy', 'N/A')}")
-            
-            # Include record_time in response if it was provided
-            if record_time:
-                result['record_time'] = record_time
-                
-            # Emit the prediction back to client
-            emit('audio_label', result)
-            return {'status': 'success', 'processed': True}
-        else:
-            logger.warning("No prediction result generated")
-            return {'status': 'warning', 'message': 'No prediction generated'}
-            
-    except Exception as e:
-        logger.error(f"Error processing audio data: {str(e)}")
-        logger.exception(e)
-        return {'status': 'error', 'message': str(e)}
 @socketio.on('audio_data')
 def handle_source(json_data):
     """Process audio data received from clients"""
     try:
-        if not json_data or 'data' not in json_data:
+        if not json_data or 'audio_data' not in json_data:
             logger.warning("Received empty or invalid audio data")
             return {'status': 'error', 'message': 'Invalid audio data format'}
 
         # Get the full audio data for processing
-        audio_data = json_data.get('data', [])
+        audio_data = json_data.get('audio_data', [])
         
-        # Create a shortened version for logging (e.g., first 10 and last 10 elements)
+        # Create a shortened version for logging (e.g., first 5 and last 5 elements)
         if len(audio_data) > 10:
             short_audio = audio_data[:5] + ['...'] + audio_data[-5:]
         else:
@@ -329,6 +282,7 @@ def handle_source(json_data):
         logger.error(f"Error processing audio data: {str(e)}")
         logger.exception(e)
         return {'status': 'error', 'message': str(e)}
+
 def process_audio(audio_data):
     """Process audio data to make sound predictions
     
