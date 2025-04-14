@@ -91,31 +91,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('SoundWatch-Server')
 
-# Configure logging to avoid printing large data arrays
-numpy_logger = logging.getLogger('numpy')
-numpy_logger.setLevel(logging.WARNING)
-
-# Set a custom formatter for the server logs
-class SanitizedFormatter(logging.Formatter):
-    def format(self, record):
-        # Check if the message contains large arrays and truncate them
-        if isinstance(record.msg, str) and len(record.msg) > 1000 and '[' in record.msg and ']' in record.msg:
-            # Find array content between brackets
-            start_idx = record.msg.find('[')
-            end_idx = record.msg.rfind(']')
-            if start_idx >= 0 and end_idx > start_idx:
-                # Truncate the array content
-                array_content = record.msg[start_idx:end_idx+1]
-                if len(array_content) > 100:
-                    truncated = f"[...array with {len(array_content)} characters...]"
-                    record.msg = record.msg[:start_idx] + truncated + record.msg[end_idx+1:]
-        return super().format(record)
-
-# Apply the custom formatter to handlers
-formatter = SanitizedFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-for handler in logging.root.handlers:
-    handler.setFormatter(formatter)
-
 ##############################
 # Socket.IO Event Handlers
 ##############################
@@ -256,8 +231,6 @@ def handle_source(json_data):
     try:
         if not json_data or 'data' not in json_data:
             logger.warning("Received empty or invalid audio data")
-            # Send acknowledgment to client
-            emit('audio_data_received', {'status': 'error', 'message': 'Invalid data format'})
             return {'status': 'error', 'message': 'Invalid audio data format'}
 
         logger.debug("Received audio data for processing")
@@ -266,8 +239,6 @@ def handle_source(json_data):
         # If empty array received, emit a message and return
         if not audio_data or len(audio_data) == 0:
             logger.warning("Received empty audio data array")
-            # Send acknowledgment to client
-            emit('audio_data_received', {'status': 'error', 'message': 'Empty data array'})
             emit('audio_label', {
                 'label': 'Empty Audio',
                 'accuracy': '0.0',
@@ -278,12 +249,8 @@ def handle_source(json_data):
         # Extract record time if present (for latency measurement)
         record_time = json_data.get('record_time', 0)
 
-        # Log the size of the received audio data without printing the entire array
-        data_length = len(audio_data)
-        logger.info(f"Processing audio data with {data_length} samples")
-
-        # Send acknowledgment to client that data was received
-        emit('audio_data_received', {'status': 'success', 'samples': data_length})
+        # Log the size of the received audio data
+        logger.info(f"Processing audio data with {len(audio_data)} samples")
 
         # Process audio data to make predictions
         result = process_audio(audio_data)
@@ -306,8 +273,6 @@ def handle_source(json_data):
     except Exception as e:
         logger.error(f"Error processing audio data: {str(e)}")
         logger.exception(e)
-        # Send error acknowledgment to client
-        emit('audio_data_received', {'status': 'error', 'message': str(e)})
         return {'status': 'error', 'message': str(e)}
 
 def process_audio(audio_data):
@@ -324,16 +289,9 @@ def process_audio(audio_data):
         # Convert to numpy array and normalize to [-1.0, +1.0]
         np_wav = np.array(audio_data, dtype=np.int16) / 32768.0
 
-        # Log audio statistics instead of the full array
-        audio_min = np_wav.min()
-        audio_max = np_wav.max()
-        audio_mean = np_wav.mean()
-        logger.debug(f"Audio stats - min: {audio_min:.4f}, max: {audio_max:.4f}, mean: {audio_mean:.4f}")
-
         # Compute RMS and convert to dB
         rms = np.sqrt(np.mean(np_wav**2))
         db = dbFS(rms)
-        logger.debug(f"Audio level: {db:.2f} dB")
 
         # Ensure we have enough audio data for feature extraction
         if len(np_wav) < 16000:  # Less than 1 second at 16kHz
