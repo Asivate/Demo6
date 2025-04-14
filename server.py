@@ -26,9 +26,9 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret!'
 # Initialize SocketIO with CORS support and ensure it works with Engine.IO v4
 socketio = SocketIO(
-    app, 
-    async_mode=async_mode, 
-    cors_allowed_origins="*", 
+    app,
+    async_mode=async_mode,
+    cors_allowed_origins="*",
     ping_timeout=60,
     ping_interval=25,
     logger=True,
@@ -91,6 +91,31 @@ logging.basicConfig(
 )
 logger = logging.getLogger('SoundWatch-Server')
 
+# Configure logging to avoid printing large data arrays
+numpy_logger = logging.getLogger('numpy')
+numpy_logger.setLevel(logging.WARNING)
+
+# Set a custom formatter for the server logs
+class SanitizedFormatter(logging.Formatter):
+    def format(self, record):
+        # Check if the message contains large arrays and truncate them
+        if isinstance(record.msg, str) and len(record.msg) > 1000 and '[' in record.msg and ']' in record.msg:
+            # Find array content between brackets
+            start_idx = record.msg.find('[')
+            end_idx = record.msg.rfind(']')
+            if start_idx >= 0 and end_idx > start_idx:
+                # Truncate the array content
+                array_content = record.msg[start_idx:end_idx+1]
+                if len(array_content) > 100:
+                    truncated = f"[...array with {len(array_content)} characters...]"
+                    record.msg = record.msg[:start_idx] + truncated + record.msg[end_idx+1:]
+        return super().format(record)
+
+# Apply the custom formatter to handlers
+formatter = SanitizedFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+for handler in logging.root.handlers:
+    handler.setFormatter(formatter)
+
 ##############################
 # Socket.IO Event Handlers
 ##############################
@@ -152,7 +177,7 @@ def audio_samples(in_data, frame_count, time_info, status_flags):
 def handle_source_features(json_data):
     '''Acoustic features: processes a list of features for predictions'''
     global graph, model, sess
-    
+
     # Parse the input
     data = str(json_data['data'])
     data = data[1:-1]
@@ -160,7 +185,7 @@ def handle_source_features(json_data):
     try:
         x = np.fromstring(data, dtype=np.float16, sep=',')
         print('Data after to numpy:', x.shape, 'min:', x.min(), 'max:', x.max())
-    
+
         # Handle multiple frames if present
         if len(x) > vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
             print(f"Warning: Received {len(x)} values, expected {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
@@ -169,33 +194,33 @@ def handle_source_features(json_data):
             print(f"Warning: Received {len(x)} values, padding to {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
             padding = np.zeros(vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS - len(x))
             x = np.concatenate((x, padding))
-        
+
         # Reshape using vggish_params constants
         x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
         print('Successfully reshaped audio features to', x.shape)
-    
+
         predictions = []
-        
+
         # Get the dB level from the JSON data or use a default value
         db = float(json_data.get('db', DBLEVEL_THRES))
-        
+
         # Use the global session and graph context to run predictions
         with sess.as_default():
             with graph.as_default():
                 pred = model.predict(x)
                 predictions.append(pred)
-                
+
                 for prediction in predictions:
                     context_prediction = np.take(
                         prediction[0], [homesounds.labels[x] for x in active_context])
                     m = np.argmax(context_prediction)
                     print('Max prediction', str(
                         homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
-                    
+
                     # Modified condition - look at db and confidence together for debugging
                     print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
                     print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
-                    
+
                     # Original condition was too strict - many sounds were being classified as "Unrecognized"
                     if context_prediction[m] > PREDICTION_THRES:
                         socketio.emit('audio_label',
@@ -229,27 +254,20 @@ def handle_source_features(json_data):
 def handle_source(json_data):
     """Process audio data received from clients"""
     try:
-        if not json_data or 'audio_data' not in json_data:
+        if not json_data or 'data' not in json_data:
             logger.warning("Received empty or invalid audio data")
+            # Send acknowledgment to client
+            emit('audio_data_received', {'status': 'error', 'message': 'Invalid data format'})
             return {'status': 'error', 'message': 'Invalid audio data format'}
 
-        # Get the full audio data for processing
-        audio_data = json_data.get('audio_data', [])
-        
-        # Create a shortened version for logging (e.g., first 5 and last 5 elements)
-        if len(audio_data) > 10:
-            short_audio = audio_data[:5] + ['...'] + audio_data[-5:]
-        else:
-            short_audio = audio_data
-            
         logger.debug("Received audio data for processing")
-        
-        # Log the shortened version
-        logger.info(f"Processing audio data with {len(audio_data)} samples: {short_audio}")
-        
+        audio_data = json_data.get('data', [])
+
         # If empty array received, emit a message and return
         if not audio_data or len(audio_data) == 0:
             logger.warning("Received empty audio data array")
+            # Send acknowledgment to client
+            emit('audio_data_received', {'status': 'error', 'message': 'Empty data array'})
             emit('audio_label', {
                 'label': 'Empty Audio',
                 'accuracy': '0.0',
@@ -259,36 +277,45 @@ def handle_source(json_data):
 
         # Extract record time if present (for latency measurement)
         record_time = json_data.get('record_time', 0)
-        
-        # Process audio data using the full array
+
+        # Log the size of the received audio data without printing the entire array
+        data_length = len(audio_data)
+        logger.info(f"Processing audio data with {data_length} samples")
+
+        # Send acknowledgment to client that data was received
+        emit('audio_data_received', {'status': 'success', 'samples': data_length})
+
+        # Process audio data to make predictions
         result = process_audio(audio_data)
-        
+
         # Log prediction results
         if result and 'label' in result:
             logger.info(f"Prediction result: {result['label']} with confidence {result.get('accuracy', 'N/A')}")
-            
+
             # Include record_time in response if it was provided
             if record_time:
                 result['record_time'] = record_time
-                
+
             # Emit the prediction back to client
             emit('audio_label', result)
             return {'status': 'success', 'processed': True}
         else:
             logger.warning("No prediction result generated")
             return {'status': 'warning', 'message': 'No prediction generated'}
-            
+
     except Exception as e:
         logger.error(f"Error processing audio data: {str(e)}")
         logger.exception(e)
+        # Send error acknowledgment to client
+        emit('audio_data_received', {'status': 'error', 'message': str(e)})
         return {'status': 'error', 'message': str(e)}
 
 def process_audio(audio_data):
     """Process audio data to make sound predictions
-    
+
     Args:
         audio_data: List of audio samples (int values)
-        
+
     Returns:
         Dictionary with prediction results including label, accuracy, and db level
     """
@@ -296,11 +323,18 @@ def process_audio(audio_data):
     try:
         # Convert to numpy array and normalize to [-1.0, +1.0]
         np_wav = np.array(audio_data, dtype=np.int16) / 32768.0
-        
+
+        # Log audio statistics instead of the full array
+        audio_min = np_wav.min()
+        audio_max = np_wav.max()
+        audio_mean = np_wav.mean()
+        logger.debug(f"Audio stats - min: {audio_min:.4f}, max: {audio_max:.4f}, mean: {audio_mean:.4f}")
+
         # Compute RMS and convert to dB
         rms = np.sqrt(np.mean(np_wav**2))
         db = dbFS(rms)
-        
+        logger.debug(f"Audio level: {db:.2f} dB")
+
         # Ensure we have enough audio data for feature extraction
         if len(np_wav) < 16000:  # Less than 1 second at 16kHz
             logger.warning(f"Audio length {len(np_wav)} is less than 1 second (16000 samples), padding...")
@@ -308,38 +342,38 @@ def process_audio(audio_data):
             padding = np.zeros(16000 - len(np_wav))
             np_wav = np.concatenate((np_wav, padding))
             logger.info(f"Padded audio to {len(np_wav)} samples")
-        
+
         # Make predictions - convert raw audio to spectrograms
         x = waveform_to_examples(np_wav, RATE)
-        
+
         # Check if features were successfully extracted
         if x.shape[0] == 0:
             logger.warning("Feature extraction produced empty array, using dummy features")
             # Create dummy features for low-energy audio
             x = np.zeros((1, 96, 64))
-        
+
         # Add the channel dimension required by the model
         x = x.reshape(x.shape[0], 96, 64, 1)
         logger.debug(f'Reshaped features to {x.shape}')
-        
+
         predictions = []
-        
+
         # Use the global session and graph context to run predictions
         with sess.as_default():
             with graph.as_default():
                 pred = model.predict(x)
                 predictions.append(pred)
-                
+
                 for prediction in predictions:
                     context_prediction = np.take(
                         prediction[0], [homesounds.labels[x] for x in active_context])
                     m = np.argmax(context_prediction)
                     logger.debug(f"Max prediction: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]})")
-                    
+
                     # Check if prediction meets threshold
                     if context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES:
                         logger.info(f"Prediction: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.2f})")
-                        
+
                         return {
                             'label': str(homesounds.to_human_labels[active_context[m]]),
                             'accuracy': str(context_prediction[m]),
@@ -350,17 +384,17 @@ def process_audio(audio_data):
                             logger.info(f"Prediction below confidence threshold: {context_prediction[m]:.2f} < {PREDICTION_THRES}")
                         if db <= DBLEVEL_THRES:
                             logger.info(f"Audio level below threshold: {db} < {DBLEVEL_THRES}")
-                        
+
                         return {
                             'label': 'Unrecognized Sound',
                             'accuracy': '1.0',
                             'db': str(db)
                         }
-                    
+
     except Exception as e:
         logger.error(f"Error in process_audio: {str(e)}")
         logger.exception(e)
-        
+
         return {
             'label': 'Processing Error',
             'accuracy': '0.0',
@@ -445,7 +479,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind to')
     parser.add_argument('--port', type=int, default=8080, help='Port to bind to')
     args = parser.parse_args()
-    
+
     # Configure logging
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,
