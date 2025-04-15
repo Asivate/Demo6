@@ -1,4 +1,3 @@
-
 Introduction
 ------------
 This repo contains the Python socket server to process the audio recognition process. Clients (phones and watches) sends raw audio or audio features to servers in an event-based architecture and server will send the audio label back to clients.
@@ -86,3 +85,37 @@ Example Usage of SocketIO Client:
     "accuracy": "0.96"
 }
 ```
+
+## Speech Recognition and Sentiment Analysis
+
+SoundWatch now supports real-time speech recognition and sentiment analysis in addition to sound classification. This feature:
+
+1. Transcribes speech in real-time
+2. Performs sentiment analysis on the transcription
+3. Sends the transcription, sentiment score, and emotion to the watch for display
+4. Stores the conversation history on the phone for later reference
+
+### Setup
+
+To use the speech recognition and sentiment analysis features, you need to:
+
+1. Create a Google Cloud project and enable the following APIs:
+   - Cloud Speech-to-Text API
+   - Cloud Natural Language API
+
+2. Create a service account and download the JSON credentials file
+
+3. Place the credentials file in the server directory as `google_cloud_credentials.json`
+
+4. Set up the credentials by running:
+   ```
+   source setup_google_cloud.sh
+   ```
+
+5. Start the server as usual
+
+### Usage
+
+Speech will be automatically detected and transcribed when a user is speaking. The sentiment of the speech will be analyzed and displayed on the watch along with an emoji representing the emotion.
+
+To view the conversation history, tap the "View Conversation History" button in the mobile app.
