@@ -584,14 +584,26 @@ def handle_source_features(json_data):
                     
                     # Original condition was too strict - many sounds were being classified as "Unrecognized"
                     if context_prediction[m] > PREDICTION_THRES:
-                        socketio.emit('audio_label',
-                                   {'label': str(homesounds.to_human_labels[active_context[m]]),
-                                    'accuracy': str(context_prediction[m]),
-                                    'db': str(db)},
-                                   room=request.sid)
+                        # Send result using both event names to support both implementations
+                        prediction_result = {
+                            'label': str(homesounds.to_human_labels[active_context[m]]),
+                            'accuracy': str(context_prediction[m]),
+                            'db': str(db)
+                        }
+                        
+                        # Emit as 'audio_label' for the updated client
+                        socketio.emit('audio_label', prediction_result, room=request.sid)
+                        
+                        # Also emit as 'predict_sound' for backward compatibility
+                        socketio.emit('predict_sound', {
+                            'label': str(homesounds.to_human_labels[active_context[m]]),
+                            'confidence': float(context_prediction[m])
+                        }, room=request.sid)
+                        
                         print("Prediction: %s (%0.2f)" % (
                             homesounds.to_human_labels[active_context[m]], context_prediction[m]))
                     else:
+                        # Send unrecognized sound notification
                         socketio.emit('audio_label',
                                     {
                                         'label': 'Unrecognized Sound',
@@ -724,13 +736,23 @@ def handle_source(json_data):
                 
                 # If confidence is high enough, send the label
                 if context_prediction[m] > PREDICTION_THRES:
-                    socketio.emit('audio_label',
-                                {
-                                    'label': str(homesounds.to_human_labels[active_context[m]]),
-                                    'accuracy': str(context_prediction[m]),
-                                    'db': str(db)
-                                },
-                                room=request.sid)
+                    # Send result using both event names for compatibility
+                    prediction_result = {
+                        'label': str(homesounds.to_human_labels[active_context[m]]),
+                        'accuracy': str(context_prediction[m]),
+                        'db': str(db)
+                    }
+                    
+                    # Emit as 'audio_label' for updated client
+                    socketio.emit('audio_label', prediction_result, room=request.sid)
+                    
+                    # Also emit as 'predict_sound' for backward compatibility
+                    socketio.emit('predict_sound', {
+                        'label': str(homesounds.to_human_labels[active_context[m]]),
+                        'confidence': float(context_prediction[m])
+                    }, room=request.sid)
+                    
+                    print(f"Emitted prediction via both audio_label and predict_sound events: {prediction_result['label']}")
                 else:
                     socketio.emit('audio_label',
                                 {
