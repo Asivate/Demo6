@@ -143,9 +143,9 @@ class SimpleStreamingRecognizer:
         self.max_silence_duration = 5  # Maximum silence duration in seconds before reconnection
         self.speech_active = False
         
-        # Keep-alive parameters
-        self.keep_alive_audio = np.zeros(int(RATE * 0.1), dtype=np.float32)  # 100ms of silence
-        self.keep_alive_interval = 2.0  # Send keep-alive every 2 seconds of silence
+        # Keep-alive parameters - IMPROVED
+        self.keep_alive_audio = np.zeros(int(RATE * 0.3), dtype=np.float32)  # 300ms of silence
+        self.keep_alive_interval = 1.0  # Reduced from 2.0 to 1.0 seconds to prevent timeouts
         self.last_keep_alive_time = time.time()
         
         # Reconnection parameters
@@ -154,6 +154,36 @@ class SimpleStreamingRecognizer:
         self.reconnect_backoff = 1.0  # Start with 1 second backoff, will increase
         self.max_stream_duration = 240  # Maximum stream duration in seconds (4 minutes)
         self.stream_start_time = time.time()
+        
+        # New timeout management
+        self.api_timeout_threshold = 5.0  # Send keepalive if no data sent for 5 seconds
+        self.force_keepalive_timer = threading.Timer(self.api_timeout_threshold, self.send_forced_keepalive)
+        self.force_keepalive_timer.daemon = True
+        self.force_keepalive_timer.start()
+
+    def send_forced_keepalive(self):
+        """Force send a keepalive packet if no audio has been sent recently"""
+        try:
+            current_time = time.time()
+            time_since_last_audio = current_time - self.last_audio_time
+            
+            if time_since_last_audio > self.api_timeout_threshold and self.is_active:
+                print(f"Forcing keepalive packet after {time_since_last_audio:.1f}s of inactivity")
+                # Generate a short beep tone instead of silence for better detection
+                t = np.linspace(0, 0.2, int(RATE * 0.2), False)
+                keep_alive_audio = np.sin(2 * np.pi * 440 * t) * 0.1  # 440Hz tone at 10% volume
+                keep_alive_int16 = (keep_alive_audio * 32768).astype(np.int16)
+                self.audio_queue.put(keep_alive_int16.tobytes())
+                self.last_audio_time = current_time
+                self.last_keep_alive_time = current_time
+        except Exception as e:
+            print(f"Error in send_forced_keepalive: {e}")
+        finally:
+            # Reschedule timer if still active
+            if self.is_active:
+                self.force_keepalive_timer = threading.Timer(self.api_timeout_threshold, self.send_forced_keepalive)
+                self.force_keepalive_timer.daemon = True
+                self.force_keepalive_timer.start()
     
     def adjust_chunk_size(self):
         """Adjust optimal chunk size based on sample rate and channels"""
@@ -191,8 +221,12 @@ class SimpleStreamingRecognizer:
                     if current_time - self.last_keep_alive_time >= self.keep_alive_interval:
                         print(f"Sending keep-alive packet after {self.silence_duration:.1f}s of silence")
                         self.last_keep_alive_time = current_time
-                        keep_alive_int16 = (self.keep_alive_audio * 32768).astype(np.int16)
+                        # Generate a short sine wave instead of zeros for better detection
+                        t = np.linspace(0, 0.2, int(RATE * 0.2), False)
+                        keep_alive_audio = np.sin(2 * np.pi * 440 * t) * 0.1  # 440Hz tone at 10% volume
+                        keep_alive_int16 = (keep_alive_audio * 32768).astype(np.int16)
                         self.audio_queue.put(keep_alive_int16.tobytes())
+                        self.last_audio_time = current_time
                 
                 # If silence persists too long, consider reconnecting the stream
                 if self.silence_duration > self.max_silence_duration and self.speech_active:
@@ -220,17 +254,37 @@ class SimpleStreamingRecognizer:
     def stop(self):
         """Stop the streaming recognition"""
         self.is_active = False
+        # Stop the keepalive timer
+        if hasattr(self, 'force_keepalive_timer') and self.force_keepalive_timer is not None:
+            self.force_keepalive_timer.cancel()
         self.audio_queue.put(None)  # Signal to stop
     
     def audio_generator(self):
-        """Generate audio chunks from the queue"""
+        """Generate audio chunks from the queue with improved keep-alive handling"""
         buffer = b''
+        last_yield_time = time.time()
         
         while self.is_active:
             # Check if stream has been active too long and needs rotation
-            if time.time() - self.stream_start_time > self.max_stream_duration:
+            current_time = time.time()
+            if current_time - self.stream_start_time > self.max_stream_duration:
                 print(f"Stream active for {self.max_stream_duration}s, initiating planned rotation")
                 return  # End this stream to allow a new one to start
+            
+            # Force send data if we haven't sent anything for too long
+            # This is a safety mechanism to prevent API timeouts
+            if current_time - last_yield_time > 3.0:  # 3 seconds max without sending data
+                if buffer:
+                    print(f"Yielding accumulated buffer to prevent timeout ({len(buffer)} bytes)")
+                    yield buffer
+                    buffer = b''
+                    last_yield_time = current_time
+                else:
+                    # If no data in buffer, create a minimal audio packet
+                    print("Creating minimal keep-alive packet to prevent timeout")
+                    minimal_audio = np.zeros(800, dtype=np.int16).tobytes()  # Very small packet
+                    yield minimal_audio
+                    last_yield_time = current_time
             
             try:
                 chunk = self.audio_queue.get(timeout=0.5)  # Short timeout to check for stream duration
@@ -244,6 +298,7 @@ class SimpleStreamingRecognizer:
                 if len(buffer) >= self.optimal_chunk_size:
                     yield buffer
                     buffer = b''
+                    last_yield_time = time.time()
                 
                 # Get any additional chunks without blocking
                 while True:
@@ -257,6 +312,7 @@ class SimpleStreamingRecognizer:
                             if buffer:  # Only yield if buffer has content
                                 yield buffer
                                 buffer = b''
+                                last_yield_time = time.time()
                         
                         buffer += chunk
                     except queue.Empty:
@@ -266,6 +322,7 @@ class SimpleStreamingRecognizer:
                 if buffer:
                     yield buffer
                     buffer = b''
+                    last_yield_time = time.time()
                     
             except queue.Empty:
                 # Timeout occurred, continue loop to check if stream needs rotation
@@ -274,162 +331,6 @@ class SimpleStreamingRecognizer:
         # Yield any remaining data before exiting
         if buffer:
             yield buffer
-    
-    def process_responses(self, responses):
-        """Process streaming responses from the API"""
-        try:
-            for response in responses:
-                if not self.is_active:
-                    break
-                
-                if not response.results:
-                    continue
-                
-                result = response.results[0]  # Get the first result
-                
-                if not result.alternatives:
-                    continue
-                
-                transcript = result.alternatives[0].transcript
-                confidence = result.alternatives[0].confidence if hasattr(result.alternatives[0], 'confidence') else 0.0
-                
-                if result.is_final:
-                    self.last_response_time = time.time()
-                    self.last_transcript = transcript
-                    print(f"Final transcript: '{transcript}' (confidence: {confidence})")
-                    
-                    # Skip empty transcripts
-                    if not transcript.strip():
-                        continue
-                    
-                    # Process for sentiment analysis
-                    try:
-                        # Create document for sentiment analysis
-                        document = language_v1.Document(
-                            content=transcript,
-                            type_=language_v1.Document.Type.PLAIN_TEXT
-                        )
-                        
-                        # Analyze sentiment
-                        sentiment_response = language_client.analyze_sentiment(document=document)
-                        sentiment = sentiment_response.document_sentiment
-                        
-                        # Map to emoji and emotion
-                        emoji = get_sentiment_emoji(sentiment.score)
-                        emotion = get_sentiment_emotion(sentiment.score)
-                        
-                        print(f"Sentiment analysis: score={sentiment.score}, emotion={emotion}, emoji={emoji}")
-                        
-                        # Create timestamp
-                        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-                        
-                        # Create transcript entry
-                        transcript_entry = {
-                            "transcription": transcript,
-                            "confidence": float(confidence),
-                            "emotion": emotion,
-                            "emoji": emoji,
-                            "sentiment_score": float(sentiment.score),
-                            "sentiment_magnitude": float(sentiment.magnitude),
-                            "timestamp": timestamp
-                        }
-                        
-                        # Send to all connected clients
-                        socketio.emit('audio_label', {
-                            'label': 'Speech',
-                            'accuracy': '1.0',
-                            'emoji': emoji,
-                            'emotion': emotion,
-                            'transcription': transcript,
-                            'confidence': confidence,
-                            'sentiment_score': sentiment.score,
-                            'sentiment_magnitude': sentiment.magnitude,
-                            'timestamp': timestamp
-                        })
-                        
-                        # Also emit transcript update event
-                        socketio.emit('transcript_update', transcript_entry)
-                        
-                    except Exception as e:
-                        print(f"Error processing sentiment for transcript: {e}")
-                else:
-                    # Interim result
-                    print(f"Interim transcript: '{transcript}'")
-                    
-        except Exception as e:
-            print(f"Error processing streaming responses: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # If we encounter specific Google API errors that suggest reconnecting would help,
-            # set is_active to False to allow for reconnection
-            error_str = str(e).lower()
-            if "timeout" in error_str or "deadline" in error_str or "unavailable" in error_str:
-                print("Detected API timeout or connection issue, signaling for reconnection")
-                return False  # Signal that reconnection is needed
-            
-        return True  # Signal successful processing
-    
-    def run(self):
-        """Run the streaming recognition in a continuous loop with improved error handling"""
-        retry_count = 0
-        max_retries = self.max_reconnect_attempts
-        
-        while self.is_active and retry_count < max_retries:
-            try:
-                print("Starting streaming recognition session")
-                self.stream_start_time = time.time()
-                self.reconnect_count = retry_count
-                
-                # Create the generator for audio chunks
-                audio_generator = self.audio_generator()
-                
-                # Create streaming recognize requests
-                requests = (
-                    speech.StreamingRecognizeRequest(audio_content=content)
-                    for content in audio_generator
-                )
-                
-                # Start streaming recognition
-                responses = self.client.streaming_recognize(self.streaming_config, requests)
-                
-                # Process responses - if it returns False, reconnection is needed
-                success = self.process_responses(responses)
-                
-                # If we get here, the stream ended
-                if success:
-                    print("Streaming recognition session ended normally")
-                    retry_count = 0  # Reset retry count on successful completion
-                else:
-                    # Process_responses signaled we should reconnect
-                    retry_count += 1
-                    print(f"Stream needs reconnection (attempt {retry_count}/{max_retries})")
-                
-                # Wait briefly before reconnecting to avoid rapid cycling
-                time.sleep(0.5)
-                
-            except Exception as e:
-                retry_count += 1
-                print(f"Streaming recognition error (retry {retry_count}/{max_retries}): {e}")
-                import traceback
-                traceback.print_exc()
-                
-                # Implement progressive backoff
-                backoff_time = min(self.reconnect_backoff * retry_count, 30)
-                print(f"Waiting {backoff_time} seconds before retry...")
-                time.sleep(backoff_time)
-                
-        if not self.is_active:
-            print("Streaming recognition stopped by request")
-        elif retry_count >= max_retries:
-            print(f"Exceeded maximum number of retries ({max_retries}). Stopping streaming recognition.")
-    
-    def start(self):
-        """Start the streaming recognition in a background thread"""
-        self.thread = threading.Thread(target=self.run)
-        self.thread.daemon = True
-        self.thread.start()
-        return self.thread
 
 def start_streaming_recognition():
     """Start the streaming recognition thread using the simplified implementation"""
