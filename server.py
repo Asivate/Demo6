@@ -259,6 +259,108 @@ class SimpleStreamingRecognizer:
             self.force_keepalive_timer.cancel()
         self.audio_queue.put(None)  # Signal to stop
     
+    def start(self):
+        """Start the streaming recognition in a background thread"""
+        if self.thread is not None and self.thread.is_alive():
+            print("Streaming thread already running, stopping it first")
+            self.stop()
+            time.sleep(0.5)  # Give it a moment to stop
+        
+        # Create and start the background thread
+        def streaming_thread_func():
+            """Thread function that handles the actual streaming recognition"""
+            try:
+                print("Starting streaming recognition thread")
+                self.stream_start_time = time.time()
+                self.last_audio_time = time.time()
+                self.last_response_time = time.time()
+                
+                while self.is_active:
+                    # Create a new streaming session for this iteration
+                    requests = (speech.StreamingRecognizeRequest(audio_content=content)
+                                for content in self.audio_generator())
+                    
+                    try:
+                        responses = self.client.streaming_recognize(
+                            config=self.streaming_config,
+                            requests=requests
+                        )
+                        
+                        # Process streaming responses
+                        for response in responses:
+                            self.last_response_time = time.time()
+                            
+                            if not response.results:
+                                continue
+                                
+                            result = response.results[0]
+                            if not result.alternatives:
+                                continue
+                                
+                            transcript = result.alternatives[0].transcript
+                            stability = result.alternatives[0].stability
+                            is_final = result.is_final
+                            
+                            if is_final:
+                                self.last_transcript = transcript
+                                print(f"Final transcript: {transcript}")
+                                
+                                # Process for sentiment if appropriate
+                                if len(transcript.strip()) > 0:
+                                    # Convert to raw audio for sentiment analysis later
+                                    audio_np = np.concatenate([
+                                        np.frombuffer(chunk, dtype=np.int16) 
+                                        for chunk in list(self.audio_generator())
+                                    ]).astype(np.float32) / 32768.0
+                                    
+                                    # Add to processing queue for sentiment analysis
+                                    speech_processing_queue.put(audio_np)
+                                    
+                                    # Emit through Socket.IO
+                                    socketio.emit('transcript_update', {
+                                        'transcript': transcript,
+                                        'timestamp': time.time(),
+                                        'is_final': True
+                                    })
+                            elif stability > 0.5:
+                                # Only emit interim results with decent stability
+                                print(f"Interim transcript (stability {stability:.2f}): {transcript}")
+                                socketio.emit('transcript_update', {
+                                    'transcript': transcript,
+                                    'timestamp': time.time(),
+                                    'is_final': False
+                                })
+                    
+                    except Exception as e:
+                        print(f"Error in streaming recognition: {e}")
+                        time.sleep(1)  # Prevent rapid reconnection on error
+                        self.reconnect_count += 1
+                        
+                        if self.reconnect_count > self.max_reconnect_attempts:
+                            print("Max reconnection attempts reached, stopping recognition")
+                            self.is_active = False
+                            break
+                    
+                    # If we got here, stream ended or timed out but thread is still active
+                    # Check if we should reconnect
+                    if self.is_active:
+                        print("Stream ended, reconnecting...")
+                        self.reconnect_count += 1
+                        self.stream_start_time = time.time()  # Reset stream age
+                
+                print("Streaming recognition thread ended")
+            
+            except Exception as e:
+                print(f"Unexpected error in streaming thread: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Create and start the thread
+        self.thread = threading.Thread(target=streaming_thread_func)
+        self.thread.daemon = True
+        self.thread.start()
+        print("Streaming recognition thread started")
+    
     def audio_generator(self):
         """Generate audio chunks from the queue with improved keep-alive handling"""
         buffer = b''
