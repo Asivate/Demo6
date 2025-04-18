@@ -94,10 +94,41 @@ except Exception as e:
     print("3. Make sure the credentials have access to Speech-to-Text and Natural Language APIs")
     GOOGLE_CLOUD_ENABLED = False
 
+# Dual-stream buffers for separate audio processing paths
 # Buffer for speech recognition (holds audio data for processing)
 speech_buffer = []
 speech_buffer_lock = threading.Lock()
 speech_processing_queue = queue.Queue()
+
+# Short buffer for sound classification (1 second chunks)
+short_buffer = []
+# Long buffer for speech transcription (accumulates longer audio)
+long_buffer = []
+long_buffer_lock = threading.Lock()
+
+# Buffer configuration
+LONG_BUFFER_MAX_SECONDS = 10  # Maximum seconds to accumulate for transcription
+LONG_BUFFER_SAMPLES = RATE * LONG_BUFFER_MAX_SECONDS  # 16000 samples/sec * 10 seconds = 160000 samples
+LONG_BUFFER_MIN_SECONDS = 3  # Minimum seconds required before attempting transcription
+LONG_BUFFER_MIN_SAMPLES = RATE * LONG_BUFFER_MIN_SECONDS  # 48000 samples
+
+# Timing controls
+last_transcription_time = time.time()
+MIN_TRANSCRIPTION_INTERVAL = 2  # Minimum seconds between transcription requests
+
+# Dual-stream buffers for separate audio processing paths
+# Short buffer for sound classification (1 second chunks)
+short_buffer = []
+# Long buffer for speech transcription (accumulates 8 seconds)
+long_buffer = []
+long_buffer_lock = threading.Lock()
+# Buffer configuration
+LONG_BUFFER_SECONDS = 8  # Accumulate 8 seconds of audio for better transcription
+LONG_BUFFER_SAMPLES = RATE * LONG_BUFFER_SECONDS  # 16000 samples/sec * 8 seconds = 128000 samples
+LONG_BUFFER_OVERLAP = 2  # 2 second overlap between consecutive long buffers
+LONG_BUFFER_OVERLAP_SAMPLES = RATE * LONG_BUFFER_OVERLAP  # 32000 samples
+last_transcription_time = time.time()
+MIN_TRANSCRIPTION_INTERVAL = 3  # Minimum seconds between transcription requests
 
 # For streaming speech recognition
 STREAMING_LIMIT = 290000  # ~5 minutes
@@ -466,7 +497,7 @@ class SimpleStreamingRecognizer:
 
 def start_streaming_recognition():
     """Start the streaming recognition thread using the simplified implementation"""
-    global streaming_recognizer, streaming_active
+    global streaming_recognizer, streaming_active, long_buffer, last_transcription_time
     
     if not GOOGLE_CLOUD_ENABLED:
         print("Google Cloud services not enabled. Cannot start streaming recognition.")
@@ -474,19 +505,32 @@ def start_streaming_recognition():
     
     streaming_active = True
     
+    # Reset our long buffer and timing variables
+    with long_buffer_lock:
+        long_buffer = []
+    last_transcription_time = time.time()
+    
     # Use the simpler streaming recognizer implementation
     streaming_recognizer = SimpleStreamingRecognizer()
     
+    # Configure for enhanced speech recognition
+    # These settings improve handling of longer audio segments
+    streaming_recognizer.config.enable_automatic_punctuation = True
+    streaming_recognizer.config.enable_word_time_offsets = True
+    streaming_recognizer.config.model = "latest_long"  # Use long-form model for better results with extended audio
+    
     # Print information about the environment
-    print("Starting streaming speech recognition with the following settings:")
+    print("Starting dual-stream speech recognition with the following settings:")
     print(f"- Sample rate: {RATE} Hz")
     print(f"- Channels: {CHANNELS}")
+    print(f"- Long buffer size: {LONG_BUFFER_SECONDS} seconds ({LONG_BUFFER_SAMPLES} samples)")
+    print(f"- Buffer overlap: {LONG_BUFFER_OVERLAP} seconds")
     print(f"- Google credentials: {os.environ.get('GOOGLE_APPLICATION_CREDENTIALS', 'Not set')}")
     
     # Start in a background thread
     streaming_recognizer.start()
     
-    print("Streaming recognition thread started")
+    print("Streaming recognition thread started with dual-buffer architecture")
     return streaming_recognizer
 
 def stop_streaming_recognition():
@@ -699,13 +743,14 @@ def assess_audio_quality(audio_data):
 @socketio.on('audio_data')
 def handle_source(json_data):
     """
-    Handles audio data from the client for sound event detection
+    Handles audio data from the client for sound event detection and speech transcription
+    Implements a dual-stream approach: short chunks for sound classification and longer buffers for transcription
     """
     try:
         print(f"Received audio data from client: {request.sid[:10]}...")
         data = str(json_data['data'])
         data = data[1:-1]
-        global graph, model, sess, streaming_recognizer
+        global graph, model, sess, streaming_recognizer, long_buffer, last_transcription_time
         np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
             32768.0  # Convert to [-1.0, +1.0]
         
@@ -716,11 +761,50 @@ def handle_source(json_data):
         # Log basic audio metrics
         print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
         
-        # Process for speech recognition
-        if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-            # Send audio to the streaming recognizer
-            # No need for extensive preprocessing now, our recognizer handles conversion
-            streaming_recognizer.add_audio(np_wav)
+        # ======= DUAL STREAM PROCESSING ======= #
+        # 1. SHORT STREAM: Process for sound classification (keep as is)
+        # 2. LONG STREAM: Accumulate audio for speech transcription
+        
+        # Add current audio to the long buffer for transcription
+        with long_buffer_lock:
+            # Save 800 samples for overlap between chunks (helps with continuity)
+            if len(np_wav) > 800:
+                print(f"Saved 800 samples for overlap")
+                overlap_samples = np_wav[-800:]
+            else:
+                overlap_samples = np_wav
+                
+            # Add the new audio to the long buffer
+            long_buffer.append(np_wav)
+            
+            # Calculate total samples in long buffer
+            total_samples = sum(len(chunk) for chunk in long_buffer)
+            
+            # If buffer exceeds maximum size, trim it while maintaining overlap
+            if total_samples > LONG_BUFFER_SAMPLES:
+                # Keep removing chunks from the start until we're under the limit
+                while sum(len(chunk) for chunk in long_buffer) > LONG_BUFFER_SAMPLES and len(long_buffer) > 1:
+                    long_buffer.pop(0)
+            
+            # Check if we have enough audio and enough time has passed since last transcription
+            current_time = time.time()
+            buffer_duration = sum(len(chunk) for chunk in long_buffer) / RATE
+            time_since_last_transcription = current_time - last_transcription_time
+            
+            has_minimum_audio = sum(len(chunk) for chunk in long_buffer) >= LONG_BUFFER_MIN_SAMPLES
+            enough_time_passed = time_since_last_transcription >= MIN_TRANSCRIPTION_INTERVAL
+            
+            # Process the long buffer for transcription if conditions are met
+            if has_minimum_audio and enough_time_passed and GOOGLE_CLOUD_ENABLED:
+                # Concatenate all chunks in the buffer
+                long_audio = np.concatenate(long_buffer)
+                
+                # Send to streaming recognizer for real-time transcription
+                if streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
+                    print(f"Send raw audio to server")
+                    print(f"Using local socket (connected: {streaming_recognizer.is_active})")
+                    streaming_recognizer.add_audio(long_audio)
+                    last_transcription_time = current_time
         
         # Skip sound classification processing if the audio is silent (very low RMS)
         if rms < SILENCE_RMS_THRESHOLD:
