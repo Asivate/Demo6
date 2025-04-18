@@ -326,7 +326,7 @@ class SimpleStreamingRecognizer:
                                     
                                     # Emit through Socket.IO
                                     socketio.emit('transcript_update', {
-                                        'transcript': transcript,
+                                        'transcription': transcript,
                                         'timestamp': time.time(),
                                         'is_final': True
                                     })
@@ -334,7 +334,7 @@ class SimpleStreamingRecognizer:
                                 # Only emit interim results with decent stability
                                 print(f"Interim transcript (stability {stability:.2f}): {transcript}")
                                 socketio.emit('transcript_update', {
-                                    'transcript': transcript,
+                                    'transcription': transcript,
                                     'timestamp': time.time(),
                                     'is_final': False
                                 })
