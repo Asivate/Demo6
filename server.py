@@ -298,7 +298,15 @@ class SimpleStreamingRecognizer:
                                 continue
                                 
                             transcript = result.alternatives[0].transcript
-                            stability = result.alternatives[0].stability
+                            
+                            # Check if stability field exists before accessing it
+                            stability = 0.0
+                            try:
+                                stability = result.alternatives[0].stability
+                            except (AttributeError, ValueError) as e:
+                                # Ignore stability field errors
+                                pass
+                                
                             is_final = result.is_final
                             
                             if is_final:
@@ -668,104 +676,119 @@ def assess_audio_quality(audio_data):
 
 @socketio.on('audio_data')
 def handle_source(json_data):
-    data = str(json_data['data'])
-    data = data[1:-1]
-    global graph, model, sess, streaming_recognizer
-    np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
-        32768.0  # Convert to [-1.0, +1.0]
-    
-    # Compute RMS and convert to dB
-    rms = np.sqrt(np.mean(np_wav**2))
-    db = dbFS(rms)
-    
-    # Log basic audio metrics
-    print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
-    
-    # Process for speech recognition
-    if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-        # Send audio to the streaming recognizer
-        # No need for extensive preprocessing now, our recognizer handles conversion
-        streaming_recognizer.add_audio(np_wav)
-    
-    # Skip sound classification processing if the audio is silent (very low RMS)
-    if rms < SILENCE_RMS_THRESHOLD:
-        print(f"Detected silent audio frame. Skipping classification.")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Silent',
-                        'accuracy': '1.0',
-                        'db': str(db)
-                    },
-                    room=request.sid)
-        return
-    
-    # Ensure we have enough audio data for feature extraction
-    if len(np_wav) < 16000:
-        print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
-        # Pad with zeros to reach 1 second if needed
-        padding = np.zeros(16000 - len(np_wav))
-        np_wav = np.concatenate((np_wav, padding))
-        print(f"Padded audio to {len(np_wav)} samples")
-    
-    # Sound classification processing
+    """
+    Handles audio data from the client for sound event detection
+    """
     try:
-        # Make predictions
-        print('Making sound classification prediction...')
-        x = waveform_to_examples(np_wav, RATE)
+        print(f"Received audio data from client: {request.sid[:10]}...")
+        data = str(json_data['data'])
+        data = data[1:-1]
+        global graph, model, sess, streaming_recognizer
+        np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
+            32768.0  # Convert to [-1.0, +1.0]
         
-        # Handle multiple frames - take the first frame if multiple are generated
-        if x.shape[0] > 1:
-            print(f"Multiple frames detected ({x.shape[0]}), using first frame")
-            x = x[0:1]
+        # Compute RMS and convert to dB
+        rms = np.sqrt(np.mean(np_wav**2))
+        db = dbFS(rms)
         
-        # Check if x is empty (shape[0] == 0)
-        if x.shape[0] == 0:
-            print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
-            # Create dummy features for testing - one frame of the right dimensions
-            x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
+        # Log basic audio metrics
+        print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
         
-        # Add the channel dimension required by the model
-        x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+        # Process for speech recognition
+        if GOOGLE_CLOUD_ENABLED and streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
+            # Send audio to the streaming recognizer
+            # No need for extensive preprocessing now, our recognizer handles conversion
+            streaming_recognizer.add_audio(np_wav)
         
-        # Use the global session and graph context to run predictions
-        with sess.as_default():
-            with graph.as_default():
-                pred = model.predict(x)
-                
-                context_prediction = np.take(
-                    pred[0], [homesounds.labels[x] for x in active_context])
-                m = np.argmax(context_prediction)
-                print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
-                
-                # If confidence is high enough, send the label
-                if context_prediction[m] > PREDICTION_THRES:
-                    # Send result using both event names for compatibility
-                    prediction_result = {
-                        'label': str(homesounds.to_human_labels[active_context[m]]),
-                        'accuracy': str(context_prediction[m]),
-                        'db': str(db)
-                    }
+        # Skip sound classification processing if the audio is silent (very low RMS)
+        if rms < SILENCE_RMS_THRESHOLD:
+            print(f"Detected silent audio frame. Skipping classification.")
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Silent',
+                            'accuracy': '1.0',
+                            'db': str(db)
+                        },
+                        room=request.sid)
+            return
+        
+        # Ensure we have enough audio data for feature extraction
+        if len(np_wav) < 16000:
+            print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
+            # Pad with zeros to reach 1 second if needed
+            padding = np.zeros(16000 - len(np_wav))
+            np_wav = np.concatenate((np_wav, padding))
+            print(f"Padded audio to {len(np_wav)} samples")
+        
+        # Sound classification processing
+        try:
+            # Make predictions
+            print('Making sound classification prediction...')
+            x = waveform_to_examples(np_wav, RATE)
+            
+            # Handle multiple frames - take the first frame if multiple are generated
+            if x.shape[0] > 1:
+                print(f"Multiple frames detected ({x.shape[0]}), using first frame")
+                x = x[0:1]
+            
+            # Check if x is empty (shape[0] == 0)
+            if x.shape[0] == 0:
+                print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
+                # Create dummy features for testing - one frame of the right dimensions
+                x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
+            
+            # Add the channel dimension required by the model
+            x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
+            
+            # Use the global session and graph context to run predictions
+            with sess.as_default():
+                with graph.as_default():
+                    pred = model.predict(x)
                     
-                    # Emit as 'audio_label' for updated client
-                    socketio.emit('audio_label', prediction_result, room=request.sid)
+                    context_prediction = np.take(
+                        pred[0], [homesounds.labels[x] for x in active_context])
+                    m = np.argmax(context_prediction)
+                    print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
                     
-                    # Also emit as 'predict_sound' for backward compatibility
-                    socketio.emit('predict_sound', {
-                        'label': str(homesounds.to_human_labels[active_context[m]]),
-                        'confidence': float(context_prediction[m])
-                    }, room=request.sid)
-                    
-                    print(f"Emitted prediction via both audio_label and predict_sound events: {prediction_result['label']}")
-                else:
-                    socketio.emit('audio_label',
-                                {
-                                    'label': 'Unrecognized Sound',
-                                    'accuracy': '1.0',
-                                    'db': str(db)
-                                },
-                                room=request.sid)
+                    # If confidence is high enough, send the label
+                    if context_prediction[m] > PREDICTION_THRES:
+                        # Send result using both event names for compatibility
+                        prediction_result = {
+                            'label': str(homesounds.to_human_labels[active_context[m]]),
+                            'accuracy': str(context_prediction[m]),
+                            'db': str(db)
+                        }
+                        
+                        # Emit as 'audio_label' for updated client
+                        socketio.emit('audio_label', prediction_result, room=request.sid)
+                        
+                        # Also emit as 'predict_sound' for backward compatibility
+                        socketio.emit('predict_sound', {
+                            'label': str(homesounds.to_human_labels[active_context[m]]),
+                            'confidence': float(context_prediction[m])
+                        }, room=request.sid)
+                        
+                        print(f"Emitted prediction via both audio_label and predict_sound events: {prediction_result['label']}")
+                    else:
+                        socketio.emit('audio_label',
+                                    {
+                                        'label': 'Unrecognized Sound',
+                                        'accuracy': '1.0',
+                                        'db': str(db)
+                                    },
+                                    room=request.sid)
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            socketio.emit('audio_label',
+                        {
+                            'label': 'Processing Error',
+                            'accuracy': '1.0',
+                            'error': str(e),
+                            'db': str(db)
+                        },
+                        room=request.sid)
     except Exception as e:
-        print(f"Error during prediction: {e}")
+        print(f"Error processing audio data: {e}")
         socketio.emit('audio_label',
                     {
                         'label': 'Processing Error',
@@ -1321,18 +1344,14 @@ def disconnect_request():
          {'data': 'Disconnected!', 'count': session['receive_count']},
          callback=can_disconnect)
 
-@socketio.on('connect', namespace='/test')
-def test_connect():
-    global thread
-    with thread_lock:
-        if thread is None:
-            thread = socketio.start_background_task(background_thread)
-    emit('my_response', {'data': 'Connected', 'count': 0})
+@socketio.on('connect')
+def on_connect():
+    print(f"Client connected: {request.sid}")
+    emit('connection_response', {'status': 'connected', 'sid': request.sid})
 
-
-@socketio.on('disconnect', namespace='/test')
-def test_disconnect():
-    print('Client disconnected', request.sid)
+@socketio.on('disconnect')
+def on_disconnect():
+    print(f"Client disconnected: {request.sid}")
 
 @app.route('/speech_status')
 def speech_status():
