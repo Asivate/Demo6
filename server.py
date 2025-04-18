@@ -95,46 +95,21 @@ except Exception as e:
     GOOGLE_CLOUD_ENABLED = False
 
 # Dual-stream buffers for separate audio processing paths
-# Buffer for speech recognition (holds audio data for processing)
-speech_buffer = []
-speech_buffer_lock = threading.Lock()
-speech_processing_queue = queue.Queue()
-
 # Short buffer for sound classification (1 second chunks)
 short_buffer = []
 # Long buffer for speech transcription (accumulates longer audio)
 long_buffer = []
 long_buffer_lock = threading.Lock()
-
-# Buffer configuration
-LONG_BUFFER_MAX_SECONDS = 10  # Maximum seconds to accumulate for transcription
-LONG_BUFFER_SAMPLES = RATE * LONG_BUFFER_MAX_SECONDS  # 16000 samples/sec * 10 seconds = 160000 samples
-LONG_BUFFER_MIN_SECONDS = 3  # Minimum seconds required before attempting transcription
-LONG_BUFFER_MIN_SAMPLES = RATE * LONG_BUFFER_MIN_SECONDS  # 48000 samples
+# Threshold for minimum buffer size before processing transcription
+LONG_BUFFER_MIN_SECONDS = 8  # Minimum seconds of audio for better transcription 
+LONG_BUFFER_MAX_SECONDS = 30  # Maximum seconds to prevent memory issues
+LONG_BUFFER_MIN_SAMPLES = RATE * LONG_BUFFER_MIN_SECONDS  # 128000 samples
+LONG_BUFFER_MAX_SAMPLES = RATE * LONG_BUFFER_MAX_SECONDS  # 480000 samples
+TRANSCRIPTION_OVERLAP_SECONDS = 2  # Seconds of audio to keep between transcriptions
 
 # Timing controls
 last_transcription_time = time.time()
-MIN_TRANSCRIPTION_INTERVAL = 2  # Minimum seconds between transcription requests
-
-# Dual-stream buffers for separate audio processing paths
-# Short buffer for sound classification (1 second chunks)
-short_buffer = []
-# Long buffer for speech transcription (accumulates 8 seconds)
-long_buffer = []
-long_buffer_lock = threading.Lock()
-# Buffer configuration
-LONG_BUFFER_SECONDS = 8  # Accumulate 8 seconds of audio for better transcription
-LONG_BUFFER_SAMPLES = RATE * LONG_BUFFER_SECONDS  # 16000 samples/sec * 8 seconds = 128000 samples
-LONG_BUFFER_OVERLAP = 2  # 2 second overlap between consecutive long buffers
-LONG_BUFFER_OVERLAP_SAMPLES = RATE * LONG_BUFFER_OVERLAP  # 32000 samples
-last_transcription_time = time.time()
 MIN_TRANSCRIPTION_INTERVAL = 3  # Minimum seconds between transcription requests
-
-# For streaming speech recognition
-STREAMING_LIMIT = 290000  # ~5 minutes
-streaming_speech_thread = None
-streaming_active = True
-streaming_recognizer = None
 
 class SimpleStreamingRecognizer:
     """Simple streaming speech recognition based on proven implementation"""
@@ -475,7 +450,7 @@ class SimpleStreamingRecognizer:
                             if buffer:  # Only yield if buffer has content
                                 yield buffer
                                 buffer = b''
-                                last_yield_time = time.time()
+                                last_yield_time = time.time
                         
                         buffer += chunk
                     except queue.Empty:
@@ -576,128 +551,239 @@ with sess.as_default():
     model = load_model(model_filename)
     graph = tf.compat.v1.get_default_graph()
 
-##############################
-# Setup Audio Callback
-##############################
-
-
-def audio_samples(in_data, frame_count, time_info, status_flags):
-    global graph, model, sess
-    np_wav = np.fromstring(in_data, dtype=np.int16) / \
-        32768.0  # Convert to [-1.0, +1.0]
-    # Compute RMS and convert to dB
-    rms = np.sqrt(np.mean(np_wav**2))
-    db = dbFS(rms)
-
-    # Make predictions
-    x = waveform_to_examples(np_wav, RATE)
-    predictions = []
-    with sess.as_default():
-        with graph.as_default():
-            if x.shape[0] != 0:
-                x = x.reshape(len(x), 96, 64, 1)
-                print('Reshape x successful', x.shape)
-                pred = model.predict(x)
-                predictions.append(pred)
-            print('Prediction succeeded')
-            for prediction in predictions:
-                context_prediction = np.take(
-                    prediction[0], [homesounds.labels[x] for x in active_context])
-                m = np.argmax(context_prediction)
-                if (context_prediction[m] > PREDICTION_THRES and db > DBLEVEL_THRES):
-                    print("Prediction: %s (%0.2f)" % (
-                        homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-
-    return (in_data, pyaudio.paContinue)
-
-
-@socketio.on('audio_feature_data')
-def handle_source_features(json_data):
-    '''Acoustic features: processes a list of features for predictions'''
-    global graph, model, sess
-    
-    # Parse the input
-    data = str(json_data['data'])
-    data = data[1:-1]
-    print('Data before transform to np', data)
+@socketio.on('audio_data')
+def handle_audio_data(json_data):
     try:
-        x = np.fromstring(data, dtype=np.float16, sep=',')
-        print('Data after to numpy:', x.shape, 'min:', x.min(), 'max:', x.max())
-    
-        # Handle multiple frames if present
-        if len(x) > vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
-            print(f"Warning: Received {len(x)} values, expected {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
-            x = x[:vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS]
-        elif len(x) < vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS:
-            print(f"Warning: Received {len(x)} values, padding to {vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS}")
-            padding = np.zeros(vggish_params.NUM_FRAMES * vggish_params.NUM_BANDS - len(x))
-            x = np.concatenate((x, padding))
+        audio_binary = json_data['audio']
         
-        # Reshape using vggish_params constants
-        x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-        print('Successfully reshaped audio features to', x.shape)
-    
-        predictions = []
+        # Decode base64 audio
+        audio_bytes = base64.b64decode(audio_binary)
+        audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
         
-        # Get the dB level from the JSON data or use a default value
-        db = float(json_data.get('db', DBLEVEL_THRES))
+        # Calculate audio metrics
+        rms = np.sqrt(np.mean(audio_np**2))
+        db = dbFS(rms)
         
-        # Use the global session and graph context to run predictions
-        with sess.as_default():
-            with graph.as_default():
-                pred = model.predict(x)
-                predictions.append(pred)
-                
-                for prediction in predictions:
+        print(f"Audio received - length: {len(audio_np)}, RMS: {rms:.4f}, dB: {db:.1f}")
+        
+        # Process audio for sound classification (short buffer)
+        process_audio_for_classification(audio_np, db)
+        
+        # Process audio for speech transcription (long buffer)
+        process_audio_for_transcription(audio_np)
+        
+        # Update last client activity time
+        update_client_activity(request.sid)
+        
+    except Exception as e:
+        print(f"Error handling audio data: {e}")
+        import traceback
+        traceback.print_exc()
+
+def process_audio_for_classification(audio_np, db):
+    """Process audio for sound classification using the short buffer"""
+    try:
+        # Sound classification works well with short chunks 
+        # so we use the audio directly
+        print("Making sound classification prediction...")
+        print(f"Audio data: shape={audio_np.shape}, min={audio_np.min():.4f}, max={audio_np.max():.4f}, rms={np.sqrt(np.mean(audio_np**2)):.4f}")
+        
+        # Convert audio to features
+        x = waveform_to_examples(audio_np, RATE)
+        if x.shape[0] != 0:
+            x = x.reshape(len(x), 96, 64, 1)
+            print(f"Generated features: shape={x.shape}")
+            
+            with sess.as_default():
+                with graph.as_default():
+                    # Make prediction
+                    pred = model.predict(x)
                     context_prediction = np.take(
-                        prediction[0], [homesounds.labels[x] for x in active_context])
+                        pred[0], [homesounds.labels[x] for x in active_context])
                     m = np.argmax(context_prediction)
-                    print('Max prediction', str(
-                        homesounds.to_human_labels[active_context[m]]), str(context_prediction[m]))
                     
-                    # Modified condition - look at db and confidence together for debugging
-                    print(f"Prediction confidence: {context_prediction[m]}, Threshold: {PREDICTION_THRES}")
-                    print(f"db level: {db}, Threshold: {DBLEVEL_THRES}")
-                    
-                    # Original condition was too strict - many sounds were being classified as "Unrecognized"
                     if context_prediction[m] > PREDICTION_THRES:
-                        # Send result using both event names to support both implementations
+                        label = homesounds.to_human_labels[active_context[m]]
+                        accuracy = context_prediction[m]
+                        print(f"Sound classification: {label} ({accuracy:.4f})")
+                        
+                        # Emit the prediction to the client
                         prediction_result = {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'accuracy': str(context_prediction[m]),
+                            'label': label,
+                            'accuracy': str(accuracy),
                             'db': str(db)
                         }
                         
-                        # Emit as 'audio_label' for the updated client
+                        # Send via both event types for compatibility
                         socketio.emit('audio_label', prediction_result, room=request.sid)
-                        
-                        # Also emit as 'predict_sound' for backward compatibility
                         socketio.emit('predict_sound', {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'confidence': float(context_prediction[m])
+                            'label': label,
+                            'confidence': float(accuracy)
                         }, room=request.sid)
                         
-                        print("Prediction: %s (%0.2f)" % (
-                            homesounds.to_human_labels[active_context[m]], context_prediction[m]))
-                    else:
-                        # Send unrecognized sound notification
-                        socketio.emit('audio_label',
-                                    {
-                                        'label': 'Unrecognized Sound',
-                                        'accuracy': '1.0',
-                                        'db': str(db)
-                                    },
-                                    room=request.sid)
+                        print(f"Emitted prediction via both audio_label and predict_sound events: {label}")
     except Exception as e:
-        print(f"Error during feature prediction: {e}")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Processing Error',
-                        'accuracy': '1.0',
-                        'error': str(e),
-                        'db': str('-60.0')  # Default value if db extraction fails
-                    },
-                    room=request.sid)
+        print(f"Error in sound classification: {e}")
+        import traceback
+        traceback.print_exc()
+
+def process_audio_for_transcription(audio_np):
+    """Process audio for speech transcription using the long buffer"""
+    global long_buffer, last_transcription_time
+    
+    try:
+        with long_buffer_lock:
+            # Add new audio to the long buffer
+            long_buffer.extend(audio_np)
+            
+            # Check if we have enough audio to process and enough time has passed
+            current_time = time.time()
+            time_since_last = current_time - last_transcription_time
+            buffer_duration = len(long_buffer) / RATE
+            
+            # Conditions for processing:
+            # 1. Buffer is large enough (at least LONG_BUFFER_MIN_SAMPLES)
+            # 2. Enough time has passed since last transcription
+            # 3. Google Cloud is enabled
+            if (len(long_buffer) >= LONG_BUFFER_MIN_SAMPLES and 
+                time_since_last >= MIN_TRANSCRIPTION_INTERVAL and
+                GOOGLE_CLOUD_ENABLED):
+                
+                print(f"Processing speech transcription for {buffer_duration:.1f}s of audio")
+                
+                # Create a copy of the buffer for processing
+                buffer_for_processing = np.array(long_buffer, dtype=np.float32)
+                
+                # Trim the long buffer (keep overlap for context)
+                overlap_samples = int(TRANSCRIPTION_OVERLAP_SECONDS * RATE)
+                if len(long_buffer) > overlap_samples:
+                    long_buffer = long_buffer[-overlap_samples:]
+                else:
+                    long_buffer = []
+                
+                # Update the last transcription time
+                last_transcription_time = current_time
+                
+                # Process the audio in a separate thread to avoid blocking
+                threading.Thread(
+                    target=perform_speech_transcription,
+                    args=(buffer_for_processing,),
+                    daemon=True
+                ).start()
+            
+            # Cap the buffer size to prevent memory issues
+            if len(long_buffer) > LONG_BUFFER_MAX_SAMPLES:
+                excess = len(long_buffer) - LONG_BUFFER_MAX_SAMPLES
+                long_buffer = long_buffer[excess:]
+                print(f"Trimmed {excess} samples from long_buffer to prevent memory issues")
+    
+    except Exception as e:
+        print(f"Error in audio transcription processing: {e}")
+        import traceback
+        traceback.print_exc()
+        # Reset buffer if there's an error
+        with long_buffer_lock:
+            long_buffer = []
+
+def perform_speech_transcription(audio_data):
+    """Perform speech transcription on the provided audio data"""
+    try:
+        # Check audio quality first
+        is_suitable, reason, processed_audio = assess_audio_quality(audio_data)
+        
+        if not is_suitable:
+            print(f"Audio unsuitable for transcription: {reason}")
+            return
+        
+        # Convert float32 [-1.0, 1.0] to int16
+        audio_int16 = (processed_audio * 32767).astype(np.int16)
+        
+        # Convert to bytes
+        audio_bytes = audio_int16.tobytes()
+        
+        # Create audio content
+        audio = speech.RecognitionAudio(content=audio_bytes)
+        
+        # Configure recognition
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="en-US",
+            max_alternatives=1,
+            enable_automatic_punctuation=True,
+            use_enhanced=True,
+            model="default"
+        )
+        
+        # Perform recognition
+        print("Sending audio to Google Speech-to-Text...")
+        response = speech_client.recognize(config=config, audio=audio)
+        
+        # Process results
+        transcript = ""
+        confidence = 0.0
+        
+        if response.results:
+            for result in response.results:
+                for alternative in result.alternatives:
+                    transcript += alternative.transcript + " "
+                    confidence = alternative.confidence
+            
+            transcript = transcript.strip()
+            
+            if transcript:
+                print(f"Got transcript: '{transcript}' with confidence {confidence}")
+                
+                # Perform sentiment analysis on transcript if it's meaningful
+                if len(transcript.split()) >= 3 and confidence > 0.7:
+                    threading.Thread(
+                        target=perform_sentiment_analysis,
+                        args=(transcript,),
+                        daemon=True
+                    ).start()
+                
+                # Send transcript to client
+                socketio.emit('transcript', {
+                    'text': transcript,
+                    'confidence': confidence
+                }, room=request.sid)
+            else:
+                print("No meaningful transcript returned")
+        else:
+            print("No transcription results")
+            
+    except Exception as e:
+        print(f"Error in speech transcription: {e}")
+        import traceback
+        traceback.print_exc()
+
+def perform_sentiment_analysis(text):
+    """Perform sentiment analysis on the provided text"""
+    try:
+        if not GOOGLE_CLOUD_ENABLED:
+            return
+            
+        document = language_v1.Document(
+            content=text,
+            type_=language_v1.Document.Type.PLAIN_TEXT
+        )
+        
+        # Analyze sentiment
+        sentiment = language_client.analyze_sentiment(
+            request={"document": document}
+        ).document_sentiment
+        
+        print(f"Sentiment analysis: score={sentiment.score}, magnitude={sentiment.magnitude}")
+        
+        # Send sentiment to client
+        socketio.emit('sentiment', {
+            'score': sentiment.score,
+            'magnitude': sentiment.magnitude,
+            'text': text
+        }, room=request.sid)
+        
+    except Exception as e:
+        print(f"Error in sentiment analysis: {e}")
 
 def assess_audio_quality(audio_data):
     """
@@ -739,171 +825,6 @@ def assess_audio_quality(audio_data):
           f"Processed(RMS: {processed_rms:.4f}, peak: {processed_peak:.4f}, dB: {processed_db:.1f})")
     
     return True, "Audio suitable for recognition", processed_audio
-
-@socketio.on('audio_data')
-def handle_source(json_data):
-    """
-    Handles audio data from the client for sound event detection and speech transcription
-    Implements a dual-stream approach: short chunks for sound classification and longer buffers for transcription
-    """
-    try:
-        print(f"Received audio data from client: {request.sid[:10]}...")
-        data = str(json_data['data'])
-        data = data[1:-1]
-        global graph, model, sess, streaming_recognizer, long_buffer, last_transcription_time
-        np_wav = np.fromstring(data, dtype=np.int16, sep=',') / \
-            32768.0  # Convert to [-1.0, +1.0]
-        
-        # Compute RMS and convert to dB
-        rms = np.sqrt(np.mean(np_wav**2))
-        db = dbFS(rms)
-        
-        # Log basic audio metrics
-        print(f'Audio received - length: {len(np_wav)}, RMS: {rms:.4f}, dB: {db:.1f}')
-        
-        # ======= DUAL STREAM PROCESSING ======= #
-        # 1. SHORT STREAM: Process for sound classification (keep as is)
-        # 2. LONG STREAM: Accumulate audio for speech transcription
-        
-        # Add current audio to the long buffer for transcription
-        with long_buffer_lock:
-            # Save 800 samples for overlap between chunks (helps with continuity)
-            if len(np_wav) > 800:
-                print(f"Saved 800 samples for overlap")
-                overlap_samples = np_wav[-800:]
-            else:
-                overlap_samples = np_wav
-                
-            # Add the new audio to the long buffer
-            long_buffer.append(np_wav)
-            
-            # Calculate total samples in long buffer
-            total_samples = sum(len(chunk) for chunk in long_buffer)
-            
-            # If buffer exceeds maximum size, trim it while maintaining overlap
-            if total_samples > LONG_BUFFER_SAMPLES:
-                # Keep removing chunks from the start until we're under the limit
-                while sum(len(chunk) for chunk in long_buffer) > LONG_BUFFER_SAMPLES and len(long_buffer) > 1:
-                    long_buffer.pop(0)
-            
-            # Check if we have enough audio and enough time has passed since last transcription
-            current_time = time.time()
-            buffer_duration = sum(len(chunk) for chunk in long_buffer) / RATE
-            time_since_last_transcription = current_time - last_transcription_time
-            
-            has_minimum_audio = sum(len(chunk) for chunk in long_buffer) >= LONG_BUFFER_MIN_SAMPLES
-            enough_time_passed = time_since_last_transcription >= MIN_TRANSCRIPTION_INTERVAL
-            
-            # Process the long buffer for transcription if conditions are met
-            if has_minimum_audio and enough_time_passed and GOOGLE_CLOUD_ENABLED:
-                # Concatenate all chunks in the buffer
-                long_audio = np.concatenate(long_buffer)
-                
-                # Send to streaming recognizer for real-time transcription
-                if streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
-                    print(f"Send raw audio to server")
-                    print(f"Using local socket (connected: {streaming_recognizer.is_active})")
-                    streaming_recognizer.add_audio(long_audio)
-                    last_transcription_time = current_time
-        
-        # Skip sound classification processing if the audio is silent (very low RMS)
-        if rms < SILENCE_RMS_THRESHOLD:
-            print(f"Detected silent audio frame. Skipping classification.")
-            socketio.emit('audio_label',
-                        {
-                            'label': 'Silent',
-                            'accuracy': '1.0',
-                            'db': str(db)
-                        },
-                        room=request.sid)
-            return
-        
-        # Ensure we have enough audio data for feature extraction
-        if len(np_wav) < 16000:
-            print(f"Warning: Audio length {len(np_wav)} is less than 1 second (16000 samples)")
-            # Pad with zeros to reach 1 second if needed
-            padding = np.zeros(16000 - len(np_wav))
-            np_wav = np.concatenate((np_wav, padding))
-            print(f"Padded audio to {len(np_wav)} samples")
-        
-        # Sound classification processing
-        try:
-            # Make predictions
-            print('Making sound classification prediction...')
-            x = waveform_to_examples(np_wav, RATE)
-            
-            # Handle multiple frames - take the first frame if multiple are generated
-            if x.shape[0] > 1:
-                print(f"Multiple frames detected ({x.shape[0]}), using first frame")
-                x = x[0:1]
-            
-            # Check if x is empty (shape[0] == 0)
-            if x.shape[0] == 0:
-                print("Warning: waveform_to_examples returned empty array. Creating dummy features.")
-                # Create dummy features for testing - one frame of the right dimensions
-                x = np.zeros((1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS))
-            
-            # Add the channel dimension required by the model
-            x = x.reshape(1, vggish_params.NUM_FRAMES, vggish_params.NUM_BANDS, 1)
-            
-            # Use the global session and graph context to run predictions
-            with sess.as_default():
-                with graph.as_default():
-                    pred = model.predict(x)
-                    
-                    context_prediction = np.take(
-                        pred[0], [homesounds.labels[x] for x in active_context])
-                    m = np.argmax(context_prediction)
-                    print(f'Sound classification: {homesounds.to_human_labels[active_context[m]]} ({context_prediction[m]:.4f})')
-                    
-                    # If confidence is high enough, send the label
-                    if context_prediction[m] > PREDICTION_THRES:
-                        # Send result using both event names for compatibility
-                        prediction_result = {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'accuracy': str(context_prediction[m]),
-                            'db': str(db)
-                        }
-                        
-                        # Emit as 'audio_label' for updated client
-                        socketio.emit('audio_label', prediction_result, room=request.sid)
-                        
-                        # Also emit as 'predict_sound' for backward compatibility
-                        socketio.emit('predict_sound', {
-                            'label': str(homesounds.to_human_labels[active_context[m]]),
-                            'confidence': float(context_prediction[m])
-                        }, room=request.sid)
-                        
-                        print(f"Emitted prediction via both audio_label and predict_sound events: {prediction_result['label']}")
-                    else:
-                        socketio.emit('audio_label',
-                                    {
-                                        'label': 'Unrecognized Sound',
-                                        'accuracy': '1.0',
-                                        'db': str(db)
-                                    },
-                                    room=request.sid)
-        except Exception as e:
-            print(f"Error during prediction: {e}")
-            socketio.emit('audio_label',
-                        {
-                            'label': 'Processing Error',
-                            'accuracy': '1.0',
-                            'error': str(e),
-                            'db': str(db)
-                        },
-                        room=request.sid)
-    except Exception as e:
-        print(f"Error processing audio data: {e}")
-        socketio.emit('audio_label',
-                    {
-                        'label': 'Processing Error',
-                        'accuracy': '1.0',
-                        'error': str(e),
-                        'db': str(db)
-                    },
-                    room=request.sid)
-
 
 def background_thread():
     """Example of how to send server generated events to clients."""
@@ -1261,7 +1182,7 @@ def test_speech():
         html += "<p>Possible reasons:</p>"
         html += "<ul>"
         html += "<li>The generated test audio doesn't contain actual speech (expected for synthetic audio)</li>"
-        html += "<li>API credentials don't have access to the Speech-to-Text API</li>"
+        html += "<li>API credentials don't have access to Speech-to-Text API</li>"
         html += "<li>There might be configuration issues with the API</li>"
         html += "</ul>"
         html += "<p>You can also try the <a href='/test_sentiment'>sentiment analysis test</a> to verify that part of the pipeline.</p>"
