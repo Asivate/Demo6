@@ -324,18 +324,40 @@ class SimpleStreamingRecognizer:
                                     # Add to processing queue for sentiment analysis
                                     speech_processing_queue.put(audio_np)
                                     
-                                    # Emit through Socket.IO
+                                    # Generate basic sentiment values for instant feedback
+                                    # This provides immediate sentiment while proper analysis happens in background
+                                    basic_sentiment_score = 0.0  # Neutral default
+                                    basic_emotion = "Neutral"
+                                    basic_emoji = "😐"
+                                    
+                                    # Emit through Socket.IO with consistent field names and additional sentiment fields
                                     socketio.emit('transcript_update', {
-                                        'transcription': transcript,
-                                        'timestamp': time.time(),
+                                        'transcription': transcript,  # Keep consistent with other places
+                                        'confidence': 1.0,           # High confidence for final results
+                                        'emotion': basic_emotion,    # Placeholder until real sentiment analysis
+                                        'emoji': basic_emoji,        # Placeholder emoji
+                                        'sentiment_score': basic_sentiment_score,
+                                        'sentiment_magnitude': 0.0,
+                                        'timestamp': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                                         'is_final': True
                                     })
                             elif stability > 0.5:
                                 # Only emit interim results with decent stability
                                 print(f"Interim transcript (stability {stability:.2f}): {transcript}")
+                                
+                                # Provide basic sentiment values for interim results too
+                                basic_sentiment_score = 0.0  # Neutral default
+                                basic_emotion = "Neutral"
+                                basic_emoji = "😐"
+                                
                                 socketio.emit('transcript_update', {
-                                    'transcription': transcript,
-                                    'timestamp': time.time(),
+                                    'transcription': transcript,    # Keep consistent field naming
+                                    'confidence': stability,        # Use stability as confidence
+                                    'emotion': basic_emotion,       # Basic placeholder
+                                    'emoji': basic_emoji,           # Basic placeholder
+                                    'sentiment_score': basic_sentiment_score,
+                                    'sentiment_magnitude': 0.0,
+                                    'timestamp': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                                     'is_final': False
                                 })
                     
@@ -926,13 +948,14 @@ def process_speech_for_sentiment(audio_data):
         
         # Create transcript entry for history
         transcript_entry = {
-            "transcription": transcript,
+            "transcription": transcript,  # Keep consistent with streaming format
             "confidence": float(confidence),
             "emotion": emotion,
             "emoji": emoji,
             "sentiment_score": float(sentiment.score),
             "sentiment_magnitude": float(sentiment.magnitude),
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "is_final": True   # Always final for sentiment analysis
         }
         
         # Send to connected clients
@@ -942,7 +965,7 @@ def process_speech_for_sentiment(audio_data):
             'db': str(db),
             'emoji': emoji,
             'emotion': emotion,
-            'transcription': transcript,
+            'transcription': transcript,  # Consistent field naming
             'confidence': confidence,
             'sentiment_score': sentiment.score,
             'sentiment_magnitude': sentiment.magnitude,
