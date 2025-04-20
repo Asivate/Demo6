@@ -475,7 +475,7 @@ class SimpleStreamingRecognizer:
                             if buffer:  # Only yield if buffer has content
                                 yield buffer
                                 buffer = b''
-                                last_yield_time = time.time()
+                                last_yield_time = time.time
                         
                         buffer += chunk
                     except queue.Empty:
@@ -580,6 +580,30 @@ with sess.as_default():
 # Setup Audio Callback
 ##############################
 
+@socketio.on('sentiment_audio_data')
+def handle_sentiment_audio(json_data):
+    """
+    Receives audio data from the client specifically for sentiment analysis (separate from classification).
+    Expects json_data['data'] as a string of comma-separated int16 samples.
+    """
+    try:
+        print(f"[sentiment_audio_data] Received sentiment audio from client: {request.sid[:10]}...")
+        data = str(json_data['data'])
+        data = data[1:-1]
+        np_wav = np.fromstring(data, dtype=np.int16, sep=',') / 32768.0  # Convert to [-1.0, +1.0]
+
+        # Process for sentiment analysis
+        transcript_entry = process_speech_for_sentiment(np_wav)
+        if transcript_entry:
+            # Optionally emit a dedicated sentiment notification event (for watch/mobile notifications)
+            socketio.emit('sentiment_notification', transcript_entry, room=request.sid)
+            print(f"[sentiment_audio_data] Emitted sentiment_notification: {transcript_entry}")
+        else:
+            print("[sentiment_audio_data] No transcript entry generated.")
+    except Exception as e:
+        print(f"[sentiment_audio_data] Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def audio_samples(in_data, frame_count, time_info, status_flags):
     global graph, model, sess
