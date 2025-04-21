@@ -1034,7 +1034,16 @@ def process_speech_for_sentiment(audio_data):
         )
         
         print("Sending audio to Google Speech-to-Text API...")
-        response = speech_client.recognize(config=config, audio=audio)
+        try:
+            response = speech_client.recognize(config=config, audio=audio)
+        except Exception as e:
+            print(f"[ERROR] Speech-to-Text recognize() failed: {e}")
+            socketio.emit('transcript_update', {
+                'transcript': '',
+                'status': f'Speech API error: {str(e)}',
+                'sentiment': None
+            }, room=request.sid)
+            return
         
         # Detailed logging of the response
         print(f"Speech API response: {response}")
@@ -1051,18 +1060,28 @@ def process_speech_for_sentiment(audio_data):
         
         if not response.results or not response.results[0].alternatives:
             print("No speech detected in audio segment")
+            socketio.emit('transcript_update', {
+                'transcript': '',
+                'status': 'No speech detected',
+                'sentiment': None
+            }, room=request.sid)
             return
-            
+        
         transcript = response.results[0].alternatives[0].transcript
         confidence = response.results[0].alternatives[0].confidence
         
         # If transcript is empty, skip sentiment analysis
         if not transcript.strip():
             print("Empty transcript, skipping sentiment analysis")
+            socketio.emit('transcript_update', {
+                'transcript': '',
+                'status': 'No speech detected',
+                'sentiment': None
+            }, room=request.sid)
             return
-            
+        
         print(f"Transcript: '{transcript}' (confidence: {confidence})")
-            
+        
         # Process with Natural Language API for sentiment
         document = language_v1.Document(
             content=transcript,
@@ -1235,14 +1254,7 @@ def test_speech():
         
         audio = audio * syllable_env
         
-        # Add a little noise
-        noise = np.random.normal(0, 0.01, samples)
-        audio = audio + noise
-        
-        # Ensure it's within [-1, 1]
-        audio = np.clip(audio, -1, 1)
-        
-        # Convert to int16 for the API
+        # Convert to int16
         audio_int16 = (audio * 32767).astype(np.int16)
         
         # Convert to bytes
