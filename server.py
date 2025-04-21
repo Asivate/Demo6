@@ -939,6 +939,29 @@ def handle_source(json_data):
                     },
                     room=request.sid)
 
+@socketio.on('transcription_audio')
+def handle_transcription_audio(data):
+    """
+    Receives long audio buffer from the mobile app for transcription and sentiment analysis.
+    Expects raw bytes (not JSON) as input.
+    """
+    try:
+        print(f"[transcription_audio] Received long audio buffer from client: {request.sid[:10]}...")
+        # Convert bytes to numpy array (assume int16 PCM)
+        np_wav = np.frombuffer(data, dtype=np.int16) / 32768.0
+        transcript_entry = process_speech_for_sentiment(np_wav)
+        if transcript_entry:
+            socketio.emit('transcript_update', transcript_entry, room=request.sid)
+            print(f"[transcription_audio] Emitted transcript_update: {transcript_entry}")
+            # Optionally emit sentiment as a separate event
+            socketio.emit('sentiment_notification', transcript_entry, room=request.sid)
+            print(f"[transcription_audio] Emitted sentiment_notification: {transcript_entry}")
+        else:
+            print("[transcription_audio] No transcript entry generated.")
+    except Exception as e:
+        print(f"[transcription_audio] Error: {e}")
+        import traceback
+        traceback.print_exc()
 
 def background_thread():
     """Example of how to send server generated events to clients."""
