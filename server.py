@@ -28,6 +28,8 @@ import re
 import sys
 import pyaudio
 import math
+import os
+from debug_audio_dump import save_debug_audio
 
 # Set this variable to "threading", "eventlet" or "gevent" to test the
 # different async modes, or leave it set to None for the application to choose
@@ -318,16 +320,20 @@ class SimpleStreamingRecognizer:
                         )
                         
                         # Process streaming responses
+                        found_result = False
                         for response in responses:
                             self.last_response_time = time.time()
                             
+                            # --- DEBUG: Print full response ---
+                            print(f"[DEBUG] Google Speech API response: {response}")
+                            
                             if not response.results:
                                 continue
-                                
+                            
                             result = response.results[0]
                             if not result.alternatives:
                                 continue
-                                
+                            
                             transcript = result.alternatives[0].transcript
                             
                             # Check if stability field exists before accessing it
@@ -337,10 +343,11 @@ class SimpleStreamingRecognizer:
                             except (AttributeError, ValueError) as e:
                                 # Ignore stability field errors
                                 pass
-                                
+                            
                             is_final = result.is_final
                             
                             if is_final:
+                                found_result = True
                                 self.last_transcript = transcript
                                 print(f"Final transcript: {transcript}")
                                 
@@ -391,16 +398,13 @@ class SimpleStreamingRecognizer:
                                     'timestamp': time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                                     'is_final': False
                                 })
-                    
+                        # --- DEBUG: If no result found, log and reference the debug audio file ---
+                        if not found_result:
+                            print("[DEBUG][WARNING] No recognition results returned from API for this buffer. Check the corresponding debug audio file.")
                     except Exception as e:
-                        print(f"Error in streaming recognition: {e}")
-                        time.sleep(1)  # Prevent rapid reconnection on error
-                        self.reconnect_count += 1
-                        
-                        if self.reconnect_count > self.max_reconnect_attempts:
-                            print("Max reconnection attempts reached, stopping recognition")
-                            self.is_active = False
-                            break
+                        print(f"[DEBUG][ERROR] Exception in streaming_recognize: {e}")
+                        import traceback
+                        traceback.print_exc()
                     
                     # If we got here, stream ended or timed out but thread is still active
                     # Check if we should reconnect
@@ -822,7 +826,14 @@ def handle_source(json_data):
             if has_minimum_audio and enough_time_passed and GOOGLE_CLOUD_ENABLED:
                 # Concatenate all chunks in the buffer
                 long_audio = np.concatenate(long_buffer)
-                
+
+                # --- DEBUG: Save audio for inspection ---
+                try:
+                    debug_path = save_debug_audio(long_audio, rate=RATE, tag=f"buffer_{int(time.time())}")
+                    print(f"[DEBUG] Saved long buffer audio for ASR to: {debug_path}")
+                except Exception as e:
+                    print(f"[DEBUG] Failed to save debug audio: {e}")
+
                 # Send to streaming recognizer for real-time transcription
                 if streaming_active and 'streaming_recognizer' in globals() and streaming_recognizer is not None:
                     print(f"Send raw audio to server")
@@ -1213,89 +1224,84 @@ def test_speech():
         # Convert to int16 for the API
         audio_int16 = (audio * 32767).astype(np.int16)
         
-        # Try the speech recognition with this test audio
+        # Convert to bytes
         audio_bytes = audio_int16.tobytes()
-        audio_obj = speech.RecognitionAudio(content=audio_bytes)
         
-        # Create config with more debugging options
-        config = speech.RecognitionConfig(
+        print(f"TEST SPEECH - Created {duration}s test audio sample")
+        
+        # Create audio content
+        audio = speech.RecognitionAudio(content=audio_bytes)
+        
+        # Send synchronous request
+        print("TEST SPEECH - Sending synchronous recognition request")
+        response = speech_client.recognize(config=speech.RecognitionConfig(
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=RATE,
             language_code="en-US",
             enable_automatic_punctuation=True,
             model="default",
-            # Add more options for debugging
-            enable_word_time_offsets=True,
-            enable_word_confidence=True,
             audio_channel_count=CHANNELS,
-            profanity_filter=False,
-            # Try different models to see if any work better
-            use_enhanced=True
+        ), audio=audio)
+        
+        # Process response
+        if response.results:
+            for result in response.results:
+                for alternative in result.alternatives:
+                    print(f"TEST SPEECH - Transcript: '{alternative.transcript}'")
+                    print(f"TEST SPEECH - Confidence: {alternative.confidence}")
+            print("TEST SPEECH - Successfully received transcription from API")
+        else:
+            print("TEST SPEECH - No transcription results returned from API")
+            
+        # Try streaming recognition as well
+        print("TEST SPEECH - Now testing streaming recognition")
+        
+        # Configure streaming recognition
+        streaming_config = speech.StreamingRecognitionConfig(
+            config=speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=RATE,
+                language_code="en-US",
+                enable_automatic_punctuation=True,
+                model="default",
+                audio_channel_count=CHANNELS,
+            ),
+            interim_results=True,
         )
         
-        # Call the API
-        print("Testing Speech API with generated audio...")
-        response = speech_client.recognize(config=config, audio=audio_obj)
+        # Split audio into chunks to simulate streaming
+        chunk_duration_ms = 100  # 100ms chunks
+        samples_per_chunk = int(RATE * chunk_duration_ms / 1000)
+        chunks = [audio_int16[i:i+samples_per_chunk] for i in range(0, len(audio_int16), samples_per_chunk)]
         
-        # Generate a plot of the audio waveform for visualization
-        plt.figure(figsize=(10, 4))
-        plt.plot(t, audio)
-        plt.title("Test Audio Waveform")
-        plt.xlabel("Time (s)")
-        plt.ylabel("Amplitude")
-        plt.grid(True)
+        # Create generator for chunks
+        def audio_chunk_generator():
+            for chunk in chunks:
+                yield speech.StreamingRecognizeRequest(audio_content=chunk.tobytes())
         
-        # Save plot to a base64 string to embed in HTML
-        buffer = BytesIO()
-        plt.savefig(buffer, format='png')
-        buffer.seek(0)
-        plot_data = base64.b64encode(buffer.getvalue()).decode('utf-8')
-        plt.close()
+        # Start streaming recognition
+        print(f"TEST SPEECH - Sending {len(chunks)} streaming chunks")
+        streaming_responses = speech_client.streaming_recognize(streaming_config, audio_chunk_generator())
         
-        # Create result HTML
-        html = "<h1>Speech Recognition Test</h1>"
-        html += "<p>Testing Google Cloud Speech-to-Text API with generated test audio</p>"
+        # Process streaming responses
+        any_results = False
+        for response in streaming_responses:
+            if response.results:
+                any_results = True
+                for result in response.results:
+                    for alternative in result.alternatives:
+                        result_type = "Final" if result.is_final else "Interim"
+                        print(f"TEST SPEECH - {result_type} transcript: '{alternative.transcript}'")
         
-        # Add the audio waveform
-        html += "<h2>Test Audio Waveform:</h2>"
-        html += f'<img src="data:image/png;base64,{plot_data}" alt="Test Audio Waveform" />'
+        if not any_results:
+            print("TEST SPEECH - No streaming transcription results returned from API")
         
-        # Add the API response
-        html += "<h2>API Response:</h2>"
-        html += f"<pre>{str(response)}</pre>"
-        
-        # Format any results
-        if hasattr(response, 'results') and response.results:
-            html += "<h2>Transcription Results:</h2><ul>"
-            for i, result in enumerate(response.results):
-                html += f"<li>Result {i+1}:"
-                if result.alternatives:
-                    for j, alt in enumerate(result.alternatives):
-                        html += f"<br>Alternative {j+1}: '{alt.transcript}' (confidence: {alt.confidence})"
-                else:
-                    html += "<br>No alternatives found in this result"
-                html += "</li>"
-            html += "</ul>"
-        else:
-            html += "<p>No transcription results returned by API</p>"
-        
-        # Add instructions for next steps
-        html += "<h2>Next Steps:</h2>"
-        html += "<p>If you see no results above, that indicates an issue with the Speech-to-Text API recognition.</p>"
-        html += "<p>Possible reasons:</p>"
-        html += "<ul>"
-        html += "<li>The generated test audio doesn't contain actual speech (expected for synthetic audio)</li>"
-        html += "<li>API credentials don't have access to the Speech-to-Text API</li>"
-        html += "<li>There might be configuration issues with the API</li>"
-        html += "</ul>"
-        html += "<p>You can also try the <a href='/test_sentiment'>sentiment analysis test</a> to verify that part of the pipeline.</p>"
-        
-        return html
+        print("TEST SPEECH - Test completed")
         
     except Exception as e:
+        print(f"TEST SPEECH - Error during test: {e}")
         import traceback
-        error_trace = traceback.format_exc()
-        return f"Error testing speech recognition: {str(e)}<br><pre>{error_trace}</pre>"
+        traceback.print_exc()
 
 @app.route('/test_direct_mic')
 def test_direct_mic():
