@@ -150,7 +150,7 @@ class SimpleStreamingRecognizer:
             max_alternatives=1,
             enable_automatic_punctuation=True,
             use_enhanced=True,
-            model="default",
+            model="phone_call",
             audio_channel_count=CHANNELS,
         )
         self.streaming_config = speech.StreamingRecognitionConfig(
@@ -521,7 +521,7 @@ def start_streaming_recognition():
     # These settings improve handling of longer audio segments
     streaming_recognizer.config.enable_automatic_punctuation = True
     streaming_recognizer.config.enable_word_time_offsets = True
-    streaming_recognizer.config.model = "latest_long"  # Use long-form model for better results with extended audio
+    streaming_recognizer.config.model = "phone_call"  # Use phone_call model for better results with extended audio
     
     # Print information about the environment
     print("Starting dual-stream speech recognition with the following settings:")
@@ -998,18 +998,9 @@ def process_speech_for_sentiment(audio_data):
             encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
             sample_rate_hertz=RATE,
             language_code="en-US",
-            # Add more configuration options for better results
             enable_automatic_punctuation=True,
-            model="default",  # Use "video" for better handling of media content or "phone_call" for phone conversations
-            use_enhanced=True,  # Use enhanced model
-            # Add these parameters to improve speech recognition in noisy environments
+            model="phone_call",
             audio_channel_count=CHANNELS,
-            enable_separate_recognition_per_channel=False,
-            # More aggressive noise settings
-            # Try with different speech contexts if needed
-            speech_contexts=[speech.SpeechContext(
-                phrases=["sound", "watch", "notification", "alarm", "alert", "doorbell", "knock", "phone"]
-            )]
         )
         
         print("Sending audio to Google Speech-to-Text API...")
@@ -1239,7 +1230,7 @@ def test_speech():
             sample_rate_hertz=RATE,
             language_code="en-US",
             enable_automatic_punctuation=True,
-            model="default",
+            model="phone_call",
             audio_channel_count=CHANNELS,
         ), audio=audio)
         
@@ -1263,7 +1254,7 @@ def test_speech():
                 sample_rate_hertz=RATE,
                 language_code="en-US",
                 enable_automatic_punctuation=True,
-                model="default",
+                model="phone_call",
                 audio_channel_count=CHANNELS,
             ),
             interim_results=True,
@@ -1340,7 +1331,7 @@ def run_direct_mic_test():
             language_code="en-US",
             enable_automatic_punctuation=True,
             use_enhanced=True,
-            model="default",
+            model="phone_call",
             audio_channel_count=CHANNELS,
         )
         
@@ -1681,7 +1672,7 @@ def run_fixed_audio_test():
             sample_rate_hertz=RATE,
             language_code="en-US",
             enable_automatic_punctuation=True,
-            model="default",
+            model="phone_call",
             audio_channel_count=1,
         )
         
@@ -1734,7 +1725,14 @@ def run_fixed_audio_test():
         
         # Configure streaming recognition
         streaming_config = speech.StreamingRecognitionConfig(
-            config=config,
+            config=speech.RecognitionConfig(
+                encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=RATE,
+                language_code="en-US",
+                enable_automatic_punctuation=True,
+                model="phone_call",
+                audio_channel_count=CHANNELS,
+            ),
             interim_results=True,
         )
         
