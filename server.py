@@ -465,7 +465,7 @@ class SimpleStreamingRecognizer:
                 if len(buffer) >= self.optimal_chunk_size:
                     yield buffer
                     buffer = b''
-                    last_yield_time = time.time()
+                    last_yield_time = time.time
                 
                 # Get any additional chunks without blocking
                 while True:
@@ -489,7 +489,7 @@ class SimpleStreamingRecognizer:
                 if buffer:
                     yield buffer
                     buffer = b''
-                    last_yield_time = time.time()
+                    last_yield_time = time.time
                     
             except queue.Empty:
                 # Timeout occurred, continue loop to check if stream needs rotation
@@ -950,14 +950,21 @@ def handle_transcription_audio(data):
         # Convert bytes to numpy array (assume int16 PCM)
         np_wav = np.frombuffer(data, dtype=np.int16) / 32768.0
         transcript_entry = process_speech_for_sentiment(np_wav)
-        if transcript_entry:
+        if transcript_entry and transcript_entry.get('transcript'):
             socketio.emit('transcript_update', transcript_entry, room=request.sid)
             print(f"[transcription_audio] Emitted transcript_update: {transcript_entry}")
             # Optionally emit sentiment as a separate event
             socketio.emit('sentiment_notification', transcript_entry, room=request.sid)
             print(f"[transcription_audio] Emitted sentiment_notification: {transcript_entry}")
         else:
-            print("[transcription_audio] No transcript entry generated.")
+            # Always emit feedback, even if no transcript
+            status_entry = {
+                'transcript': '',
+                'status': 'No speech detected',
+                'sentiment': None
+            }
+            socketio.emit('transcript_update', status_entry, room=request.sid)
+            print("[transcription_audio] No transcript entry generated. Emitted status update.")
     except Exception as e:
         print(f"[transcription_audio] Error: {e}")
         import traceback
